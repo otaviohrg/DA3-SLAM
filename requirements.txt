@@ -1,6 +1,9 @@
 # Project dependencies
---extra-index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://download.pytorch.org/whl/cu128
 torch
+torchvision
 numpy
+scipy
+gtsam
 hatchling
 editables
