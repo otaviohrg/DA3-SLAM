@@ -51,8 +51,11 @@ def main():
     from da3_slam.depth_estimator import DepthEstimator
     from da3_slam.submap import SubmapBuilder
     from da3_slam.alignment import SubmapAligner
-    from da3_slam.factor_graph import PoseGraph, NoiseConfig
-    from da3_slam.keyframe_selector import KeyframeSelector, KeyframeSelectorConfig
+    from da3_slam.factor_graph import PoseGraph
+    from da3_slam.keyframe_selector import KeyframeSelector
+    from da3_slam.config import load_slam_config
+
+    slam_cfg = load_slam_config(submap_size=args.submap_size)
 
     estimator = DepthEstimator()
     builder = SubmapBuilder(estimator)
@@ -60,10 +63,7 @@ def main():
 
     # ── keyframe selection ────────────────────────────────────────────────────
     header("Keyframe selection")
-    selector = KeyframeSelector(KeyframeSelectorConfig(
-        min_disparity_frac=0.15,
-        max_submap_size=args.submap_size,
-    ))
+    selector = KeyframeSelector(slam_cfg.keyframe)
     kf_result = selector.select_paths(all_paths)
     # Limit to enough keyframes for the requested number of submaps
     max_kf = args.submap_size * args.n_submaps - (args.n_submaps - 1)
@@ -89,7 +89,7 @@ def main():
 
     # ── build factor graph ────────────────────────────────────────────────────
     header("Building factor graph")
-    graph = PoseGraph()
+    graph = PoseGraph(slam_cfg.noise)
     graph.add_submap(submaps[0])
     for i, (sm, alignment) in enumerate(zip(submaps[1:], alignments)):
         graph.add_submap(sm, alignment)
