@@ -25,26 +25,28 @@ from da3_slam.alignment import AlignmentResult
 
 @dataclass
 class LoopClosureConfig:
+    # Canonical values: config/default.yaml → loop_closure.*
+
     # Minimum cosine similarity to flag a candidate
-    similarity_threshold: float = 0.85
+    similarity_threshold: float
 
     # Submaps must be this far apart in the sequence to be a loop closure
-    min_submaps_apart: int = 3
+    min_submaps_apart: int
 
     # DINOv2 model variant
-    dinov2_model: str = "dinov2_vitb14"
+    dinov2_model: str
 
     # ICP: max number of iterations
-    icp_max_iter: int = 50
+    icp_max_iter: int
 
     # ICP: convergence tolerance
-    icp_tol: float = 1e-6
+    icp_tol: float
 
     # ICP: max correspondence distance (metres)
-    icp_max_dist: float = 1.0
+    icp_max_dist: float
 
     # Number of points to subsample per submap for ICP
-    icp_n_points: int = 5000
+    icp_n_points: int
 
 
 # ── result types ──────────────────────────────────────────────────────────────

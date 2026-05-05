@@ -27,29 +27,25 @@ from da3_slam.loop_closure import LoopClosureDetector, LoopClosureConfig, LoopCl
 
 @dataclass
 class SLAMConfig:
-    # Keyframe selection
-    keyframe: KeyframeSelectorConfig = field(
-        default_factory=KeyframeSelectorConfig
-    )
-    # Pose graph noise
-    noise: NoiseConfig = field(default_factory=NoiseConfig)
-    # Loop closure
-    loop_closure: LoopClosureConfig = field(
-        default_factory=LoopClosureConfig
-    )
+    # Canonical values: config/default.yaml
+    # Use da3_slam.config.load_slam_config() to construct from YAML.
+
+    keyframe: KeyframeSelectorConfig
+    noise: NoiseConfig
+    loop_closure: LoopClosureConfig
 
     # Frames per submap (including the 1-frame anchor overlap)
-    submap_size: int = 8
+    submap_size: int
 
-    # Confidence percentile for point cloud filtering
-    conf_percentile: float = 40.0
+    # Global confidence percentile threshold for point cloud filtering
+    conf_percentile: float
 
     # DA3 model
-    da3_model: str = "depth-anything/DA3NESTED-GIANT-LARGE"
-    da3_process_res: int = 504
+    da3_model: str
+    da3_process_res: int
 
     # Enable loop closure (can disable for speed during debugging)
-    enable_loop_closure: bool = True
+    enable_loop_closure: bool
 
 
 # ── result ────────────────────────────────────────────────────────────────────
@@ -92,11 +88,23 @@ class SLAMResult:
                 row = pose[:3, :].flatten()
                 f.write(" ".join(f"{v:.9e}" for v in row) + "\n")
 
-    def save_tum(self, path: str, fps: float = 30.0) -> None:
+    def save_tum(
+        self,
+        path: str,
+        fps: float = 30.0,
+        timestamps: dict[int, float] | None = None,
+    ) -> None:
         """
         Save trajectory in TUM RGB-D format.
         Each line: timestamp tx ty tz qx qy qz qw
-        Timestamps are synthesised from seq_idx / fps.
+
+        Args:
+            path:       output file path
+            fps:        fallback frame rate used to synthesise timestamps when
+                        `timestamps` is not provided
+            timestamps: optional mapping {seq_idx: real_timestamp_seconds}.
+                        When provided these are used instead of seq_idx / fps.
+                        Frames with no entry fall back to seq_idx / fps.
         """
         from scipy.spatial.transform import Rotation
 
@@ -106,7 +114,10 @@ class SLAMResult:
                 t = pose[:3, 3]
                 R = Rotation.from_matrix(pose[:3, :3])
                 q = R.as_quat()  # (qx, qy, qz, qw)
-                ts = seq_idx / fps
+                if timestamps is not None and seq_idx in timestamps:
+                    ts = timestamps[seq_idx]
+                else:
+                    ts = seq_idx / fps
                 f.write(
                     f"{ts:.6f} "
                     f"{t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "

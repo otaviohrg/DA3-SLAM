@@ -34,16 +34,17 @@ from da3_slam.alignment import AlignmentResult
 @dataclass
 class NoiseConfig:
     # Sigmas for the prior on submap 0 — [rot (rad), trans (m)] x3
-    prior_rot_sigma: float = 1e-6
-    prior_trans_sigma: float = 1e-6
+    # Canonical values: config/default.yaml → noise.*
+    prior_rot_sigma: float
+    prior_trans_sigma: float
 
     # Sigmas for between-factors from anchor alignment
-    between_rot_sigma: float = 1e-3   # ~0.057 degrees
-    between_trans_sigma: float = 1e-2  # 1 cm
+    between_rot_sigma: float
+    between_trans_sigma: float
 
     # Sigmas for loop closure between-factors (looser)
-    loop_rot_sigma: float = 5e-3
-    loop_trans_sigma: float = 5e-2
+    loop_rot_sigma: float
+    loop_trans_sigma: float
 
 
 # ── result ────────────────────────────────────────────────────────────────────

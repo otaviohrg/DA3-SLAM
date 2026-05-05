@@ -4,6 +4,7 @@ torch
 torchvision
 numpy
 scipy
+pyyaml
 gtsam
 hatchling
 editables

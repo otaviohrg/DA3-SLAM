@@ -40,19 +40,27 @@ class DepthPrediction:
     def n_frames(self) -> int:
         return self.depth.shape[0]
 
-    def confident_mask(self, percentile: float = 40.0) -> np.ndarray:
+    def confident_mask(self, percentile: float = 65.0) -> np.ndarray:
         """
         Boolean mask (N, H, W) keeping pixels above `percentile` confidence.
-        Mirrors the filtering strategy used in VGGT-SLAM.
+
+        The threshold is computed **globally** across all frames in the batch
+        so that consistently low-quality frames contribute fewer points than
+        high-quality ones (per-frame normalisation would always keep the same
+        fraction regardless of actual quality).
         """
-        threshold = np.percentile(self.conf, percentile, axis=(1, 2), keepdims=True)
+        threshold = float(np.percentile(self.conf, percentile))
         return self.conf >= threshold
 
     def to_pointcloud(
-        self, frame_idx: int, conf_percentile: float = 40.0
+        self, frame_idx: int, conf_percentile: float = 65.0
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Lift a single depth frame to a 3D point cloud in camera space.
+
+        Only pixels whose confidence is in the top (100 - conf_percentile)%
+        across the entire submap batch are included.  Also discards pixels
+        with non-positive or non-finite depth.
 
         Returns:
             points: (M, 3) float32 — 3D points in camera coordinates
@@ -60,7 +68,10 @@ class DepthPrediction:
         """
         K = self.intrinsics[frame_idx]
         depth = self.depth[frame_idx]
-        mask = self.confident_mask(conf_percentile)[frame_idx]
+
+        conf_mask = self.confident_mask(conf_percentile)[frame_idx]
+        depth_mask = np.isfinite(depth) & (depth > 0.0)
+        mask = conf_mask & depth_mask
 
         H, W = depth.shape
         u, v = np.meshgrid(np.arange(W), np.arange(H))

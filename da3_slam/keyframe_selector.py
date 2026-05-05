@@ -18,22 +18,23 @@ import numpy as np
 
 @dataclass
 class KeyframeSelectorConfig:
+    # Canonical values: config/default.yaml → keyframe.*
+
     # Minimum mean optical flow as a fraction of image width [0, 1].
     # A frame is a keyframe when mean displacement >= min_disparity_frac * W.
-    # 0.15 means 15% of image width — works across resolutions and framerates.
-    min_disparity_frac: float = 0.15
+    min_disparity_frac: float
 
     # Maximum number of frames in a submap before forcing a new keyframe
-    max_submap_size: int = 8
+    max_submap_size: int
 
     # cv2.goodFeaturesToTrack parameters
-    max_corners: int = 500
-    quality_level: float = 0.01
-    min_distance: float = 8.0
+    max_corners: int
+    quality_level: float
+    min_distance: float
 
     # cv2.calcOpticalFlowPyrLK parameters
-    lk_win_size: tuple[int, int] = (21, 21)
-    lk_max_level: int = 3
+    lk_win_size: tuple[int, int]
+    lk_max_level: int
 
 
 # ── result type ───────────────────────────────────────────────────────────────
