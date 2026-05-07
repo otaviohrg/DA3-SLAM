@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import gtsam
 
-from da3_slam.frontend.submap import Submap
-from da3_slam.backend.alignment import AlignmentResult
+from da3_slam.backend.inference.submap import Submap
+from da3_slam.backend.processing.alignment import AlignmentResult
 
 
 # ── noise models ──────────────────────────────────────────────────────────────

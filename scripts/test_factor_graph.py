@@ -47,10 +47,10 @@ def main():
     )
     check("At least 1 image available", len(all_paths) >= 1)
 
-    from da3_slam.frontend.depth_estimator import DepthEstimator
-    from da3_slam.frontend.submap import SubmapBuilder
-    from da3_slam.backend.alignment import SubmapAligner
-    from da3_slam.backend.factor_graph import PoseGraph
+    from da3_slam.backend.inference.depth_estimator import DepthEstimator
+    from da3_slam.backend.inference.submap import SubmapBuilder
+    from da3_slam.backend.processing.alignment import SubmapAligner
+    from da3_slam.backend.processing.factor_graph import PoseGraph
     from da3_slam.frontend.keyframe_selector import KeyframeSelector
     from da3_slam.config import load_slam_config
 

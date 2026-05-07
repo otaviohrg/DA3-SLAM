@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from da3_slam.frontend.submap import Submap
+from da3_slam.backend.inference.submap import Submap
 
 
 @dataclass

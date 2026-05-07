@@ -15,8 +15,8 @@ import yaml
 
 from da3_slam.slam import SLAMConfig
 from da3_slam.frontend.keyframe_selector import KeyframeSelectorConfig
-from da3_slam.backend.factor_graph import NoiseConfig
-from da3_slam.backend.loop_closure import LoopClosureConfig
+from da3_slam.backend.processing.factor_graph import NoiseConfig
+from da3_slam.backend.processing.loop_closure import LoopClosureConfig
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_YAML = _REPO_ROOT / "config" / "default.yaml"

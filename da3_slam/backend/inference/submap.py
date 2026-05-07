@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from da3_slam.frontend.depth_estimator import DepthEstimator, DepthPrediction
+from da3_slam.backend.inference.depth_estimator import DepthEstimator, DepthPrediction
 
 
 # ── data types ────────────────────────────────────────────────────────────────
@@ -131,7 +131,7 @@ class SubmapBuilder:
         prediction: DepthPrediction = self.estimator.infer(image_paths)
         submap = Submap(idx=submap_idx)
 
-        for i, (path, seq_idx) in enumerate(zip(image_paths, seq_indices)):
+        for i, seq_idx in enumerate(seq_indices):
             points_cam, mask = prediction.to_pointcloud(i, self.confidence_percentile)
             points_world = _transform_to_world(points_cam, prediction.extrinsics[i])
             colors = _extract_colors(prediction.processed_images[i], mask)

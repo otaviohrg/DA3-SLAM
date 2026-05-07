@@ -44,8 +44,8 @@ def main():
     )[: args.submap_size]
     check(f"Found {len(paths)} images", len(paths) > 0)
 
-    from da3_slam.frontend.depth_estimator import DepthEstimator
-    from da3_slam.frontend.submap import SubmapBuilder
+    from da3_slam.backend.inference.depth_estimator import DepthEstimator
+    from da3_slam.backend.inference.submap import SubmapBuilder
 
     estimator = DepthEstimator()
     builder = SubmapBuilder(estimator, confidence_percentile=args.confidence_percentile)

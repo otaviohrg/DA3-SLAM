@@ -12,17 +12,16 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 
-from da3_slam.frontend.depth_estimator import DepthEstimator
 from da3_slam.frontend.keyframe_selector import OnlineKeyframeSelector, KeyframeSelectorConfig
-from da3_slam.frontend.submap import Submap, SubmapBuilder
-from da3_slam.backend.alignment import SubmapAligner
-from da3_slam.backend.factor_graph import PoseGraph, NoiseConfig, OptimizationResult
-from da3_slam.backend.loop_closure import LoopClosureDetector, LoopClosureConfig, LoopClosure
+from da3_slam.backend.inference.depth_estimator import DepthEstimator
+from da3_slam.backend.inference.submap import Submap, SubmapBuilder
+from da3_slam.backend.processing.alignment import SubmapAligner
+from da3_slam.backend.processing.factor_graph import PoseGraph, NoiseConfig, OptimizationResult
+from da3_slam.backend.processing.loop_closure import LoopClosureDetector, LoopClosureConfig, LoopClosure
 
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -76,8 +75,7 @@ class SLAMResult:
     @property
     def trajectory(self) -> np.ndarray:
         """(N, 4, 4) cam-to-world poses sorted by seq_idx."""
-        items = sorted(self.keyframe_poses.items())
-        return np.stack([pose for _, pose in items])
+        return np.stack([pose for _, pose in sorted(self.keyframe_poses.items())])
 
     def save_kitti(self, path: str) -> None:
         """
@@ -116,10 +114,7 @@ class SLAMResult:
                 t = pose[:3, 3]
                 R = Rotation.from_matrix(pose[:3, :3])
                 q = R.as_quat()  # (qx, qy, qz, qw)
-                if timestamps is not None and seq_idx in timestamps:
-                    ts = timestamps[seq_idx]
-                else:
-                    ts = seq_idx / fps
+                ts = timestamps[seq_idx] if timestamps is not None and seq_idx in timestamps else seq_idx / fps
                 f.write(
                     f"{ts:.6f} "
                     f"{t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "
@@ -172,26 +167,29 @@ class SLAMResult:
 
 @dataclass
 class _RunContext:
-    """Shared mutable state passed between the frontend and backend threads."""
-    config:            SLAMConfig
-    batch_queue:       queue.Queue
-    submaps:           list[Submap]
-    loop_closures:     list[LoopClosure]
-    frontend_timings:  dict[str, float]
-    backend_timings:   dict[str, float]
-    opt_result:        OptimizationResult | None = None
-    backend_error:     BaseException | None = None
+    """Shared mutable state passed between the frontend, inference, and processing threads."""
+    config:       SLAMConfig
+    batch_queue:  queue.Queue   # frontend   → inference  (paths, indices)
+    submap_queue: queue.Queue   # inference  → processing (Submap)
+    submaps:      list[Submap]
+    loop_closures: list[LoopClosure]
+    timings:      dict[str, float]
+    opt_result:   OptimizationResult | None = None
+    backend_error: BaseException | None = None
 
 
-def _enqueue(ctx: _RunContext, paths: list[str], indices: list[int]) -> None:
-    """Put a keyframe batch on the queue; give up silently if the backend crashed."""
+def _blocking_put(ctx: _RunContext, q: queue.Queue, item) -> bool:
+    """Put item on q, retrying every 0.5 s until space is available or a thread error is set.
+
+    Returns False if a thread error was set before the item could be placed.
+    """
     while True:
         try:
-            ctx.batch_queue.put((paths, indices), timeout=0.5)
-            return
+            q.put(item, timeout=0.5)
+            return True
         except queue.Full:
             if ctx.backend_error is not None:
-                return
+                return False
 
 
 # ── runner ────────────────────────────────────────────────────────────────────
@@ -227,35 +225,41 @@ class DA3SLAM:
         ctx = _RunContext(
             config=self.config,
             batch_queue=queue.Queue(maxsize=2),
+            submap_queue=queue.Queue(maxsize=1),
             submaps=[],
             loop_closures=[],
-            frontend_timings={"keyframe_selection": 0.0},
-            backend_timings={
-                "submap_building": 0.0,
-                "graph_building":  0.0,
-                "loop_closure":    0.0,
-                "optimization":    0.0,
+            timings={
+                "keyframe_selection": 0.0,
+                "submap_building":    0.0,
+                "graph_building":     0.0,
+                "loop_closure":       0.0,
+                "optimization":       0.0,
             },
         )
 
-        # Start backend first so it is ready before the frontend produces anything.
-        backend_thread = threading.Thread(target=self._backend, args=(ctx,),
-                                          name="da3-backend", daemon=True)
-        frontend_thread = threading.Thread(target=self._frontend, args=(image_paths, ctx),
-                                           name="da3-frontend", daemon=True)
+        # Start consumers before producers so they are ready immediately.
+        processing_thread = threading.Thread(target=self._processing, args=(ctx,),
+                                             name="da3-processing", daemon=True)
+        inference_thread  = threading.Thread(target=self._inference,  args=(ctx,),
+                                             name="da3-inference",   daemon=True)
+        frontend_thread   = threading.Thread(target=self._frontend, args=(image_paths, ctx),
+                                             name="da3-frontend",    daemon=True)
         wall_start = time.time()
-        backend_thread.start()
+        processing_thread.start()
+        inference_thread.start()
         frontend_thread.start()
         frontend_thread.join()
-        backend_thread.join()
+        inference_thread.join()
+        processing_thread.join()
         wall_elapsed = time.time() - wall_start
 
         if ctx.backend_error is not None:
             raise ctx.backend_error
 
-        timings = {**ctx.frontend_timings, **ctx.backend_timings}
+        timings = ctx.timings
         col = max(len(k) for k in timings)
-        print("[SLAM] Timing breakdown (per-module compute time, threads overlap):")
+        tag = f"[{threading.current_thread().name}]"
+        print(f"{tag} Timing breakdown (per-module compute time, threads overlap):")
         for module, seconds in timings.items():
             print(f"  {module:<{col}}  {seconds:6.1f}s")
         print(f"  {'':-<{col+9}}")
@@ -283,37 +287,60 @@ class DA3SLAM:
 
                 t0 = time.time()
                 is_keyframe = selector.step_path(path)
-                ctx.frontend_timings["keyframe_selection"] += time.time() - t0
+                ctx.timings["keyframe_selection"] += time.time() - t0
 
                 if is_keyframe:
                     keyframe_paths.append(path)
                     keyframe_indices.append(i)
 
                 if len(keyframe_paths) >= ctx.config.submap_size:
-                    _enqueue(ctx, list(keyframe_paths), list(keyframe_indices))
+                    _blocking_put(ctx, ctx.batch_queue, (list(keyframe_paths), list(keyframe_indices)))
                     # 1-frame overlap: anchor next submap on the last keyframe
                     keyframe_paths[:] = [keyframe_paths[-1]]
                     keyframe_indices[:] = [keyframe_indices[-1]]
 
             if len(keyframe_paths) >= 2 and ctx.backend_error is None:
-                _enqueue(ctx, list(keyframe_paths), list(keyframe_indices))
+                _blocking_put(ctx, ctx.batch_queue, (list(keyframe_paths), list(keyframe_indices)))
         finally:
             ctx.batch_queue.put(None)  # sentinel — always sent, even on error
 
-    def _backend(self, ctx: _RunContext) -> None:
-        pose_graph       = PoseGraph(ctx.config.noise)
-        accumulated_pose = np.eye(4, dtype=np.float32)
+    def _inference(self, ctx: _RunContext) -> None:
+        """DA3 inference: pops batches from batch_queue, pushes built Submaps to submap_queue."""
+        submap_idx = 0
         try:
             while True:
                 item = ctx.batch_queue.get()
                 if item is None:
                     break
+                if ctx.backend_error is not None:
+                    break
                 paths, indices = item
 
-                # ── build submap ───────────────────────────────────────────
                 t0 = time.time()
-                submap = self.builder.build(paths, indices, len(ctx.submaps))
-                ctx.backend_timings["submap_building"] += time.time() - t0
+                submap = self.builder.build(paths, indices, submap_idx)
+                ctx.timings["submap_building"] += time.time() - t0
+                submap_idx += 1
+
+                if not _blocking_put(ctx, ctx.submap_queue, submap):
+                    return
+
+        except Exception as exc:
+            ctx.backend_error = exc
+        finally:
+            try:
+                ctx.submap_queue.put(None, timeout=1.0)
+            except queue.Full:
+                pass  # processing is already dead; sentinel is not needed
+
+    def _processing(self, ctx: _RunContext) -> None:
+        """Alignment, loop closure, and optimization: consumes Submaps from submap_queue."""
+        pose_graph       = PoseGraph(ctx.config.noise)
+        accumulated_pose = np.eye(4, dtype=np.float32)
+        try:
+            while True:
+                submap = ctx.submap_queue.get()
+                if submap is None:
+                    break
 
                 # ── align + add to graph ───────────────────────────────────
                 t0 = time.time()
@@ -321,13 +348,13 @@ class DA3SLAM:
                     alignment = self.aligner.align(ctx.submaps[-1], submap)
                     pose_graph.add_submap(submap, alignment)
                     accumulated_pose = accumulated_pose @ alignment.T_a_from_b
-                    print(f"[SLAM] Submap {submap.idx}: "
+                    print(f"[{threading.current_thread().name}] Submap {submap.idx}: "
                           f"rot={alignment.rotation_angle_deg:.2f}°  "
                           f"|t|={np.linalg.norm(alignment.translation):.3f}m")
                 else:
                     pose_graph.add_submap(submap)
                 ctx.submaps.append(submap)
-                ctx.backend_timings["graph_building"] += time.time() - t0
+                ctx.timings["graph_building"] += time.time() - t0
 
                 # ── loop closure ───────────────────────────────────────────
                 if self.detector is not None:
@@ -338,12 +365,15 @@ class DA3SLAM:
                         pose_graph.add_loop_closure(
                             closure.submap_idx_a, closure.submap_idx_b, closure.alignment
                         )
-                    ctx.backend_timings["loop_closure"] += time.time() - t0
+                    ctx.timings["loop_closure"] += time.time() - t0
 
                 # ── incremental optimization ───────────────────────────────
                 t0 = time.time()
                 pose_graph.optimize()
-                ctx.backend_timings["optimization"] += time.time() - t0
+                ctx.timings["optimization"] += time.time() - t0
+
+            if ctx.backend_error is not None:
+                return  # inference failed; let run() surface the error
 
             if not ctx.submaps:
                 raise RuntimeError(
@@ -351,12 +381,13 @@ class DA3SLAM:
                 )
 
             # ── final optimization ─────────────────────────────────────────
-            print(f"[SLAM] Final optimization "
+            tag = f"[{threading.current_thread().name}]"
+            print(f"{tag} Final optimization "
                   f"({pose_graph.n_nodes} nodes, {pose_graph.n_factors} factors) ...")
             t0 = time.time()
             ctx.opt_result = pose_graph.optimize(verbose=True)
-            ctx.backend_timings["optimization"] += time.time() - t0
-            print(f"[SLAM] Done: error {ctx.opt_result.final_error:.4f}, "
+            ctx.timings["optimization"] += time.time() - t0
+            print(f"{tag} Done: error {ctx.opt_result.final_error:.4f}, "
                   f"{ctx.opt_result.iterations} iters, "
                   f"{len(ctx.submaps)} submaps, {len(ctx.loop_closures)} loop closures")
 
@@ -381,11 +412,8 @@ def _build_keyframe_poses(
     """
     poses: dict[int, np.ndarray] = {}
     for submap in submaps:
-        T_opt = opt.pose(submap.idx)   # (4,4) submap frame → global
+        T_opt = opt.pose(submap.idx)
         for frame in submap.frames:
-            cam_to_world_local  = frame.cam_to_world   # (4,4) cam → submap local
-            cam_to_world_global = T_opt @ cam_to_world_local
-            # Anchor frame appears in two submaps — first wins
-            if frame.seq_idx not in poses:
-                poses[frame.seq_idx] = cam_to_world_global.astype(np.float32)
+            if frame.seq_idx not in poses:  # anchor frame appears in two submaps — first wins
+                poses[frame.seq_idx] = (T_opt @ frame.cam_to_world).astype(np.float32)
     return poses

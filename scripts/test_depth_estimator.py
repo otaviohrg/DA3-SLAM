@@ -45,7 +45,7 @@ def main():
 
     # ── run inference ─────────────────────────────────────────────────────────
     header("DepthEstimator.infer()")
-    from da3_slam.frontend.depth_estimator import DepthEstimator
+    from da3_slam.backend.inference.depth_estimator import DepthEstimator
     estimator = DepthEstimator()
     pred = estimator.infer(paths)
     N = len(paths)

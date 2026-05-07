@@ -51,9 +51,9 @@ def main():
     check(f"At least {needed} images available", len(all_paths) >= needed)
     all_paths = all_paths[:needed]
 
-    from da3_slam.frontend.depth_estimator import DepthEstimator
-    from da3_slam.frontend.submap import SubmapBuilder
-    from da3_slam.backend.alignment import SubmapAligner
+    from da3_slam.backend.inference.depth_estimator import DepthEstimator
+    from da3_slam.backend.inference.submap import SubmapBuilder
+    from da3_slam.backend.processing.alignment import SubmapAligner
 
     estimator = DepthEstimator()
     builder = SubmapBuilder(estimator, confidence_percentile=args.confidence_percentile)
