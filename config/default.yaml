@@ -3,42 +3,44 @@
 # Override any key from the CLI: --submap_size 12, --loop_threshold 0.9, etc.
 
 # ── DA3 model ──────────────────────────────────────────────────────────────────
-da3_model: "depth-anything/DA3NESTED-GIANT-LARGE"
-da3_process_res: 504
+depth_model: "depth-anything/DA3NESTED-GIANT-LARGE"
+depth_model_resolution: 504
 
 # ── submap ─────────────────────────────────────────────────────────────────────
 submap_size: 20                 # max keyframes per submap (including anchor overlap)
 
 # ── keyframe selection (Lucas-Kanade optical flow) ─────────────────────────────
 keyframe:
-  min_disparity_frac: 0.15    # min mean flow as fraction of image width
-  max_submap_size: 20          # kept in sync with submap_size above
-  max_corners: 500            # goodFeaturesToTrack: number of corners
-  quality_level: 0.01         # goodFeaturesToTrack: minimum quality
-  min_distance: 8.0           # goodFeaturesToTrack: minimum corner distance (px)
-  lk_win_size: [21, 21]       # calcOpticalFlowPyrLK: window size
-  lk_max_level: 3             # calcOpticalFlowPyrLK: pyramid levels
+  min_disparity_fraction: 0.30  # min mean flow as fraction of image width
+  max_submap_size: 20           # kept in sync with submap_size above
+  max_corners: 500              # goodFeaturesToTrack: number of corners
+  quality_level: 0.01           # goodFeaturesToTrack: minimum quality
+  min_distance: 8.0             # goodFeaturesToTrack: minimum corner distance (px)
+  block_size: 7                 # goodFeaturesToTrack: neighbourhood size for covariance matrix
+  flow_window_size: [21, 21]    # calcOpticalFlowPyrLK: window size
+  flow_pyramid_levels: 3        # calcOpticalFlowPyrLK: pyramid levels
+  flow_stop_criteria: [3, 30, 0.01]  # calcOpticalFlowPyrLK: [type(EPS|COUNT=3), maxCount, epsilon]
 
 # ── point cloud filtering ──────────────────────────────────────────────────────
-conf_percentile: 65.0         # global confidence percentile threshold (0-100)
-                               # higher = fewer but cleaner points
+confidence_percentile: 65.0    # global confidence percentile threshold (0-100)
+                                # higher = fewer but cleaner points
 
 # ── pose graph noise ───────────────────────────────────────────────────────────
 noise:
-  prior_rot_sigma: 1.0e-6     # rad — prior on first submap rotation
-  prior_trans_sigma: 1.0e-6   # m   — prior on first submap translation
-  between_rot_sigma: 1.0e-3   # rad — consecutive submap rotation noise
-  between_trans_sigma: 1.0e-2 # m   — consecutive submap translation noise
-  loop_rot_sigma: 5.0e-3      # rad — loop closure rotation noise (looser)
-  loop_trans_sigma: 5.0e-2    # m   — loop closure translation noise (looser)
+  prior_rotation_sigma: 1.0e-6     # rad — prior on first submap rotation
+  prior_translation_sigma: 1.0e-6  # m   — prior on first submap translation
+  between_rotation_sigma: 1.0e-3   # rad — consecutive submap rotation noise
+  between_translation_sigma: 1.0e-2 # m  — consecutive submap translation noise
+  loop_rotation_sigma: 5.0e-3      # rad — loop closure rotation noise (looser)
+  loop_translation_sigma: 5.0e-2   # m   — loop closure translation noise (looser)
 
 # ── loop closure ───────────────────────────────────────────────────────────────
 loop_closure:
   enable: true
-  similarity_threshold: 0.85  # DINOv2 cosine similarity to flag a candidate
-  min_submaps_apart: 3        # minimum index gap to consider a loop
+  similarity_threshold: 0.85   # DINOv2 cosine similarity to flag a candidate
+  min_submaps_apart: 3         # minimum index gap to consider a loop
   dinov2_model: "dinov2_vitb14"
-  icp_max_iter: 50
-  icp_tol: 1.0e-6
-  icp_max_dist: 1.0           # m — max ICP correspondence distance
-  icp_n_points: 5000          # points to subsample per submap for ICP
+  icp_max_iterations: 50
+  icp_tolerance: 1.0e-6
+  icp_max_distance: 1.0        # m — max ICP correspondence distance
+  icp_num_points: 5000         # points to subsample per submap for ICP

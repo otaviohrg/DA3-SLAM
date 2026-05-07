@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from da3_slam.depth_estimator import DepthEstimator, DepthPrediction
+from da3_slam.frontend.depth_estimator import DepthEstimator, DepthPrediction
 
 
 # ── data types ────────────────────────────────────────────────────────────────
@@ -106,10 +106,10 @@ class SubmapBuilder:
     def __init__(
         self,
         estimator: DepthEstimator,
-        conf_percentile: float = 40.0,
+        confidence_percentile: float = 40.0,
     ):
         self.estimator = estimator
-        self.conf_percentile = conf_percentile
+        self.confidence_percentile = confidence_percentile
 
     def build(
         self,
@@ -128,63 +128,26 @@ class SubmapBuilder:
         """
         assert len(image_paths) == len(seq_indices)
 
-        pred: DepthPrediction = self.estimator.infer(image_paths)
+        prediction: DepthPrediction = self.estimator.infer(image_paths)
         submap = Submap(idx=submap_idx)
 
         for i, (path, seq_idx) in enumerate(zip(image_paths, seq_indices)):
-            points_cam, mask = pred.to_pointcloud(i, self.conf_percentile)
-            points_world = _transform_to_world(points_cam, pred.extrinsics[i])
-            colors = _extract_colors(pred.processed_images[i], mask)
+            points_cam, mask = prediction.to_pointcloud(i, self.confidence_percentile)
+            points_world = _transform_to_world(points_cam, prediction.extrinsics[i])
+            colors = _extract_colors(prediction.processed_images[i], mask)
 
             frame = Frame(
                 seq_idx=seq_idx,
-                image=pred.processed_images[i],
+                image=prediction.processed_images[i],
                 points_cam=points_cam,
                 points_world=points_world,
                 colors=colors,
-                extrinsic=pred.extrinsics[i],
-                intrinsic=pred.intrinsics[i],
+                extrinsic=prediction.extrinsics[i],
+                intrinsic=prediction.intrinsics[i],
             )
             submap.frames.append(frame)
 
         return submap
-
-    def build_sequence(
-        self,
-        image_paths: list[str],
-        keyframe_indices: list[int],
-        submap_size: int = 8,
-    ) -> list[Submap]:
-        """
-        Build a sequence of overlapping submaps from keyframe-selected frames.
-
-        Args:
-            image_paths:      full ordered list of ALL image paths in the sequence
-            keyframe_indices: indices into image_paths selected by KeyframeSelector
-            submap_size:      max frames per submap (including the anchor)
-
-        Returns:
-            list of Submap objects, each sharing its last frame with the next
-        """
-        submaps = []
-        kf_paths = [image_paths[i] for i in keyframe_indices]
-        n = len(kf_paths)
-        start = 0
-        submap_idx = 0
-
-        while start < n:
-            end = min(start + submap_size, n)
-            batch_paths = kf_paths[start:end]
-            batch_seq_indices = keyframe_indices[start:end]
-
-            submap = self.build(batch_paths, batch_seq_indices, submap_idx)
-            submaps.append(submap)
-
-            submap_idx += 1
-            # Overlap: next batch starts at the last frame of this batch
-            start = end - 1 if end < n else n
-
-        return submaps
 
 
 # ── internal helpers ──────────────────────────────────────────────────────────
@@ -197,9 +160,9 @@ def _transform_to_world(
 
     extrinsic is world-to-cam (4x4), so cam-to-world = inv(extrinsic).
     """
-    c2w = np.linalg.inv(extrinsic)
-    R = c2w[:3, :3]
-    t = c2w[:3, 3]
+    cam_to_world = np.linalg.inv(extrinsic)
+    R = cam_to_world[:3, :3]
+    t = cam_to_world[:3, 3]
     return (points_cam @ R.T) + t
 
 

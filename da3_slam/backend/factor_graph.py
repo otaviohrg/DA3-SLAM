@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import gtsam
 
-from da3_slam.submap import Submap
-from da3_slam.alignment import AlignmentResult
+from da3_slam.frontend.submap import Submap
+from da3_slam.backend.alignment import AlignmentResult
 
 
 # ── noise models ──────────────────────────────────────────────────────────────
@@ -35,16 +35,16 @@ from da3_slam.alignment import AlignmentResult
 class NoiseConfig:
     # Sigmas for the prior on submap 0 — [rot (rad), trans (m)] x3
     # Canonical values: config/default.yaml → noise.*
-    prior_rot_sigma: float
-    prior_trans_sigma: float
+    prior_rotation_sigma: float
+    prior_translation_sigma: float
 
     # Sigmas for between-factors from anchor alignment
-    between_rot_sigma: float
-    between_trans_sigma: float
+    between_rotation_sigma: float
+    between_translation_sigma: float
 
     # Sigmas for loop closure between-factors (looser)
-    loop_rot_sigma: float
-    loop_trans_sigma: float
+    loop_rotation_sigma: float
+    loop_translation_sigma: float
 
 
 # ── result ────────────────────────────────────────────────────────────────────
@@ -103,12 +103,13 @@ class PoseGraph:
                        Must be None for the first submap.
         """
         key = submap.idx
-        n = noise = self.noise
+        noise = self.noise
 
         if not self._submap_ids:
             # First submap — add prior and seed at identity
             prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
-                np.array([n.prior_rot_sigma] * 3 + [n.prior_trans_sigma] * 3)
+                np.array([noise.prior_rotation_sigma] * 3
+                         + [noise.prior_translation_sigma] * 3)
             )
             self._graph.add(
                 gtsam.PriorFactorPose3(key, gtsam.Pose3(), prior_noise)
@@ -120,7 +121,8 @@ class PoseGraph:
 
             prev_key = self._submap_ids[-1]
             between_noise = gtsam.noiseModel.Diagonal.Sigmas(
-                np.array([n.between_rot_sigma] * 3 + [n.between_trans_sigma] * 3)
+                np.array([noise.between_rotation_sigma] * 3
+                         + [noise.between_translation_sigma] * 3)
             )
             T = alignment.T_a_from_b
             relative = gtsam.Pose3(gtsam.Rot3(T[:3, :3]), T[:3, 3])
@@ -143,9 +145,10 @@ class PoseGraph:
         """
         Add a loop closure between-factor between two non-consecutive submaps.
         """
-        n = self.noise
+        noise = self.noise
         loop_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([n.loop_rot_sigma] * 3 + [n.loop_trans_sigma] * 3)
+            np.array([noise.loop_rotation_sigma] * 3
+                     + [noise.loop_translation_sigma] * 3)
         )
         T = alignment.T_a_from_b
         relative = gtsam.Pose3(gtsam.Rot3(T[:3, :3]), T[:3, 3])
@@ -165,6 +168,15 @@ class PoseGraph:
             self._graph, self._initial, params
         )
         self._result = optimizer.optimize()
+
+        # Warm-start: rebuild _initial from the optimized result so the next
+        # optimize() call starts from the current solution, not the original
+        # linearization point. Also seed new nodes from the last optimized pose.
+        new_initial = gtsam.Values()
+        for idx in self._submap_ids:
+            new_initial.insert(idx, self._result.atPose3(idx))
+        self._initial = new_initial
+        self._current_pose = self._result.atPose3(self._submap_ids[-1])
 
         poses = {
             idx: _pose3_to_matrix(self._result.atPose3(idx))

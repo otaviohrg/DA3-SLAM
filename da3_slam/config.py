@@ -13,13 +13,13 @@ from typing import Any
 
 import yaml
 
+from da3_slam.slam import SLAMConfig
+from da3_slam.frontend.keyframe_selector import KeyframeSelectorConfig
+from da3_slam.backend.factor_graph import NoiseConfig
+from da3_slam.backend.loop_closure import LoopClosureConfig
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_YAML = _REPO_ROOT / "config" / "default.yaml"
-
-
-def _load_yaml(path: str | Path) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
 
 
 def load_slam_config(
@@ -32,57 +32,56 @@ def load_slam_config(
     Args:
         yaml_path: Path to the YAML config file (defaults to config/default.yaml).
         **overrides: Scalar top-level keys to override, e.g.
-                     submap_size=12, conf_percentile=75.
+                     submap_size=12, confidence_percentile=75.
 
     Returns:
         A fully populated SLAMConfig.
     """
-    from da3_slam.slam import SLAMConfig
-    from da3_slam.keyframe_selector import KeyframeSelectorConfig
-    from da3_slam.factor_graph import NoiseConfig
-    from da3_slam.loop_closure import LoopClosureConfig
 
-    cfg = _load_yaml(yaml_path)
+    with open(yaml_path) as f:
+        cfg = yaml.safe_load(f)
 
     # Apply scalar top-level overrides
     for k, v in overrides.items():
         if v is not None:
             cfg[k] = v
 
-    kf = cfg.get("keyframe", {})
-    noise = cfg.get("noise", {})
-    lc = cfg.get("loop_closure", {})
+    keyframe = cfg.get("keyframe", {})
+    noise    = cfg.get("noise", {})
+    lc       = cfg.get("loop_closure", {})
 
     return SLAMConfig(
         submap_size=cfg["submap_size"],
-        conf_percentile=cfg["conf_percentile"],
-        da3_model=cfg["da3_model"],
-        da3_process_res=cfg["da3_process_res"],
+        confidence_percentile=cfg["confidence_percentile"],
+        depth_model=cfg["depth_model"],
+        depth_model_resolution=cfg["depth_model_resolution"],
         enable_loop_closure=lc.get("enable", True),
         keyframe=KeyframeSelectorConfig(
-            min_disparity_frac=kf["min_disparity_frac"],
+            min_disparity_fraction=keyframe["min_disparity_fraction"],
             max_submap_size=cfg["submap_size"],
-            max_corners=kf["max_corners"],
-            quality_level=kf["quality_level"],
-            min_distance=kf["min_distance"],
-            lk_win_size=tuple(kf["lk_win_size"]),
-            lk_max_level=kf["lk_max_level"],
+            max_corners=keyframe["max_corners"],
+            quality_level=keyframe["quality_level"],
+            min_distance=keyframe["min_distance"],
+            block_size=keyframe["block_size"],
+            flow_window_size=tuple(keyframe["flow_window_size"]),
+            flow_pyramid_levels=keyframe["flow_pyramid_levels"],
+            flow_stop_criteria=tuple(keyframe["flow_stop_criteria"]),
         ),
         noise=NoiseConfig(
-            prior_rot_sigma=noise["prior_rot_sigma"],
-            prior_trans_sigma=noise["prior_trans_sigma"],
-            between_rot_sigma=noise["between_rot_sigma"],
-            between_trans_sigma=noise["between_trans_sigma"],
-            loop_rot_sigma=noise["loop_rot_sigma"],
-            loop_trans_sigma=noise["loop_trans_sigma"],
+            prior_rotation_sigma=noise["prior_rotation_sigma"],
+            prior_translation_sigma=noise["prior_translation_sigma"],
+            between_rotation_sigma=noise["between_rotation_sigma"],
+            between_translation_sigma=noise["between_translation_sigma"],
+            loop_rotation_sigma=noise["loop_rotation_sigma"],
+            loop_translation_sigma=noise["loop_translation_sigma"],
         ),
         loop_closure=LoopClosureConfig(
             similarity_threshold=lc["similarity_threshold"],
             min_submaps_apart=lc["min_submaps_apart"],
             dinov2_model=lc["dinov2_model"],
-            icp_max_iter=lc["icp_max_iter"],
-            icp_tol=lc["icp_tol"],
-            icp_max_dist=lc["icp_max_dist"],
-            icp_n_points=lc["icp_n_points"],
+            icp_max_iterations=lc["icp_max_iterations"],
+            icp_tolerance=lc["icp_tolerance"],
+            icp_max_distance=lc["icp_max_distance"],
+            icp_num_points=lc["icp_num_points"],
         ),
     )

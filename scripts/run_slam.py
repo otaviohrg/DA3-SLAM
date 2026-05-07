@@ -8,7 +8,7 @@ Usage:
     python scripts/run_slam.py --image_dir data/video1_30fps
     python scripts/run_slam.py --image_dir data/video1_30fps --config config/default.yaml
     python scripts/run_slam.py --image_dir data/video1_30fps \\
-        --out_dir outputs/run1 --submap_size 12 --conf_percentile 75 --no_loop_closure
+        --out_dir outputs/run1 --submap_size 12 --confidence_percentile 75 --no_loop_closure
 """
 
 import argparse
@@ -18,6 +18,9 @@ from pathlib import Path
 
 import numpy as np
 import yaml
+
+from da3_slam.slam import DA3SLAM
+from da3_slam.config import load_slam_config
 
 
 # ── config loading ─────────────────────────────────────────────────────────────
@@ -35,7 +38,6 @@ def parse_args(cfg: dict) -> argparse.Namespace:
     """Build argument parser with defaults drawn from the loaded config."""
     lc = cfg.get("loop_closure", {})
     kf = cfg.get("keyframe", {})
-    noise = cfg.get("noise", {})
 
     parser = argparse.ArgumentParser(
         description="DA3-SLAM runner",
@@ -53,10 +55,10 @@ def parse_args(cfg: dict) -> argparse.Namespace:
                         help="Cap the number of input frames (for quick tests)")
 
     # ── DA3 model ─────────────────────────────────────────────────────────────
-    parser.add_argument("--da3_model", default=cfg.get("da3_model"),
+    parser.add_argument("--depth_model", default=cfg.get("depth_model"),
                         help="DA3 model ID")
-    parser.add_argument("--da3_process_res", type=int,
-                        default=cfg.get("da3_process_res"),
+    parser.add_argument("--depth_model_resolution", type=int,
+                        default=cfg.get("depth_model_resolution"),
                         help="DA3 processing resolution")
 
     # ── submap ────────────────────────────────────────────────────────────────
@@ -65,13 +67,13 @@ def parse_args(cfg: dict) -> argparse.Namespace:
                         help="Max keyframes per submap (including anchor overlap)")
 
     # ── keyframe selection ────────────────────────────────────────────────────
-    parser.add_argument("--min_disparity_frac", type=float,
-                        default=kf.get("min_disparity_frac"),
+    parser.add_argument("--min_disparity_fraction", type=float,
+                        default=kf.get("min_disparity_fraction"),
                         help="Min optical flow as fraction of image width [0,1]")
 
     # ── point cloud ───────────────────────────────────────────────────────────
-    parser.add_argument("--conf_percentile", type=float,
-                        default=cfg.get("conf_percentile"),
+    parser.add_argument("--confidence_percentile", type=float,
+                        default=cfg.get("confidence_percentile"),
                         help="Global confidence percentile threshold (0-100). "
                              "Higher = fewer but cleaner points")
 
@@ -110,25 +112,21 @@ def main():
         image_paths = image_paths[: args.max_frames]
     print(f"[run_slam] {len(image_paths)} images from {args.image_dir}")
 
-    # ── build config (YAML → CLI overrides) ───────────────────────────────────
-    from da3_slam.slam import DA3SLAM
-    from da3_slam.config import load_slam_config
-
     # load_slam_config reads the YAML; keyword args override top-level scalars
     config = load_slam_config(
         args.config,
         submap_size=args.submap_size,
-        conf_percentile=args.conf_percentile,
-        da3_model=args.da3_model,
-        da3_process_res=args.da3_process_res,
+        confidence_percentile=args.confidence_percentile,
+        depth_model=args.depth_model,
+        depth_model_resolution=args.depth_model_resolution,
     )
     # Boolean / nested overrides not covered by load_slam_config scalars
     if args.no_loop_closure:
         config.enable_loop_closure = False
     if args.loop_threshold is not None:
         config.loop_closure.similarity_threshold = args.loop_threshold
-    if args.min_disparity_frac is not None:
-        config.keyframe.min_disparity_frac = args.min_disparity_frac
+    if args.min_disparity_fraction is not None:
+        config.keyframe.min_disparity_fraction = args.min_disparity_fraction
 
     # ── run ────────────────────────────────────────────────────────────────────
     t_total = time.time()

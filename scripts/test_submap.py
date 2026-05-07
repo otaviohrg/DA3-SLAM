@@ -6,7 +6,6 @@ Usage:
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +15,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--submap_size", type=int, default=8)
-    parser.add_argument("--conf_percentile", type=float, default=40.0)
+    parser.add_argument("--confidence_percentile", type=float, default=40.0)
     parser.add_argument("--save_ply", default=None,
                         help="Save merged point cloud to this .ply path")
     return parser.parse_args()
@@ -32,7 +31,7 @@ def check(label: str, condition: bool) -> None:
     status = "PASS" if condition else "FAIL"
     print(f"  [{status}] {label}")
     if not condition:
-        sys.exit(1)
+        raise AssertionError(f"FAIL: {label}")
 
 
 def main():
@@ -45,11 +44,11 @@ def main():
     )[: args.submap_size]
     check(f"Found {len(paths)} images", len(paths) > 0)
 
-    from da3_slam.depth_estimator import DepthEstimator
-    from da3_slam.submap import SubmapBuilder
+    from da3_slam.frontend.depth_estimator import DepthEstimator
+    from da3_slam.frontend.submap import SubmapBuilder
 
     estimator = DepthEstimator()
-    builder = SubmapBuilder(estimator, conf_percentile=args.conf_percentile)
+    builder = SubmapBuilder(estimator, confidence_percentile=args.confidence_percentile)
 
     # ── build submap ──────────────────────────────────────────────────────────
     header("SubmapBuilder.build()")

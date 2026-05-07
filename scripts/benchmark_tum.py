@@ -26,7 +26,7 @@ Outputs per sequence (inside <out_dir>/<seq_name>/):
     ate_errors.png          per-frame ATE over time
 
 SLAM config knobs (same as run_slam.py):
-    --config, --submap_size, --conf_percentile,
+    --config, --submap_size, --confidence_percentile,
     --no_loop_closure, --loop_threshold, --max_frames
 """
 
@@ -337,16 +337,16 @@ def benchmark_sequence(seq_dir: Path, out_dir: Path, args) -> dict | None:
     config = load_slam_config(
         args.config,
         submap_size=args.submap_size,
-        conf_percentile=args.conf_percentile,
-        da3_model=args.da3_model,
-        da3_process_res=args.da3_process_res,
+        confidence_percentile=args.confidence_percentile,
+        depth_model=args.depth_model,
+        depth_model_resolution=args.depth_model_resolution,
     )
     if args.no_loop_closure:
         config.enable_loop_closure = False
     if args.loop_threshold is not None:
         config.loop_closure.similarity_threshold = args.loop_threshold
-    if args.min_disparity_frac is not None:
-        config.keyframe.min_disparity_frac = args.min_disparity_frac
+    if args.min_disparity_fraction is not None:
+        config.keyframe.min_disparity_fraction = args.min_disparity_fraction
 
     slam = DA3SLAM(config)
     result = slam.run(image_paths)
@@ -514,12 +514,12 @@ def parse_args() -> argparse.Namespace:
 
     # SLAM overrides
     parser.add_argument("--submap_size",       type=int,   default=None)
-    parser.add_argument("--conf_percentile",   type=float, default=None)
-    parser.add_argument("--min_disparity_frac",type=float, default=None)
-    parser.add_argument("--no_loop_closure",   action="store_true")
-    parser.add_argument("--loop_threshold",    type=float, default=None)
-    parser.add_argument("--da3_model",         default=None)
-    parser.add_argument("--da3_process_res",   type=int,   default=None)
+    parser.add_argument("--confidence_percentile",   type=float, default=None)
+    parser.add_argument("--min_disparity_fraction",  type=float, default=None)
+    parser.add_argument("--no_loop_closure",         action="store_true")
+    parser.add_argument("--loop_threshold",          type=float, default=None)
+    parser.add_argument("--depth_model",             default=None)
+    parser.add_argument("--depth_model_resolution",  type=int,   default=None)
 
     return parser.parse_args()
 

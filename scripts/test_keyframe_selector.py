@@ -6,7 +6,6 @@ Usage:
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import cv2
@@ -18,8 +17,8 @@ def parse_args():
     cfg = load_slam_config()
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
-    parser.add_argument("--min_disparity_frac", type=float,
-                        default=cfg.keyframe.min_disparity_frac)
+    parser.add_argument("--min_disparity_fraction", type=float,
+                        default=cfg.keyframe.min_disparity_fraction)
     parser.add_argument("--max_submap_size", type=int,
                         default=cfg.keyframe.max_submap_size)
     return parser.parse_args()
@@ -35,7 +34,7 @@ def check(label: str, condition: bool) -> None:
     status = "PASS" if condition else "FAIL"
     print(f"  [{status}] {label}")
     if not condition:
-        sys.exit(1)
+        raise AssertionError(f"FAIL: {label}")
 
 
 def main():
@@ -48,13 +47,13 @@ def main():
     )
     check(f"Found {len(paths)} images", len(paths) > 0)
 
-    from da3_slam.keyframe_selector import KeyframeSelector, KeyframeSelectorConfig
+    from da3_slam.frontend.keyframe_selector import KeyframeSelector, KeyframeSelectorConfig
 
     from da3_slam.config import load_slam_config
     base_cfg = load_slam_config(
-        min_disparity_frac=args.min_disparity_frac,
         submap_size=args.max_submap_size,
     )
+    base_cfg.keyframe.min_disparity_fraction = args.min_disparity_fraction
     cfg = base_cfg.keyframe
     selector = KeyframeSelector(cfg)
 
@@ -82,7 +81,7 @@ def main():
     print(f"  Keyframes:       {result.n_keyframes}")
     print(f"  Keyframe ratio:  {result.n_keyframes / len(paths):.1%}")
     print(f"  Keyframe idx:    {result.indices}")
-    print(f"  Min disparity:   {args.min_disparity_frac} × W")
+    print(f"  Min disparity:   {args.min_disparity_fraction} × W")
     print(f"  Max submap size: {args.max_submap_size}")
 
     # ── select from numpy arrays ──────────────────────────────────────────────
@@ -102,7 +101,8 @@ def main():
 
     # ── max_submap_size enforcement ───────────────────────────────────────────
     header("max_submap_size enforcement")
-    cfg_tight = load_slam_config(min_disparity_frac=999.0, submap_size=3).keyframe
+    cfg_tight = load_slam_config(submap_size=3).keyframe
+    cfg_tight.min_disparity_fraction = 999.0
     result_tight = KeyframeSelector(cfg_tight).select(images)
     gaps = [result_tight.indices[i+1] - result_tight.indices[i]
             for i in range(len(result_tight.indices) - 1)]

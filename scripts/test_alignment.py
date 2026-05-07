@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +19,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--submap_size", type=int, default=8)
-    parser.add_argument("--conf_percentile", type=float, default=40.0)
+    parser.add_argument("--confidence_percentile", type=float, default=40.0)
     parser.add_argument("--save_ply", default=None,
                         help="Save merged two-submap point cloud to this .ply")
     return parser.parse_args()
@@ -36,7 +35,7 @@ def check(label: str, condition: bool) -> None:
     status = "PASS" if condition else "FAIL"
     print(f"  [{status}] {label}")
     if not condition:
-        sys.exit(1)
+        raise AssertionError(f"FAIL: {label}")
 
 
 def main():
@@ -52,12 +51,12 @@ def main():
     check(f"At least {needed} images available", len(all_paths) >= needed)
     all_paths = all_paths[:needed]
 
-    from da3_slam.depth_estimator import DepthEstimator
-    from da3_slam.submap import SubmapBuilder
-    from da3_slam.alignment import SubmapAligner
+    from da3_slam.frontend.depth_estimator import DepthEstimator
+    from da3_slam.frontend.submap import SubmapBuilder
+    from da3_slam.backend.alignment import SubmapAligner
 
     estimator = DepthEstimator()
-    builder = SubmapBuilder(estimator, conf_percentile=args.conf_percentile)
+    builder = SubmapBuilder(estimator, confidence_percentile=args.confidence_percentile)
     aligner = SubmapAligner()
 
     # ── build sequence ────────────────────────────────────────────────────────

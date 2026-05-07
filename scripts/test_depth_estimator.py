@@ -6,7 +6,6 @@ Usage:
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +15,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--max_frames", type=int, default=8)
-    parser.add_argument("--conf_percentile", type=float, default=40.0)
+    parser.add_argument("--confidence_percentile", type=float, default=40.0)
     return parser.parse_args()
 
 
@@ -30,7 +29,7 @@ def check(label: str, condition: bool) -> None:
     status = "PASS" if condition else "FAIL"
     print(f"  [{status}] {label}")
     if not condition:
-        sys.exit(1)
+        raise AssertionError(f"FAIL: {label}")
 
 
 def main():
@@ -46,7 +45,7 @@ def main():
 
     # ── run inference ─────────────────────────────────────────────────────────
     header("DepthEstimator.infer()")
-    from da3_slam.depth_estimator import DepthEstimator
+    from da3_slam.frontend.depth_estimator import DepthEstimator
     estimator = DepthEstimator()
     pred = estimator.infer(paths)
     N = len(paths)
@@ -54,7 +53,7 @@ def main():
     # ── shapes ────────────────────────────────────────────────────────────────
     header("Output shapes")
     check(f"depth shape    = ({N}, H, W)", pred.depth.ndim == 3 and pred.depth.shape[0] == N)
-    check(f"conf shape     = ({N}, H, W)", pred.conf.shape == pred.depth.shape)
+    check(f"confidence shape = ({N}, H, W)", pred.confidence.shape == pred.depth.shape)
     check(f"extrinsics shape = ({N}, 4, 4)", pred.extrinsics.shape == (N, 4, 4))
     check(f"intrinsics shape = ({N}, 3, 3)", pred.intrinsics.shape == (N, 3, 3))
     check(f"n_frames property = {N}", pred.n_frames == N)
@@ -62,7 +61,7 @@ def main():
     # ── value ranges ──────────────────────────────────────────────────────────
     header("Value ranges")
     check("depth > 0 everywhere", pred.depth.min() > 0)
-    check("conf in [0, 1]", pred.conf.min() >= 0.0 and pred.conf.max() <= 1.0)
+    check("confidence in [0, 1]", pred.confidence.min() >= 0.0 and pred.confidence.max() <= 1.0)
 
     for i in range(N):
         R = pred.extrinsics[i, :3, :3]
@@ -74,9 +73,9 @@ def main():
     check("extrinsics homogeneous row = [0,0,0,1]",
           np.allclose(bottom_row, expected[None], atol=1e-6))
 
-    # ── confident_mask ────────────────────────────────────────────────────────
-    header(f"confident_mask(percentile={args.conf_percentile})")
-    mask = pred.confident_mask(args.conf_percentile)
+    # ── confidence_mask ───────────────────────────────────────────────────────
+    header(f"confidence_mask(percentile={args.confidence_percentile})")
+    mask = pred.confidence_mask(args.confidence_percentile)
     check("mask shape matches depth", mask.shape == pred.depth.shape)
     check("mask dtype is bool", mask.dtype == bool)
     for i in range(N):
@@ -91,7 +90,7 @@ def main():
     # ── to_pointcloud ─────────────────────────────────────────────────────────
     header("to_pointcloud()")
     for i in range(N):
-        points, pc_mask = pred.to_pointcloud(i, conf_percentile=args.conf_percentile)
+        points, pc_mask = pred.to_pointcloud(i, confidence_percentile=args.confidence_percentile)
         check(f"frame {i:02d}: points shape = (M, 3)", points.ndim == 2 and points.shape[1] == 3)
         check(f"frame {i:02d}: z > 0 (all points in front of camera)", (points[:, 2] > 0).all())
         print(f"           {len(points):,} points — "

@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +33,7 @@ def check(label: str, condition: bool) -> None:
     status = "PASS" if condition else "FAIL"
     print(f"  [{status}] {label}")
     if not condition:
-        sys.exit(1)
+        raise AssertionError(f"FAIL: {label}")
 
 
 def main():
@@ -47,10 +46,10 @@ def main():
     )
     check("At least 1 image available", len(all_paths) >= 1)
 
-    from da3_slam.depth_estimator import DepthEstimator
-    from da3_slam.submap import SubmapBuilder
-    from da3_slam.keyframe_selector import KeyframeSelector
-    from da3_slam.loop_closure import LoopClosureDetector, LoopClosureConfig
+    from da3_slam.frontend.depth_estimator import DepthEstimator
+    from da3_slam.frontend.submap import SubmapBuilder
+    from da3_slam.frontend.keyframe_selector import KeyframeSelector
+    from da3_slam.backend.loop_closure import LoopClosureDetector, LoopClosureConfig
     from da3_slam.config import load_slam_config
 
     slam_cfg = load_slam_config(submap_size=args.submap_size)
@@ -76,10 +75,10 @@ def main():
         similarity_threshold=args.similarity_threshold,
         min_submaps_apart=slam_cfg.loop_closure.min_submaps_apart,
         dinov2_model=slam_cfg.loop_closure.dinov2_model,
-        icp_max_iter=slam_cfg.loop_closure.icp_max_iter,
-        icp_tol=slam_cfg.loop_closure.icp_tol,
-        icp_max_dist=slam_cfg.loop_closure.icp_max_dist,
-        icp_n_points=slam_cfg.loop_closure.icp_n_points,
+        icp_max_iterations=slam_cfg.loop_closure.icp_max_iterations,
+        icp_tolerance=slam_cfg.loop_closure.icp_tolerance,
+        icp_max_distance=slam_cfg.loop_closure.icp_max_distance,
+        icp_num_points=slam_cfg.loop_closure.icp_num_points,
     )
     detector = LoopClosureDetector(config=cfg)
 
@@ -144,10 +143,10 @@ def main():
         similarity_threshold=0.0,
         min_submaps_apart=3,
         dinov2_model=slam_cfg.loop_closure.dinov2_model,
-        icp_max_iter=slam_cfg.loop_closure.icp_max_iter,
-        icp_tol=slam_cfg.loop_closure.icp_tol,
-        icp_max_dist=slam_cfg.loop_closure.icp_max_dist,
-        icp_n_points=slam_cfg.loop_closure.icp_n_points,
+        icp_max_iterations=slam_cfg.loop_closure.icp_max_iterations,
+        icp_tolerance=slam_cfg.loop_closure.icp_tolerance,
+        icp_max_distance=slam_cfg.loop_closure.icp_max_distance,
+        icp_num_points=slam_cfg.loop_closure.icp_num_points,
     ))
     # Register submaps 0, 1, 2 with identical descriptors
     for i in range(3):
