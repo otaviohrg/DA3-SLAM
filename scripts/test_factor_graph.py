@@ -128,7 +128,7 @@ def main():
     # Each subsequent pose should match the accumulated alignment
     accumulated = np.eye(4)
     for i, alignment in enumerate(alignments):
-        accumulated = accumulated @ alignment.T_a_from_b
+        accumulated = accumulated @ alignment.world_b_to_world_a
         T_opt = result.pose(i + 1)
         err = np.linalg.norm(T_opt - accumulated)
         print(f"  Submap {i+1}: alignment vs optimized error = {err:.2e}")

@@ -111,14 +111,13 @@ class SLAMResult:
         with open(path, "w") as f:
             f.write("# timestamp tx ty tz qx qy qz qw\n")
             for seq_idx, pose in sorted(self.keyframe_poses.items()):
-                t = pose[:3, 3]
-                R = Rotation.from_matrix(pose[:3, :3])
-                q = R.as_quat()  # (qx, qy, qz, qw)
+                translation = pose[:3, 3]
+                quaternion  = Rotation.from_matrix(pose[:3, :3]).as_quat()  # (qx, qy, qz, qw)
                 ts = timestamps[seq_idx] if timestamps is not None and seq_idx in timestamps else seq_idx / fps
                 f.write(
                     f"{ts:.6f} "
-                    f"{t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "
-                    f"{q[0]:.9f} {q[1]:.9f} {q[2]:.9f} {q[3]:.9f}\n"
+                    f"{translation[0]:.9f} {translation[1]:.9f} {translation[2]:.9f} "
+                    f"{quaternion[0]:.9f} {quaternion[1]:.9f} {quaternion[2]:.9f} {quaternion[3]:.9f}\n"
                 )
 
     def save_ply(self, path: str) -> None:
@@ -128,18 +127,19 @@ class SLAMResult:
         optimized global transform before writing so the cloud aligns with
         the trajectory.
         """
-        all_pts = []
-        all_col = []
+        all_points = []
+        all_colors = []
         for submap in self.submaps:
-            T_opt = self.optimization.pose(submap.idx)   # (4,4) submap-local → global
-            pts = submap.points_world                    # (M, 3) float32, submap-local
-            pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
-            all_pts.append((T_opt @ pts_h.T).T[:, :3].astype(np.float32))
-            all_col.append(submap.colors)
+            global_transform = self.optimization.pose(submap.idx)  # (4,4) submap-local → global
+            local_points = submap.points_world                     # (M, 3) float32
+            homogeneous  = np.hstack([local_points,
+                                      np.ones((len(local_points), 1), dtype=np.float32)])
+            all_points.append((global_transform @ homogeneous.T).T[:, :3].astype(np.float32))
+            all_colors.append(submap.colors)
 
-        all_pts = np.concatenate(all_pts)  # (N, 3) float32
-        all_col = np.concatenate(all_col)  # (N, 3) uint8
-        n = len(all_pts)
+        all_points = np.concatenate(all_points)  # (N, 3) float32
+        all_colors = np.concatenate(all_colors)  # (N, 3) uint8
+        n = len(all_points)
 
         header = (
             "ply\n"
@@ -155,8 +155,8 @@ class SLAMResult:
         )
         # Pack each vertex as 12 bytes xyz (float32) + 3 bytes rgb (uint8).
         # view(uint8) reinterprets the float32 memory; hstack interleaves them.
-        xyz_bytes = all_pts.view(np.uint8).reshape(n, 12)
-        vertex_data = np.hstack([xyz_bytes, all_col])  # (N, 15)
+        xyz_bytes   = all_points.view(np.uint8).reshape(n, 12)
+        vertex_data = np.hstack([xyz_bytes, all_colors])  # (N, 15)
 
         with open(path, "wb") as f:
             f.write(header.encode())
@@ -344,13 +344,11 @@ class DA3SLAM:
 
                 # ── align + add to graph ───────────────────────────────────
                 t0 = time.time()
+                alignment = None
                 if ctx.submaps:
                     alignment = self.aligner.align(ctx.submaps[-1], submap)
                     pose_graph.add_submap(submap, alignment)
-                    accumulated_pose = accumulated_pose @ alignment.T_a_from_b
-                    print(f"[{threading.current_thread().name}] Submap {submap.idx}: "
-                          f"rot={alignment.rotation_angle_deg:.2f}°  "
-                          f"|t|={np.linalg.norm(alignment.translation):.3f}m")
+                    accumulated_pose = accumulated_pose @ alignment.world_b_to_world_a
                 else:
                     pose_graph.add_submap(submap)
                 ctx.submaps.append(submap)
@@ -369,8 +367,24 @@ class DA3SLAM:
 
                 # ── incremental optimization ───────────────────────────────
                 t0 = time.time()
-                pose_graph.optimize()
+                opt = pose_graph.optimize()
                 ctx.timings["optimization"] += time.time() - t0
+
+                # Feed optimized poses back to the loop closure detector so
+                # subsequent ICP verifications use a better initial transform.
+                if self.detector is not None:
+                    self.detector.update_optimized_poses(opt.poses)
+
+                # Log after optimization so the Sim3 scale is available
+                tag = f"[{threading.current_thread().name}]"
+                s_opt = opt.scale(submap.idx)
+                if alignment is not None:
+                    print(f"{tag} Submap {submap.idx}: "
+                          f"rot={alignment.rotation_angle_deg:.2f}°  "
+                          f"|t|={np.linalg.norm(alignment.translation):.3f}m  "
+                          f"scale={s_opt:.4f}")
+                else:
+                    print(f"{tag} Submap {submap.idx}: origin  scale={s_opt:.4f}")
 
             if ctx.backend_error is not None:
                 return  # inference failed; let run() surface the error
@@ -404,16 +418,27 @@ def _build_keyframe_poses(
     """
     Compute global cam-to-world pose for every keyframe.
 
-    For each frame in each submap:
-        c2w_global = T_opt_submap @ inv(frame.extrinsic)
+    The submap global pose is a Sim3 matrix [scale·R | t; 0|1].  Composing
+    it naively with frame.cam_to_world would contaminate the rotation block
+    with scale.  Instead, decompose it and apply scale only to the translation
+    offset, keeping the rotation block pure SO3:
 
-    Where T_opt_submap is the optimized pose of the submap's local frame
-    in the global frame.
+        rotation_final    = global_rotation @ local_rotation
+        translation_final = scale · global_rotation @ local_translation + global_translation
     """
     poses: dict[int, np.ndarray] = {}
     for submap in submaps:
-        T_opt = opt.pose(submap.idx)
+        submap_global_pose  = opt.pose(submap.idx)           # (4,4) Sim3: [:3,:3] = scale·R
+        submap_scale        = opt.scale(submap.idx)
+        global_rotation     = submap_global_pose[:3, :3] / submap_scale  # pure SO3
+        global_translation  = submap_global_pose[:3, 3]
+
         for frame in submap.frames:
-            if frame.seq_idx not in poses:  # anchor frame appears in two submaps — first wins
-                poses[frame.seq_idx] = (T_opt @ frame.cam_to_world).astype(np.float32)
+            if frame.seq_idx not in poses:    # anchor frame — first submap wins
+                local_rotation    = frame.cam_to_world[:3, :3]
+                local_translation = frame.cam_to_world[:3, 3]
+                pose = np.eye(4, dtype=np.float32)
+                pose[:3, :3] = global_rotation @ local_rotation
+                pose[:3, 3]  = submap_scale * (global_rotation @ local_translation) + global_translation
+                poses[frame.seq_idx] = pose
     return poses

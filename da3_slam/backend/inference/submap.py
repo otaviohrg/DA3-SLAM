@@ -161,9 +161,9 @@ def _transform_to_world(
     extrinsic is world-to-cam (4x4), so cam-to-world = inv(extrinsic).
     """
     cam_to_world = np.linalg.inv(extrinsic)
-    R = cam_to_world[:3, :3]
-    t = cam_to_world[:3, 3]
-    return (points_cam @ R.T) + t
+    rotation    = cam_to_world[:3, :3]
+    translation = cam_to_world[:3, 3]
+    return (points_cam @ rotation.T) + translation
 
 
 def _extract_colors(image: np.ndarray, mask: np.ndarray) -> np.ndarray:

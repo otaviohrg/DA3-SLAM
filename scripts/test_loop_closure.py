@@ -127,11 +127,11 @@ def main():
               f"sim={lc.candidate.similarity:.4f}  icp_rmse={lc.icp_rmse:.4f}m")
         check("Matched against submap 0", lc.submap_idx_a == 0)
         check("Similarity ≥ threshold", lc.candidate.similarity >= args.similarity_threshold)
-        check("ICP transform shape (4,4)", lc.alignment.T_a_from_b.shape == (4, 4))
+        check("ICP transform shape (4,4)", lc.alignment.world_b_to_world_a.shape == (4, 4))
         check("ICP det(R) ≈ 1.0",
-              abs(np.linalg.det(lc.alignment.T_a_from_b[:3, :3]) - 1.0) < 1e-3)
+              abs(np.linalg.det(lc.alignment.world_b_to_world_a[:3, :3]) - 1.0) < 1e-3)
         # For a self-loop the transform should be close to identity
-        err = np.linalg.norm(lc.alignment.T_a_from_b - np.eye(4))
+        err = np.linalg.norm(lc.alignment.world_b_to_world_a - np.eye(4))
         print(f"  Transform error from identity: {err:.4f}")
         check("Self-loop transform ≈ identity (err < 0.1)", err < 0.1)
     else:

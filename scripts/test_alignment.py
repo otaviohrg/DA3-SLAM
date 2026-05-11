@@ -78,11 +78,11 @@ def main():
     print(f"  Method:           {result.method}")
     print(f"  Rotation angle:   {result.rotation_angle_deg:.4f} deg")
     print(f"  Translation:      {result.translation.round(4)}")
-    print(f"  T_a_from_b:\n{result.T_a_from_b.round(4)}")
+    print(f"  world_b_to_world_a:\n{result.world_b_to_world_a.round(4)}")
 
-    check("T shape (4,4)", result.T_a_from_b.shape == (4, 4))
+    check("T shape (4,4)", result.world_b_to_world_a.shape == (4, 4))
     check("T bottom row = [0,0,0,1]",
-          np.allclose(result.T_a_from_b[3], [0, 0, 0, 1], atol=1e-5))
+          np.allclose(result.world_b_to_world_a[3], [0, 0, 0, 1], atol=1e-5))
     check("det(R) ≈ 1.0",
           abs(np.linalg.det(result.rotation) - 1.0) < 1e-4)
 
@@ -93,7 +93,7 @@ def main():
 
     # The anchor frame's camera position in world_B, mapped to world_A via T
     pos_b_in_a = aligner.transform_points(
-        sm_b.frames[0].position_world[None], result.T_a_from_b
+        sm_b.frames[0].position_world[None], result.world_b_to_world_a
     )[0]
 
     err = float(np.linalg.norm(pos_a - pos_b_in_a))
@@ -104,7 +104,7 @@ def main():
 
     # ── apply_to_submap ───────────────────────────────────────────────────────
     header("apply_to_submap()")
-    sm_b_aligned = aligner.apply_to_submap(sm_b, result.T_a_from_b)
+    sm_b_aligned = aligner.apply_to_submap(sm_b, result.world_b_to_world_a)
 
     check("aligned submap has same n_frames", sm_b_aligned.n_frames == sm_b.n_frames)
     check("aligned points shape unchanged",

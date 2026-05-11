@@ -36,29 +36,32 @@ SEQUENCES = {
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _progress_hook(label: str):
-    start = time.time()
-    last_pct = [-1]
+class _ProgressHook:
+    """Callable progress hook for urllib.request.urlretrieve."""
 
-    def hook(block_num, block_size, total_size):
+    def __init__(self, label: str):
+        self._label    = label
+        self._start    = time.time()
+        self._last_pct = -1
+
+    def __call__(self, block_num: int, block_size: int, total_size: int) -> None:
         if total_size <= 0:
             return
         downloaded = block_num * block_size
         pct = min(100, int(downloaded * 100 / total_size))
-        if pct != last_pct[0]:
-            last_pct[0] = pct
-            mb = downloaded / 1_048_576
-            total_mb = total_size / 1_048_576
-            elapsed = time.time() - start
-            rate = mb / elapsed if elapsed > 0 else 0
-            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-            print(f"\r  {label}  [{bar}] {pct:3d}%  "
-                  f"{mb:.1f}/{total_mb:.1f} MB  {rate:.1f} MB/s",
-                  end="", flush=True)
-            if pct == 100:
-                print()
-
-    return hook
+        if pct == self._last_pct:
+            return
+        self._last_pct = pct
+        mb       = downloaded / 1_048_576
+        total_mb = total_size / 1_048_576
+        elapsed  = time.time() - self._start
+        rate     = mb / elapsed if elapsed > 0 else 0
+        bar      = "█" * (pct // 5) + "░" * (20 - pct // 5)
+        print(f"\r  {self._label}  [{bar}] {pct:3d}%  "
+              f"{mb:.1f}/{total_mb:.1f} MB  {rate:.1f} MB/s",
+              end="", flush=True)
+        if pct == 100:
+            print()
 
 
 def download_and_extract(name: str, url: str, data_dir: Path) -> Path:
@@ -75,7 +78,7 @@ def download_and_extract(name: str, url: str, data_dir: Path) -> Path:
     # Download
     if not tgz_path.exists():
         print(f"  [{name}] downloading from {url}")
-        urllib.request.urlretrieve(url, tgz_path, _progress_hook(name))
+        urllib.request.urlretrieve(url, tgz_path, _ProgressHook(name))
     else:
         print(f"  [{name}] archive already present, extracting…")
 

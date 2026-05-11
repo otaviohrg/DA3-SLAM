@@ -40,6 +40,18 @@ from pathlib import Path
 import numpy as np
 
 
+# ── formatting helpers ────────────────────────────────────────────────────────
+
+def _m_str(v: float) -> str:
+    return f"{v:.4f} m"
+
+def _cm_str(v: float) -> str:
+    return f"{v * 100:.2f} cm"
+
+def _deg_str(d: float) -> str:
+    return f"{d:.3f}°"
+
+
 # ── TUM dataset helpers ───────────────────────────────────────────────────────
 
 def parse_tum_file(path: str | Path) -> list[tuple[float, str]]:
@@ -405,19 +417,15 @@ def benchmark_sequence(seq_dir: Path, out_dir: Path, args) -> dict | None:
                            delta=max(1, n_matched // 8))
 
     # ── print results ─────────────────────────────────────────────────────────
-    def m_str(v): return f"{v:.4f} m"
-    def cm(v):   return f"{v*100:.2f} cm"
-    def deg(d):  return f"{d:.3f}°"
-
     print(f"\n  ┌─ ATE (SE3 alignment) ──────────────────────────────────┐")
-    print(f"  │  RMSE   {m_str(ate_se3['rmse']):<14}  Mean   {m_str(ate_se3['mean']):<14}  │")
-    print(f"  │  Median {m_str(ate_se3['median']):<14}  Max    {m_str(ate_se3['max']):<14}  │")
+    print(f"  │  RMSE   {_m_str(ate_se3['rmse']):<14}  Mean   {_m_str(ate_se3['mean']):<14}  │")
+    print(f"  │  Median {_m_str(ate_se3['median']):<14}  Max    {_m_str(ate_se3['max']):<14}  │")
     print(f"  ├─ ATE (Sim3 alignment, scale={ate_sim3['scale']:.4f}) ───────────────┤")
-    print(f"  │  RMSE   {m_str(ate_sim3['rmse']):<14}  Mean   {m_str(ate_sim3['mean']):<14}  │")
+    print(f"  │  RMSE   {_m_str(ate_sim3['rmse']):<14}  Mean   {_m_str(ate_sim3['mean']):<14}  │")
     print(f"  ├─ RPE  δ=1 frame ─────────────────────────────────────────┤")
-    print(f"  │  Trans  {cm(rpe_1['trans_rmse']):<14}  Rot    {deg(rpe_1['rot_rmse_deg']):<14}  │")
+    print(f"  │  Trans  {_cm_str(rpe_1['trans_rmse']):<14}  Rot    {_deg_str(rpe_1['rot_rmse_deg']):<14}  │")
     print(f"  ├─ RPE  δ={rpe_n['delta']} frames ────────────────────────────────────┤")
-    print(f"  │  Trans  {cm(rpe_n['trans_rmse']):<14}  Rot    {deg(rpe_n['rot_rmse_deg']):<14}  │")
+    print(f"  │  Trans  {_cm_str(rpe_n['trans_rmse']):<14}  Rot    {_deg_str(rpe_n['rot_rmse_deg']):<14}  │")
     print(f"  └───────────────────────────────────────────────────────────┘")
     print(f"  Keyframes: {result.n_keyframes}  Submaps: {len(result.submaps)}  "
           f"Loop closures: {len(result.loop_closures)}")
@@ -466,7 +474,7 @@ def print_summary(all_metrics: list[dict]) -> None:
 
     header = (f"{'Sequence':<{col}}  "
               f"{'ATE RMSE (m)':>13}  {'ATE Sim3 (m)':>13}  "
-              f"{'RPE-t (m)':>10}  {'RPE-r (°)':>10}  {'KFs':>5}")
+              f"{'RPE-t (m)':>10}  {'RPE-r (°)':>10}  {'KFs':>5}  {'LCs':>4}")
     sep = "═" * (len(header) + 2)
     print(f"\n{sep}")
     print("  BENCHMARK SUMMARY  —  ATE RMSE of the Absolute Trajectory Error")
@@ -480,10 +488,11 @@ def print_summary(all_metrics: list[dict]) -> None:
         rpt  = m["rpe_delta1"]["trans_rmse"]
         rpr  = m["rpe_delta1"]["rot_rmse_deg"]
         kfs  = m["n_keyframes"]
+        lcs  = m["n_loop_closures"]
         ate_values.append(ate)
         print(f"  {name:<{col}}  "
               f"{ate:>13.4f}  {ate3:>13.4f}  "
-              f"{rpt:>10.4f}  {rpr:>10.3f}  {kfs:>5}")
+              f"{rpt:>10.4f}  {rpr:>10.3f}  {kfs:>5}  {lcs:>4}")
 
     # Average row
     avg = sum(ate_values) / len(ate_values)

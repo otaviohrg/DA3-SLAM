@@ -115,7 +115,7 @@ def main():
 
     # Also print per-submap alignments
     print("\n" + "─" * 70)
-    print("  INTER-SUBMAP ALIGNMENTS (T_a_from_b)")
+    print("  INTER-SUBMAP ALIGNMENTS (world_b_to_world_a)")
     print("─" * 70)
     from da3_slam.backend.processing.alignment import SubmapAligner
     aligner = SubmapAligner()

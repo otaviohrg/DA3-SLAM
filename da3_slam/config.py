@@ -72,8 +72,10 @@ def load_slam_config(
             prior_translation_sigma=noise["prior_translation_sigma"],
             between_rotation_sigma=noise["between_rotation_sigma"],
             between_translation_sigma=noise["between_translation_sigma"],
+            between_scale_sigma=noise["between_scale_sigma"],
             loop_rotation_sigma=noise["loop_rotation_sigma"],
             loop_translation_sigma=noise["loop_translation_sigma"],
+            loop_scale_sigma=noise["loop_scale_sigma"],
         ),
         loop_closure=LoopClosureConfig(
             similarity_threshold=lc["similarity_threshold"],
@@ -83,5 +85,8 @@ def load_slam_config(
             icp_tolerance=lc["icp_tolerance"],
             icp_max_distance=lc["icp_max_distance"],
             icp_num_points=lc["icp_num_points"],
+            icp_max_rmse=lc["icp_max_rmse"],
+            icp_max_scale_deviation=lc["icp_max_scale_deviation"],
+            n_descriptor_frames=lc["n_descriptor_frames"],
         ),
     )
