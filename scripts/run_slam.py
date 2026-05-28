@@ -60,6 +60,9 @@ def parse_args(cfg: dict) -> argparse.Namespace:
     parser.add_argument("--depth_model_resolution", type=int,
                         default=cfg.get("depth_model_resolution"),
                         help="DA3 processing resolution")
+    parser.add_argument("--use_ray_pose", action="store_true",
+                        default=bool(cfg.get("use_ray_pose", False)),
+                        help="Use ray-based pose estimation instead of the camera decoder")
 
     # ── submap ────────────────────────────────────────────────────────────────
     parser.add_argument("--submap_size", type=int,
@@ -76,6 +79,11 @@ def parse_args(cfg: dict) -> argparse.Namespace:
                         default=cfg.get("confidence_percentile"),
                         help="Global confidence percentile threshold (0-100). "
                              "Higher = fewer but cleaner points")
+
+    # ── output ────────────────────────────────────────────────────────────────
+    parser.add_argument("--skip_ply", action="store_true",
+                        help="Skip saving the dense point cloud (map.ply). "
+                             "Use during benchmarking to avoid I/O overhead.")
 
     # ── loop closure ──────────────────────────────────────────────────────────
     parser.add_argument("--no_loop_closure", action="store_true",
@@ -119,6 +127,7 @@ def main():
         confidence_percentile=args.confidence_percentile,
         depth_model=args.depth_model,
         depth_model_resolution=args.depth_model_resolution,
+        use_ray_pose=args.use_ray_pose,
     )
     # Boolean / nested overrides not covered by load_slam_config scalars
     if args.no_loop_closure:
@@ -163,15 +172,25 @@ def main():
     tum_path   = str(out / "trajectory_tum.txt")
     ply_path   = str(out / "map.ply")
 
+    # Build real-timestamp map from filenames when they are numeric (e.g. TUM).
+    timestamps: dict[int, float] | None = None
+    try:
+        ts_list = [float(Path(p).stem) for p in image_paths]
+        timestamps = {i: ts for i, ts in enumerate(ts_list)}
+    except ValueError:
+        pass  # non-numeric filenames — fall back to seq_idx / fps
+
     result.save_kitti(kitti_path)
-    result.save_tum(tum_path)
-    result.save_ply(ply_path)
+    result.save_tum(tum_path, timestamps=timestamps)
+    if not args.skip_ply:
+        result.save_ply(ply_path)
 
     print(f"\n  Outputs saved to {out}/")
     print(f"    trajectory_kitti.txt  ({result.n_keyframes} poses)")
     print(f"    trajectory_tum.txt    ({result.n_keyframes} poses)")
-    n_pts = sum(len(sm.points_world) for sm in result.submaps)
-    print(f"    map.ply               ({n_pts:,} points)")
+    if not args.skip_ply:
+        n_pts = sum(len(sm.points_world) for sm in result.submaps)
+        print(f"    map.ply               ({n_pts:,} points)")
 
 
 if __name__ == "__main__":

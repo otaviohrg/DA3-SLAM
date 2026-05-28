@@ -2,7 +2,7 @@
 DA3-SLAM: full pipeline runner.
 
 Wires together:
-  OnlineKeyframeSelector → SubmapBuilder → SubmapAligner
+  OnlineKeyframeSelector → SubmapBuilder
   → PoseGraph → LoopClosureDetector → optimization
   → trajectory export (KITTI / TUM)
 """
@@ -19,7 +19,6 @@ import numpy as np
 from da3_slam.frontend.keyframe_selector import OnlineKeyframeSelector, KeyframeSelectorConfig
 from da3_slam.backend.inference.depth_estimator import DepthEstimator
 from da3_slam.backend.inference.submap import Submap, SubmapBuilder
-from da3_slam.backend.processing.alignment import SubmapAligner
 from da3_slam.backend.processing.factor_graph import PoseGraph, NoiseConfig, OptimizationResult
 from da3_slam.backend.processing.loop_closure import LoopClosureDetector, LoopClosureConfig, LoopClosure
 
@@ -47,6 +46,12 @@ class SLAMConfig:
 
     # Enable loop closure (can disable for speed during debugging)
     enable_loop_closure: bool
+
+    # Fields with defaults must come after all non-default fields
+    use_ray_pose: bool = False
+
+    # HuggingFace CLIP model ID for semantic embeddings (None = disabled)
+    semantic_model: str | None = None
 
 
 # ── result ────────────────────────────────────────────────────────────────────
@@ -123,19 +128,26 @@ class SLAMResult:
     def save_ply(self, path: str) -> None:
         """
         Save the full merged coloured point cloud as binary PLY.
-        Each submap's points are in the submap's local frame; we apply the
-        optimized global transform before writing so the cloud aligns with
-        the trajectory.
+        Each frame's camera-space points are projected to global world via the
+        per-frame optimised cam-to-world pose from GTSAM.
         """
         all_points = []
         all_colors = []
+        seen_seq_idx: set[int] = set()
         for submap in self.submaps:
-            global_transform = self.optimization.pose(submap.idx)  # (4,4) submap-local → global
-            local_points = submap.points_world                     # (M, 3) float32
-            homogeneous  = np.hstack([local_points,
-                                      np.ones((len(local_points), 1), dtype=np.float32)])
-            all_points.append((global_transform @ homogeneous.T).T[:, :3].astype(np.float32))
-            all_colors.append(submap.colors)
+            if submap.is_lc_submap:
+                continue
+            for frame in submap.frames:
+                if frame.seq_idx in seen_seq_idx:
+                    continue
+                seen_seq_idx.add(frame.seq_idx)
+                pts = frame.points_cam              # (M, 3) in camera space
+                if len(pts) == 0:
+                    continue
+                global_c2w = self.optimization.pose(frame.seq_idx).astype(np.float64)
+                homo = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
+                all_points.append((global_c2w @ homo.T).T[:, :3].astype(np.float32))
+                all_colors.append(frame.colors)
 
         all_points = np.concatenate(all_points)  # (N, 3) float32
         all_colors = np.concatenate(all_colors)  # (N, 3) uint8
@@ -155,12 +167,45 @@ class SLAMResult:
         )
         # Pack each vertex as 12 bytes xyz (float32) + 3 bytes rgb (uint8).
         # view(uint8) reinterprets the float32 memory; hstack interleaves them.
-        xyz_bytes   = all_points.view(np.uint8).reshape(n, 12)
+        xyz_bytes   = np.ascontiguousarray(all_points).view(np.uint8).reshape(n, 12)
         vertex_data = np.hstack([xyz_bytes, all_colors])  # (N, 15)
 
         with open(path, "wb") as f:
             f.write(header.encode())
             f.write(vertex_data.tobytes())
+
+    def retrieve_best_semantic_frame(
+        self,
+        text_embedding: np.ndarray,
+    ) -> tuple[int, int, float] | None:
+        """
+        Find the frame whose CLIP embedding best matches a text embedding.
+
+        Args:
+            text_embedding: (D,) float32 L2-normalised CLIP text vector,
+                            produced by SemanticEmbedder.encode_text()
+
+        Returns:
+            (submap_idx, frame_index_in_submap, cosine_similarity) of the
+            best-matching frame, or None if no semantic embeddings are stored.
+        """
+        best_submap_idx = None
+        best_frame_idx  = None
+        best_sim        = -np.inf
+
+        for submap in self.submaps:
+            for frame_idx, frame in enumerate(submap.frames):
+                if frame.semantic_vector is None:
+                    continue
+                sim = float(np.dot(text_embedding, frame.semantic_vector))
+                if sim > best_sim:
+                    best_sim        = sim
+                    best_submap_idx = submap.idx
+                    best_frame_idx  = frame_idx
+
+        if best_submap_idx is None:
+            return None
+        return best_submap_idx, best_frame_idx, best_sim
 
 
 # ── run context ───────────────────────────────────────────────────────────────
@@ -212,14 +257,19 @@ class DA3SLAM:
         self.estimator = DepthEstimator(
             model_id=cfg.depth_model,
             process_resolution=cfg.depth_model_resolution,
+            use_ray_pose=cfg.use_ray_pose,
         )
         self.builder = SubmapBuilder(
             self.estimator,
             confidence_percentile=cfg.confidence_percentile,
         )
-        self.aligner = SubmapAligner()
-        self.detector = LoopClosureDetector(cfg.loop_closure) \
+        self.detector = LoopClosureDetector(cfg.loop_closure, builder=self.builder) \
             if cfg.enable_loop_closure else None
+
+        self.semantic_embedder = None
+        if cfg.semantic_model:
+            from da3_slam.backend.inference.semantic_embedder import SemanticEmbedder
+            self.semantic_embedder = SemanticEmbedder(cfg.semantic_model)
 
     def run(self, image_paths: list[str]) -> SLAMResult:
         ctx = _RunContext(
@@ -318,6 +368,9 @@ class DA3SLAM:
 
                 t0 = time.time()
                 submap = self.builder.build(paths, indices, submap_idx)
+                if self.semantic_embedder is not None:
+                    semantic_vecs = self.semantic_embedder.encode_frames(submap)
+                    submap.set_all_semantic_vectors(semantic_vecs)
                 ctx.timings["submap_building"] += time.time() - t0
                 submap_idx += 1
 
@@ -333,77 +386,144 @@ class DA3SLAM:
                 pass  # processing is already dead; sentinel is not needed
 
     def _processing(self, ctx: _RunContext) -> None:
-        """Alignment, loop closure, and optimization: consumes Submaps from submap_queue."""
-        pose_graph       = PoseGraph(ctx.config.noise)
-        accumulated_pose = np.eye(4, dtype=np.float32)
+        """Per-frame SL(4) graph building, loop closure, and GTSAM optimisation."""
+        pose_graph = PoseGraph(ctx.config.noise)
+
+        # accumulated_scale: current submap's depth unit relative to submap 0.
+        # All between-factor translations are multiplied by this before insertion
+        # so the graph operates in a single consistent global metric scale.
+        accumulated_scale: float = 1.0
+        submap_scales: dict[int, float] = {}   # submap.idx → accumulated_scale
+        submap_dict:   dict[int, Submap] = {}  # submap.idx → Submap (for LC lookup)
+
         try:
             while True:
                 submap = ctx.submap_queue.get()
                 if submap is None:
                     break
 
-                # ── align + add to graph ───────────────────────────────────
-                t0 = time.time()
-                alignment = None
-                if ctx.submaps:
-                    alignment = self.aligner.align(ctx.submaps[-1], submap)
-                    pose_graph.add_submap(submap, alignment)
-                    accumulated_pose = accumulated_pose @ alignment.world_b_to_world_a
+                # ── build per-frame graph nodes ────────────────────────────
+                t0  = time.time()
+                tag = f"[{threading.current_thread().name}]"
+                prev_submap = ctx.submaps[-1] if ctx.submaps else None
+
+                if prev_submap is None:
+                    # First submap — initialise all frames, anchor frame 0.
+                    for frame in submap.frames:
+                        pose_graph.add_frame(
+                            frame.seq_idx,
+                            frame.cam_to_world.astype(np.float64),
+                        )
+                    pose_graph.add_prior(submap.frames[0].seq_idx)
+
                 else:
-                    pose_graph.add_submap(submap)
+                    # Estimate scale factor between this submap and the previous.
+                    # The anchor frame (shared seq_idx) observed the same scene in
+                    # both batches; the depth ratio gives the relative metric scale.
+                    delta_scale = _estimate_boundary_scale(prev_submap, submap)
+                    accumulated_scale *= delta_scale
+
+                    # The anchor frame node is already in the graph (from prev submap).
+                    # Initialise only the new frames using the anchor's current pose.
+                    anchor_global_c2w = pose_graph.get_pose(submap.frames[0].seq_idx)
+                    anchor_local_w2c  = submap.frames[0].extrinsic.astype(np.float64)
+
+                    for frame in submap.frames[1:]:
+                        local_c2w    = frame.cam_to_world.astype(np.float64)
+                        # Relative from anchor → frame in local (unscaled) coords
+                        relative     = anchor_local_w2c @ local_c2w
+                        relative_scaled        = relative.copy()
+                        relative_scaled[:3, 3] *= accumulated_scale
+                        pose_graph.add_frame(
+                            frame.seq_idx,
+                            anchor_global_c2w @ relative_scaled,
+                        )
+
+                    print(f"{tag} Submap {submap.idx}: scale={accumulated_scale:.4f} "
+                          f"(Δ={delta_scale:.4f})")
+
+                # Add inner-submap between factors (consecutive frame pairs).
+                # Translations are scaled to the global metric unit.
+                for i in range(1, len(submap.frames)):
+                    f_prev = submap.frames[i - 1]
+                    f_curr = submap.frames[i]
+                    relative        = f_prev.extrinsic.astype(np.float64) @ f_curr.cam_to_world.astype(np.float64)
+                    relative_scaled = relative.copy()
+                    relative_scaled[:3, 3] *= accumulated_scale
+                    pose_graph.add_between(f_prev.seq_idx, f_curr.seq_idx, relative_scaled)
+
                 ctx.submaps.append(submap)
+                submap_scales[submap.idx] = accumulated_scale
+                submap_dict[submap.idx]   = submap
                 ctx.timings["graph_building"] += time.time() - t0
 
                 # ── loop closure ───────────────────────────────────────────
                 if self.detector is not None:
                     t0 = time.time()
-                    closures = self.detector.process(submap, accumulated_pose)
+                    closures = self.detector.process(submap, None)
                     for closure in closures:
                         ctx.loop_closures.append(closure)
-                        pose_graph.add_loop_closure(
-                            closure.submap_idx_a, closure.submap_idx_b, closure.alignment
+
+                        # Compute the relative transform between the matched frames
+                        # from the LC re-inference, then scale to global metric units.
+                        lc_e0 = closure.lc_submap.frames[0].extrinsic.astype(np.float64)
+                        lc_e1 = closure.lc_submap.frames[1].extrinsic.astype(np.float64)
+                        # Relative: inv(lc_c2w[0]) @ lc_c2w[1] = lc_e0 @ inv(lc_e1)
+                        relative_lc = lc_e0 @ np.linalg.inv(lc_e1)
+
+                        # Scale LC translation to global units using the depth ratio
+                        # between LC frame 0 and the query frame (same physical camera).
+                        submap_b = submap_dict[closure.candidate.submap_idx_b]
+                        frame_b  = submap_b.frames[closure.candidate.frame_idx_b]
+                        submap_a = submap_dict[closure.candidate.submap_idx_a]
+                        frame_a  = submap_a.frames[closure.candidate.frame_idx_a]
+
+                        s_lc = _estimate_depth_scale(
+                            frame_b.depth,
+                            closure.lc_submap.frames[0].depth,
                         )
+                        relative_lc[:3, 3] *= s_lc * submap_scales[closure.candidate.submap_idx_b]
+
+                        pose_graph.add_between(
+                            frame_b.seq_idx, frame_a.seq_idx,
+                            relative_lc, loop=True,
+                        )
+                        print(f"{tag} LC {closure.candidate.submap_idx_b}"
+                              f"[f{closure.candidate.frame_idx_b}]"
+                              f" ↔ {closure.candidate.submap_idx_a}"
+                              f"[f{closure.candidate.frame_idx_a}]  "
+                              f"s_lc={s_lc:.3f}")
+
                     ctx.timings["loop_closure"] += time.time() - t0
 
-                # ── incremental optimization ───────────────────────────────
-                t0 = time.time()
+                # ── incremental optimisation ───────────────────────────────
+                t0  = time.time()
                 opt = pose_graph.optimize()
                 ctx.timings["optimization"] += time.time() - t0
-
-                # Feed optimized poses back to the loop closure detector so
-                # subsequent ICP verifications use a better initial transform.
-                if self.detector is not None:
-                    self.detector.update_optimized_poses(opt.poses)
-
-                # Log after optimization so the Sim3 scale is available
-                tag = f"[{threading.current_thread().name}]"
-                s_opt = opt.scale(submap.idx)
-                if alignment is not None:
-                    print(f"{tag} Submap {submap.idx}: "
-                          f"rot={alignment.rotation_angle_deg:.2f}°  "
-                          f"|t|={np.linalg.norm(alignment.translation):.3f}m  "
-                          f"scale={s_opt:.4f}")
-                else:
-                    print(f"{tag} Submap {submap.idx}: origin  scale={s_opt:.4f}")
+                print(f"{tag} Submap {submap.idx}: "
+                      f"{pose_graph.n_nodes} nodes  "
+                      f"{pose_graph.n_factors} factors  "
+                      f"error={opt.final_error:.4f}")
 
             if ctx.backend_error is not None:
-                return  # inference failed; let run() surface the error
+                return
 
             if not ctx.submaps:
                 raise RuntimeError(
                     "No submaps built — sequence too short or no keyframes detected."
                 )
 
-            # ── final optimization ─────────────────────────────────────────
+            # ── final optimisation ─────────────────────────────────────────
             tag = f"[{threading.current_thread().name}]"
-            print(f"{tag} Final optimization "
+            print(f"{tag} Final optimisation "
                   f"({pose_graph.n_nodes} nodes, {pose_graph.n_factors} factors) ...")
             t0 = time.time()
             ctx.opt_result = pose_graph.optimize(verbose=True)
             ctx.timings["optimization"] += time.time() - t0
-            print(f"{tag} Done: error {ctx.opt_result.final_error:.4f}, "
-                  f"{ctx.opt_result.iterations} iters, "
-                  f"{len(ctx.submaps)} submaps, {len(ctx.loop_closures)} loop closures")
+            print(f"{tag} Done: error={ctx.opt_result.final_error:.4f}  "
+                  f"iters={ctx.opt_result.iterations}  "
+                  f"submaps={len(ctx.submaps)}  "
+                  f"loop_closures={len(ctx.loop_closures)}")
 
         except Exception as exc:
             ctx.backend_error = exc
@@ -416,29 +536,52 @@ def _build_keyframe_poses(
     opt: OptimizationResult,
 ) -> dict[int, np.ndarray]:
     """
-    Compute global cam-to-world pose for every keyframe.
+    Return the per-frame cam-to-world poses from the GTSAM optimisation result.
 
-    The submap global pose is a Sim3 matrix [scale·R | t; 0|1].  Composing
-    it naively with frame.cam_to_world would contaminate the rotation block
-    with scale.  Instead, decompose it and apply scale only to the translation
-    offset, keeping the rotation block pure SO3:
-
-        rotation_final    = global_rotation @ local_rotation
-        translation_final = scale · global_rotation @ local_translation + global_translation
+    The anchor frame (shared between consecutive submaps) is included once —
+    the first submap that contributed it wins.  LC submaps are skipped.
     """
     poses: dict[int, np.ndarray] = {}
     for submap in submaps:
-        submap_global_pose  = opt.pose(submap.idx)           # (4,4) Sim3: [:3,:3] = scale·R
-        submap_scale        = opt.scale(submap.idx)
-        global_rotation     = submap_global_pose[:3, :3] / submap_scale  # pure SO3
-        global_translation  = submap_global_pose[:3, 3]
-
+        if submap.is_lc_submap:
+            continue
         for frame in submap.frames:
-            if frame.seq_idx not in poses:    # anchor frame — first submap wins
-                local_rotation    = frame.cam_to_world[:3, :3]
-                local_translation = frame.cam_to_world[:3, 3]
-                pose = np.eye(4, dtype=np.float32)
-                pose[:3, :3] = global_rotation @ local_rotation
-                pose[:3, 3]  = submap_scale * (global_rotation @ local_translation) + global_translation
-                poses[frame.seq_idx] = pose
+            if frame.seq_idx not in poses:
+                poses[frame.seq_idx] = opt.pose(frame.seq_idx).astype(np.float32)
     return poses
+
+
+def _estimate_boundary_scale(prev_submap: Submap, curr_submap: Submap) -> float:
+    """
+    Estimate the metric scale of curr_submap relative to prev_submap.
+
+    The anchor frame (last of prev, first of curr) observed the same scene in
+    both DA3 batches.  The median depth ratio gives the scale factor needed to
+    bring curr_submap's translations into the same metric unit as prev_submap.
+    """
+    return _estimate_depth_scale(
+        prev_submap.frames[-1].depth,
+        curr_submap.frames[0].depth,
+    )
+
+
+def _estimate_depth_scale(depth_ref: np.ndarray, depth_new: np.ndarray) -> float:
+    """
+    Median ratio depth_ref / depth_new over valid pixels.
+
+    If shapes differ (different DA3 resolutions), depth_new is resized to
+    match depth_ref before comparison.  Returns 1.0 if no valid pixels exist.
+    """
+    if depth_ref.shape != depth_new.shape:
+        import cv2
+        depth_new = cv2.resize(
+            depth_new, (depth_ref.shape[1], depth_ref.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    valid = (
+        (depth_ref > 0) & (depth_new > 0) &
+        np.isfinite(depth_ref) & np.isfinite(depth_new)
+    )
+    if not valid.any():
+        return 1.0
+    return float(np.median(depth_ref[valid] / depth_new[valid]))

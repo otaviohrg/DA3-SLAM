@@ -38,6 +38,10 @@ class KeyframeSelectorConfig:
     flow_pyramid_levels: int
     flow_stop_criteria: tuple[int, int, float]  # (type, maxCount, epsilon)
 
+    # Downsample factor applied before running optical flow.
+    # Higher = faster but coarser motion estimate. 4 is a good default.
+    flow_downsample_factor: int = 4
+
 
 # ── result type ───────────────────────────────────────────────────────────────
 
@@ -83,17 +87,18 @@ class KeyframeSelector:
         result = KeyframeResult()
 
         # Frame 0 is always a keyframe
-        reference_gray = _to_gray(images[0])
+        reference_gray = _to_flow_gray(images[0], config.flow_downsample_factor)
         reference_points = _detect_points(reference_gray, config)
         result.indices.append(0)
         result.disparities.append(0.0)
         frames_since_keyframe = 0
 
+        # Threshold is in downsampled-image pixels
         W = reference_gray.shape[1]
         min_disparity_pixels = config.min_disparity_fraction * W
 
         for i, img in enumerate(images[1:], start=1):
-            current_gray = _to_gray(img)
+            current_gray = _to_flow_gray(img, config.flow_downsample_factor)
             disparity = 0.0
 
             if reference_points is not None and len(reference_points) > 0:
@@ -110,7 +115,7 @@ class KeyframeSelector:
 
             if is_keyframe:
                 result.indices.append(i)
-                reference_gray = current_gray
+                reference_gray = current_gray  # already downsampled
                 reference_points = _detect_points(reference_gray, config)
                 frames_since_keyframe = 0
 
@@ -147,7 +152,7 @@ class OnlineKeyframeSelector:
             True if this frame is a keyframe
         """
         config = self.config
-        gray = _to_gray(image)
+        gray = _to_flow_gray(image, config.flow_downsample_factor)
 
         if self._reference_gray is None:
             self._reference_gray = gray
@@ -155,6 +160,7 @@ class OnlineKeyframeSelector:
             self._frames_since_keyframe = 0
             return True
 
+        # Threshold is in downsampled-image pixels
         W = gray.shape[1]
         min_disparity_pixels = config.min_disparity_fraction * W
         disparity = 0.0
@@ -169,7 +175,7 @@ class OnlineKeyframeSelector:
         )
 
         if is_keyframe:
-            self._reference_gray = gray
+            self._reference_gray = gray  # already downsampled
             self._reference_points = _detect_points(gray, config)
             self._frames_since_keyframe = 0
 
@@ -186,6 +192,15 @@ def _to_gray(img: np.ndarray) -> np.ndarray:
     if img.ndim == 3:
         return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     return img
+
+
+def _to_flow_gray(img: np.ndarray, downsample_factor: int) -> np.ndarray:
+    gray = _to_gray(img)
+    if downsample_factor > 1:
+        h, w = gray.shape[:2]
+        gray = cv2.resize(gray, (w // downsample_factor, h // downsample_factor),
+                          interpolation=cv2.INTER_AREA)
+    return gray
 
 
 def _load_rgb(path: str) -> np.ndarray:

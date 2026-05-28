@@ -1,23 +1,37 @@
 """
-Loop closure detection and transform estimation.
+Loop closure detection and pose estimation.
 
 Detection:
-    DINOv2 (ViT-B/14) CLS token as a global descriptor per submap.
-    Cosine similarity between descriptors identifies revisited places.
+    DINOv2 (ViT-B/14) per-frame L2-norm matching against all stored
+    per-frame descriptors across all eligible previous submaps.
+    A priority queue keeps the top-K candidates (lowest L2 = most similar).
 
-Transform estimation:
-    Point-to-point ICP between the two submaps' world-frame point clouds,
-    using the graph's accumulated pose as the initial alignment guess.
+Verification & transform estimation:
+    DA3 is re-run on the matched image pair [query_frame, detected_frame].
+    The relative pose from DA3 defines the loop constraint directly,
+    replacing the old ICP-based alignment.  A mean depth-confidence gate
+    (analogous to VGGT's image_match_ratio threshold) rejects bad pairs.
+
+Graph integration:
+    A 2-frame LC submap is built from the re-inference result and wired
+    into the pose graph with two factors:
+      - sequential factor:    query_submap  →  lc_submap
+      - loop closure factor:  detected_submap  ←  lc_submap
+    This mirrors VGGT-SLAM's mechanism exactly.
 """
 
 from __future__ import annotations
 
+import heapq
+import os
 from dataclasses import dataclass
 
 import numpy as np
 import torch
+import torchvision.transforms as T
+from PIL import Image as PILImage
 
-from da3_slam.backend.inference.submap import Submap
+from da3_slam.backend.inference.submap import Submap, SubmapBuilder
 from da3_slam.backend.processing.alignment import AlignmentResult
 
 
@@ -25,58 +39,47 @@ from da3_slam.backend.processing.alignment import AlignmentResult
 
 @dataclass
 class LoopClosureConfig:
-    # Canonical values: config/default.yaml → loop_closure.*
+    # L2 distance threshold for frame-level candidate detection.
+    # Lower distance = more similar.
+    distance_threshold: float
 
-    # Minimum cosine similarity to flag a candidate
-    similarity_threshold: float
-
-    # Submaps must be this far apart in the sequence to be a loop closure
+    # Minimum submap index gap between the query and any candidate
     min_submaps_apart: int
 
-    # DINOv2 model variant
-    dinov2_model: str
+    # Maximum loop closures accepted per submap (priority queue capacity)
+    max_loop_closures: int
 
-    # ICP: max number of iterations
-    icp_max_iterations: int
-
-    # ICP: convergence tolerance
-    icp_tolerance: float
-
-    # ICP: max correspondence distance (metres)
-    icp_max_distance: float
-
-    # Number of points to subsample per submap for ICP
-    icp_num_points: int
-
-    # ICP RMSE above which a loop closure is rejected (metres)
-    icp_max_rmse: float
-
-    # Maximum |log(scale)| deviation from 1.0 before the estimated Sim3 scale
-    # is considered unreliable and the loop closure is rejected.
-    # log(1.20) ≈ 0.18 → rejects scale changes larger than ~20%.
-    icp_max_scale_deviation: float
-
-    # Number of evenly-spaced frames to average for the submap descriptor.
-    # More frames → more robust but slower. 1 = middle frame only (old behaviour).
-    n_descriptor_frames: int
+    # Minimum mean DA3 depth confidence [0, 1] required to accept a closure.
+    # Analogous to VGGT's image_match_ratio >= 0.85 gate.
+    min_confidence_ratio: float
 
 
 # ── result types ──────────────────────────────────────────────────────────────
 
 @dataclass
 class LoopCandidate:
-    """A potential loop closure detected by descriptor matching."""
-    submap_idx_a: int
-    submap_idx_b: int
-    similarity: float
+    """Frame-level loop closure candidate from descriptor matching."""
+    submap_idx_a: int   # detected (older) submap
+    frame_idx_a:  int   # frame index within the detected submap
+    submap_idx_b: int   # query (current) submap
+    frame_idx_b:  int   # frame index within the query submap
+    distance:     float # L2 norm of descriptor difference (lower = better)
 
 
 @dataclass
 class LoopClosure:
-    """A verified loop closure with an estimated relative transform."""
-    candidate: LoopCandidate
-    alignment: AlignmentResult
-    icp_rmse: float  # point cloud fit quality (lower = better)
+    """
+    Verified loop closure with a 2-frame LC submap and two graph alignments.
+
+    The LC submap contains [query_frame, detected_frame] as processed by a
+    fresh DA3 inference.  Two AlignmentResults express the LC submap's world
+    frame relative to both the query and the detected submap's world frames.
+    """
+    candidate:            LoopCandidate
+    lc_submap:            Submap          # 2-frame LC submap from re-inference
+    alignment_to_query:   AlignmentResult # world_lc → world_query   (B=LC, A=query)
+    alignment_to_detected: AlignmentResult # world_lc → world_detected (B=LC, A=detected)
+    lc_confidence:        float           # mean depth confidence (diagnostic)
 
     @property
     def submap_idx_a(self) -> int:
@@ -87,51 +90,106 @@ class LoopClosure:
         return self.candidate.submap_idx_b
 
 
+# ── priority queue ────────────────────────────────────────────────────────────
+
+class LoopMatchQueue:
+    """
+    Fixed-capacity priority queue that keeps the N best LoopCandidates.
+
+    Internally a max-heap (on negated distance) of size max_size so that
+    heappushpop evicts the worst (largest distance) element when full.
+    A monotone counter breaks ties without requiring LoopCandidate.__lt__.
+    """
+
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self._heap: list = []
+        self._counter = 0
+
+    def push(self, candidate: LoopCandidate) -> None:
+        if self.max_size <= 0:
+            return
+        item = (-candidate.distance, self._counter, candidate)
+        self._counter += 1
+        if len(self._heap) < self.max_size:
+            heapq.heappush(self._heap, item)
+        else:
+            heapq.heappushpop(self._heap, item)
+
+    def get_best(self) -> list[LoopCandidate]:
+        """Return candidates sorted by distance ascending (best first)."""
+        return [c for _, _, c in sorted(self._heap, reverse=True)]
+
+
 # ── detector ──────────────────────────────────────────────────────────────────
 
 class LoopClosureDetector:
     """
-    Detects loop closures and estimates relative transforms.
+    Detects and verifies loop closures using frame-level DINOv2 matching
+    followed by DA3 re-inference on the matched image pair.
 
     Usage:
-        detector = LoopClosureDetector()
+        detector = LoopClosureDetector(config, builder)
         for submap in submaps:
             closures = detector.process(submap, graph_pose)
             for closure in closures:
-                pose_graph.add_loop_closure(closure.submap_idx_a,
-                                            closure.submap_idx_b,
-                                            closure.alignment)
+                pose_graph.add_lc_submap(
+                    closure.lc_submap,
+                    closure.candidate.submap_idx_b,
+                    closure.alignment_to_query,
+                )
+                pose_graph.add_loop_closure(
+                    closure.candidate.submap_idx_a,
+                    closure.lc_submap.idx,
+                    closure.alignment_to_detected,
+                )
     """
+
+    # SALAD input size (224×224) and ImageNet normalisation — mirrors VGGT-SLAM
+    _INPUT_SIZE = 224
+    _TRANSFORM  = T.Compose([
+        T.Resize((_INPUT_SIZE, _INPUT_SIZE), interpolation=T.InterpolationMode.BILINEAR),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
     def __init__(
         self,
         config: LoopClosureConfig | None = None,
+        builder: SubmapBuilder | None = None,
         device: torch.device | None = None,
     ):
-        self.config = config or LoopClosureConfig()
-        self.device = device or torch.device(
+        self.config  = config or LoopClosureConfig()
+        self.builder = builder
+        self.device  = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
-        self._descriptors: dict[int, np.ndarray] = {}
-        self._submaps: dict[int, Submap] = {}
-        self._poses: dict[int, np.ndarray] = {}      # raw accumulated poses
-        self._opt_poses: dict[int, np.ndarray] = {}  # latest optimized poses
 
-        print(f"[LoopClosure] Loading {self.config.dinov2_model}...")
-        self._model: torch.nn.Module = torch.hub.load(
-            "facebookresearch/dinov2",
-            self.config.dinov2_model,
-            verbose=False,
-        ).to(self.device).eval()
+        self._submaps:            dict[int, Submap]              = {}
+        # Per-frame descriptors indexed by (submap_idx, frame_idx)
+        self._frame_descriptors:  dict[tuple[int, int], np.ndarray] = {}
+        # Submap-level aggregated descriptor (mean of all frames, for diagnostics)
+        self._descriptors:        dict[int, np.ndarray]          = {}
+
+        # LC submap indices are negative to avoid collision with regular submaps
+        self._next_lc_idx = -1
+
+        print("[LoopClosure] Loading DINO-SALAD...")
+        from salad.eval import load_model
+        ckpt_path = os.path.join(torch.hub.get_dir(), "checkpoints", "dino_salad.ckpt")
+        if not os.path.exists(ckpt_path):
+            print(f"[LoopClosure] Checkpoint not found — downloading to {ckpt_path}")
+            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+            torch.hub.download_url_to_file(
+                "https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt",
+                ckpt_path,
+            )
+        self._model: torch.nn.Module = load_model(ckpt_path).to(self.device).eval()
         print("[LoopClosure] Ready.")
 
     def update_optimized_poses(self, poses: dict[int, np.ndarray]) -> None:
-        """
-        Update the stored optimized poses for all known submaps.
-        Called after each incremental optimization so ICP uses the best
-        available initial transform rather than the raw accumulated pose.
-        """
-        self._opt_poses.update(poses)
+        """No-op: optimized poses are no longer used (ICP replaced by re-inference)."""
+        pass
 
     @torch.no_grad()
     def process(
@@ -140,22 +198,34 @@ class LoopClosureDetector:
         graph_pose: np.ndarray,
     ) -> list[LoopClosure]:
         """
-        Add a submap and return verified loop closures.
+        Register a new submap and return verified loop closures.
+
+        Populates submap.retrieval_vectors with per-frame DINOv2 descriptors,
+        then runs frame-level L2 matching against all previous submaps.
+        Each candidate is verified by DA3 re-inference on the matched pair.
 
         Args:
             submap:     newly built submap
-            graph_pose: (4, 4) initial pose estimate for this submap
-                        in the global frame (from accumulated alignments)
+            graph_pose: (4, 4) accumulated pose estimate (retained for API compat)
 
         Returns:
-            list of LoopClosure objects ready to add to the factor graph
+            list of LoopClosure objects, each carrying a 2-frame LC submap
         """
         self._submaps[submap.idx] = submap
-        self._poses[submap.idx] = graph_pose
-        self._descriptors[submap.idx] = self._extract_descriptor(submap)
 
-        candidates = self._find_candidates(submap.idx)
-        closures = []
+        # Extract per-frame descriptors; store on submap and in local flat index
+        per_frame = self._extract_per_frame_descriptors(submap)
+        submap.set_all_retrieval_vectors(per_frame)
+        for frame_idx, desc in enumerate(per_frame):
+            self._frame_descriptors[(submap.idx, frame_idx)] = desc
+
+        # Submap-level aggregated descriptor (for diagnostics / future use)
+        mean_desc = np.mean(per_frame, axis=0)
+        mean_desc /= np.linalg.norm(mean_desc) + 1e-8
+        self._descriptors[submap.idx] = mean_desc
+
+        candidates = self._find_candidates(submap)
+        closures   = []
         for candidate in candidates:
             closure = self._verify(candidate)
             if closure is not None:
@@ -166,207 +236,146 @@ class LoopClosureDetector:
     # ── descriptor extraction ─────────────────────────────────────────────────
 
     @torch.no_grad()
-    def _extract_descriptor(self, submap: Submap) -> np.ndarray:
+    def _extract_per_frame_descriptors(self, submap: Submap) -> list[np.ndarray]:
         """
-        Extract a global L2-normalised descriptor by averaging DINOv2 CLS
-        tokens from n_descriptor_frames evenly-spaced frames in the submap.
-        Averaging suppresses per-frame noise and gives a view that is more
-        representative of the submap's spatial extent.
+        Extract one L2-normalised DINO-SALAD descriptor per frame in the submap.
+
+        All frames are processed as a single batch for efficiency.
+        Each (H, W, 3) uint8 numpy image is resized to 224×224, normalised
+        with ImageNet statistics, then fed to the SALAD model — identical
+        to VGGT-SLAM's ImageRetrieval.get_batch_descriptors().
         """
-        import torch.nn.functional as F
+        tensors = torch.stack([
+            self._TRANSFORM(PILImage.fromarray(f.image))
+            for f in submap.frames
+        ]).to(self.device)                               # (N, 3, 224, 224)
 
-        n_frames = len(submap.frames)
-        n_sample = min(self.config.n_descriptor_frames, n_frames)
-        if n_sample <= 1:
-            frame_indices = [n_frames // 2]
-        else:
-            frame_indices = [
-                int(round(i * (n_frames - 1) / (n_sample - 1)))
-                for i in range(n_sample)
-            ]
+        feats = self._model(tensors)                     # (N, D) on device
+        feats_np = feats.cpu().numpy().astype(np.float32)
+        norms = np.linalg.norm(feats_np, axis=1, keepdims=True)
+        feats_np /= norms + 1e-8
+        return [feats_np[i] for i in range(len(submap.frames))]
 
-        mean_np = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std_np  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    # ── frame-level candidate detection ──────────────────────────────────────
 
-        descriptors = []
-        for frame_idx in frame_indices:
-            img = submap.frames[frame_idx].image.astype(np.float32) / 255.0
-            img = (img - mean_np) / std_np
-            tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            _, _, H, W = tensor.shape
-            H14 = (H // 14) * 14
-            W14 = (W // 14) * 14
-            if H14 != H or W14 != W:
-                tensor = F.interpolate(tensor, size=(H14, W14), mode="bilinear",
-                                       align_corners=False)
-            feat = self._model(tensor).squeeze(0).cpu().numpy().astype(np.float32)
-            descriptors.append(feat)
+    def _find_candidates(self, query_submap: Submap) -> list[LoopCandidate]:
+        """
+        Compare every frame of query_submap against every stored frame of all
+        eligible previous submaps using L2 distance on DINOv2 descriptors.
 
-        descriptor = np.mean(descriptors, axis=0)
-        descriptor /= np.linalg.norm(descriptor) + 1e-8
-        return descriptor
+        Returns the top-K candidates from the priority queue (K = max_loop_closures).
+        """
+        config  = self.config
+        queue   = LoopMatchQueue(config.max_loop_closures)
 
-    # ── candidate detection ───────────────────────────────────────────────────
+        eligible = [
+            idx for idx in self._submaps
+            if abs(idx - query_submap.idx) > config.min_submaps_apart
+            and not self._submaps[idx].is_lc_submap
+        ]
 
-    def _find_candidates(self, query_idx: int) -> list[LoopCandidate]:
-        config = self.config
-        query_descriptor = self._descriptors[query_idx]
-        candidates = []
-
-        for candidate_idx, stored_descriptor in self._descriptors.items():
-            if abs(candidate_idx - query_idx) <= config.min_submaps_apart:
+        for frame_idx_b, frame_b in enumerate(query_submap.frames):
+            if frame_b.retrieval_vector is None:
                 continue
-            similarity = float(np.dot(query_descriptor, stored_descriptor))
-            if similarity >= config.similarity_threshold:
-                candidates.append(LoopCandidate(
-                    submap_idx_a=candidate_idx,
-                    submap_idx_b=query_idx,
-                    similarity=similarity,
-                ))
+            q_vec = frame_b.retrieval_vector
 
-        return sorted(candidates, key=lambda c: -c.similarity)
+            for a_idx in eligible:
+                a_submap = self._submaps[a_idx]
+                for frame_idx_a in range(len(a_submap.frames)):
+                    desc_a = self._frame_descriptors.get((a_idx, frame_idx_a))
+                    if desc_a is None:
+                        continue
+                    dist = float(np.linalg.norm(q_vec - desc_a))
+                    if dist < config.distance_threshold:
+                        queue.push(LoopCandidate(
+                            submap_idx_a=a_idx,
+                            frame_idx_a=frame_idx_a,
+                            submap_idx_b=query_submap.idx,
+                            frame_idx_b=frame_idx_b,
+                            distance=dist,
+                        ))
 
-    # ── transform verification via ICP ────────────────────────────────────────
+        return queue.get_best()
+
+    # ── re-inference verification ─────────────────────────────────────────────
 
     def _verify(self, candidate: LoopCandidate) -> LoopClosure | None:
         """
-        Estimate relative transform between two submaps using Sim3 ICP.
+        Verify a candidate by re-running DA3 on [query_frame, detected_frame].
 
-        Rejection gates (in order):
-          1. ICP fails to find enough correspondences → None
-          2. RMSE > icp_max_rmse → poor geometric fit
-          3. |log(scale)| > icp_max_scale_deviation → unreliable scale estimate
+        Alignment derivation (anchor frame principle):
+            Both frames share a physical camera viewpoint with the corresponding
+            frame in each original submap.  The world-to-cam extrinsic must be
+            identical for the same physical camera, so:
+
+                world_lc_to_world_X = inv(frame_X.extrinsic) @ lc_frameN.extrinsic
+
+            This gives an exact transform without any ICP or point cloud matching.
         """
-        submap_idx_a = candidate.submap_idx_a
-        submap_idx_b = candidate.submap_idx_b
-        submap_a = self._submaps[submap_idx_a]
-        submap_b = self._submaps[submap_idx_b]
+        if self.builder is None:
+            raise RuntimeError(
+                "LoopClosureDetector requires a SubmapBuilder for re-inference. "
+                "Pass builder= to the constructor."
+            )
 
-        # Use optimized pose if available (better initial alignment); else raw.
-        global_pose_a = self._opt_poses.get(submap_idx_a, self._poses[submap_idx_a])
-        global_pose_b = self._opt_poses.get(submap_idx_b, self._poses[submap_idx_b])
-        initial_world_b_to_world_a = np.linalg.inv(global_pose_a) @ global_pose_b
+        submap_a = self._submaps[candidate.submap_idx_a]  # detected
+        submap_b = self._submaps[candidate.submap_idx_b]  # query
+        frame_a  = submap_a.frames[candidate.frame_idx_a]
+        frame_b  = submap_b.frames[candidate.frame_idx_b]
 
-        destination_points = _subsample(submap_a.points_world, self.config.icp_num_points)
-        source_points      = _subsample(submap_b.points_world, self.config.icp_num_points)
-
-        icp_world_b_to_world_a, rmse = _icp(source_points, destination_points,
-                                             initial_world_b_to_world_a, self.config)
-
-        tag = f"[LoopClosure] {submap_idx_a}↔{submap_idx_b}  sim={candidate.similarity:.3f}"
-
-        if rmse is None:
-            print(f"{tag}  REJECTED (no correspondences)")
-            return None
-
-        if rmse > self.config.icp_max_rmse:
-            print(f"{tag}  icp_rmse={rmse:.4f}m  REJECTED (rmse > {self.config.icp_max_rmse}m)")
-            return None
-
-        icp_scale = float(np.cbrt(max(abs(np.linalg.det(icp_world_b_to_world_a[:3, :3])), 1e-12)))
-        log_scale_deviation = abs(float(np.log(max(icp_scale, 1e-6))))
-        if log_scale_deviation > self.config.icp_max_scale_deviation:
-            print(f"{tag}  icp_rmse={rmse:.4f}m  scale={icp_scale:.3f}"
-                  f"  REJECTED (|log(scale)|={log_scale_deviation:.3f} > {self.config.icp_max_scale_deviation})")
-            return None
-
-        print(f"{tag}  icp_rmse={rmse:.4f}m  scale={icp_scale:.4f}  ACCEPTED")
-        alignment = AlignmentResult(
-            world_b_to_world_a=icp_world_b_to_world_a.astype(np.float32),
-            method="icp",
-            scale=icp_scale,
+        tag = (
+            f"[LoopClosure] "
+            f"{candidate.submap_idx_a}[f{candidate.frame_idx_a}]"
+            f"↔{candidate.submap_idx_b}[f{candidate.frame_idx_b}]"
+            f"  dist={candidate.distance:.3f}"
         )
-        return LoopClosure(candidate=candidate, alignment=alignment, icp_rmse=rmse)
 
+        # Run DA3 on [query_frame, detected_frame] — order matters:
+        # LC frame 0 = query, LC frame 1 = detected
+        prediction = self.builder.estimator.infer([frame_b.image, frame_a.image])
 
-# ── ICP implementation ────────────────────────────────────────────────────────
+        # Quality gate: mean depth confidence across both LC frames
+        mean_conf = float(np.mean(prediction.confidence))
+        if mean_conf < self.config.min_confidence_ratio:
+            print(f"{tag}  REJECTED (confidence={mean_conf:.3f} < {self.config.min_confidence_ratio})")
+            return None
 
-def _subsample(points: np.ndarray, n: int) -> np.ndarray:
-    if len(points) <= n:
-        return points
-    selected_indices = np.random.choice(len(points), n, replace=False)
-    return points[selected_indices]
+        # Build 2-frame LC submap from the re-inference result
+        lc_idx    = self._next_lc_idx
+        self._next_lc_idx -= 1
+        lc_submap = self.builder.build_from_prediction(prediction, lc_idx)
+        lc_submap.set_lc_status(True)
+        lc_submap.set_last_non_loop_frame_index(1)
 
+        # Anchor frame alignment: derive world_lc_to_world_X for both submaps.
+        # lc_submap.frames[0].extrinsic: world_lc → cam  (same cam as frame_b)
+        # frame_b.extrinsic:             world_query → cam
+        # => world_lc_to_world_query = inv(frame_b.extrinsic) @ lc_frame0.extrinsic
+        world_lc_to_world_query = (
+            np.linalg.inv(frame_b.extrinsic.astype(np.float64))
+            @ lc_submap.frames[0].extrinsic.astype(np.float64)
+        )
+        world_lc_to_world_detected = (
+            np.linalg.inv(frame_a.extrinsic.astype(np.float64))
+            @ lc_submap.frames[1].extrinsic.astype(np.float64)
+        )
 
-def _icp(
-    source_points: np.ndarray,
-    destination_points: np.ndarray,
-    initial_transform: np.ndarray,
-    config: LoopClosureConfig,
-) -> tuple[np.ndarray, float | None]:
-    """
-    Point-to-point ICP.
+        alignment_to_query = AlignmentResult(
+            world_b_to_world_a=world_lc_to_world_query.astype(np.float32),
+            method="lc_inference",
+            scale=1.0,
+        )
+        alignment_to_detected = AlignmentResult(
+            world_b_to_world_a=world_lc_to_world_detected.astype(np.float32),
+            method="lc_inference",
+            scale=1.0,
+        )
 
-    Args:
-        source_points:      (M, 3) source points (submap B world-frame)
-        destination_points: (N, 3) destination points (submap A world-frame)
-        initial_transform:  (4, 4) initial transform (source → destination)
-        config:             ICP hyperparameters
-
-    Returns:
-        (refined_transform, rmse) or (initial_transform, None) on failure
-    """
-    from scipy.spatial import KDTree
-
-    transform = initial_transform.copy().astype(np.float64)
-    destination_tree = KDTree(destination_points)
-    prev_rmse = np.inf
-
-    for _ in range(config.icp_max_iterations):
-        scale_rotation, translation = transform[:3, :3], transform[:3, 3]
-        source_transformed = (source_points @ scale_rotation.T) + translation
-
-        distances, closest_indices = destination_tree.query(source_transformed, workers=-1)
-        inlier_mask = distances < config.icp_max_distance
-        if inlier_mask.sum() < 10:
-            return initial_transform, None
-
-        inlier_source      = source_transformed[inlier_mask]
-        inlier_destination = destination_points[closest_indices[inlier_mask]]
-        rmse = float(np.sqrt((distances[inlier_mask] ** 2).mean()))
-
-        if abs(prev_rmse - rmse) < config.icp_tolerance:
-            break
-        prev_rmse = rmse
-
-        # Estimate incremental Sim3 transform (Umeyama)
-        incremental_scale, incremental_rotation, incremental_translation = \
-            _umeyama_sim3(inlier_source, inlier_destination)
-        incremental_transform = np.eye(4, dtype=np.float64)
-        incremental_transform[:3, :3] = incremental_scale * incremental_rotation
-        incremental_transform[:3, 3]  = incremental_translation
-        transform = incremental_transform @ transform
-
-    return transform.astype(np.float32), rmse
-
-
-def _umeyama_sim3(
-    source_points: np.ndarray,
-    destination_points: np.ndarray,
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """
-    Sim3 alignment via Umeyama (1991).
-    Finds scale, rotation, translation minimising
-    sum ||scale·rotation·source_i + translation − destination_i||².
-    Returns (scale, rotation_3x3, translation_3).
-    """
-    num_points          = len(source_points)
-    source_centroid     = source_points.mean(0)
-    destination_centroid = destination_points.mean(0)
-    centered_source      = source_points      - source_centroid
-    centered_destination = destination_points - destination_centroid
-
-    source_variance       = float(np.trace(centered_source.T @ centered_source) / num_points)
-    cross_covariance      = (centered_destination.T @ centered_source) / num_points
-    U, singular_values, Vt = np.linalg.svd(cross_covariance)
-
-    determinant_product       = np.linalg.det(U) * np.linalg.det(Vt)
-    reflection_correction_matrix = np.diag([1., 1., float(np.sign(determinant_product))])
-
-    rotation    = U @ reflection_correction_matrix @ Vt
-    scale       = float(max(
-        np.trace(np.diag(singular_values) @ reflection_correction_matrix) / max(source_variance, 1e-12),
-        1e-6,
-    ))
-    translation = destination_centroid - scale * rotation @ source_centroid
-    return scale, rotation, translation
+        print(f"{tag}  conf={mean_conf:.3f}  lc_idx={lc_idx}  ACCEPTED")
+        return LoopClosure(
+            candidate=candidate,
+            lc_submap=lc_submap,
+            alignment_to_query=alignment_to_query,
+            alignment_to_detected=alignment_to_detected,
+            lc_confidence=mean_conf,
+        )

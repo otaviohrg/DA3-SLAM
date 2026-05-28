@@ -93,12 +93,14 @@ class DepthEstimator:
 
     def __init__(
         self,
-        model_id: str = "depth-anything/DA3NESTED-GIANT-LARGE",
+        model_id: str = "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
         process_resolution: int = 504,
         device: torch.device | None = None,
+        use_ray_pose: bool = False,
     ):
 
         self.process_resolution = process_resolution
+        self.use_ray_pose = use_ray_pose
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -121,7 +123,7 @@ class DepthEstimator:
         Returns:
             DepthPrediction with normalised outputs
         """
-        raw = self.model.inference(images, process_res=self.process_resolution)
+        raw = self.model.inference(images, process_res=self.process_resolution, use_ray_pose=self.use_ray_pose)
 
         depth = raw.depth.astype(np.float32)           # (N, H, W)
         confidence = _normalize_confidence(raw.conf.astype(np.float32))  # (N, H, W) → [0,1]

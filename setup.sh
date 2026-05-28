@@ -14,6 +14,14 @@ git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git
 uv pip install --no-build-isolation -e "./Depth-Anything-3[all]"
 cd -
 
-# 4. Install da3_slam package
+# 4. Clone and install SALAD
+echo "Cloning and installing Salad..."
+cd /opt/third_party
+git clone https://github.com/Dominic101/salad.git
+uv pip install -e ./salad
+uv pip install pytorch_lightning pytorch_metric_learning
+cd -
+
+# 5. Install da3_slam package
 echo "Installing da3_slam..."
 uv pip install -e /app
