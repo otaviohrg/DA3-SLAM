@@ -458,6 +458,7 @@ class SubmapBuilder:
     def build(
         self,
         image_paths: list[str],
+        images: list[np.ndarray],
         seq_indices: list[int],
         submap_idx: int = 0,
     ) -> Submap:
@@ -469,16 +470,17 @@ class SubmapBuilder:
         image provenance metadata.
 
         Args:
-            image_paths:  ordered list of keyframe file paths for this submap
+            image_paths:  ordered list of keyframe file paths (used for metadata only)
+            images:       pre-loaded HxWx3 uint8 RGB arrays, one per keyframe
             seq_indices:  corresponding indices in the original full sequence
             submap_idx:   position of this submap in the global sequence
 
         Returns:
             Submap with per-frame point clouds, raw maps, and metadata
         """
-        assert len(image_paths) == len(seq_indices)
+        assert len(image_paths) == len(seq_indices) == len(images)
 
-        prediction: DepthPrediction = self.estimator.infer(image_paths)
+        prediction: DepthPrediction = self.estimator.infer(images)
 
         # Global confidence threshold computed across all frames in this batch
         conf_threshold = float(np.percentile(prediction.confidence, self.confidence_percentile))

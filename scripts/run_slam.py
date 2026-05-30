@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -109,10 +110,13 @@ def main():
 
     # ── collect image paths ────────────────────────────────────────────────────
     exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    image_paths = sorted(
-        str(p) for p in Path(args.image_dir).iterdir()
-        if p.suffix.lower() in exts
-    )
+    all_images = sorted(p for p in Path(args.image_dir).iterdir() if p.suffix.lower() in exts)
+    # If the directory mixes RGB frames (frame*.jpg) and depth maps (depth*.png),
+    # keep only files whose stem does not start with "depth".
+    has_depth = any(p.stem.startswith("depth") for p in all_images)
+    if has_depth:
+        all_images = [p for p in all_images if not p.stem.startswith("depth")]
+    image_paths = [str(p) for p in all_images]
     if not image_paths:
         print(f"No images found in {args.image_dir}")
         sys.exit(1)
@@ -138,10 +142,15 @@ def main():
         config.keyframe.min_disparity_fraction = args.min_disparity_fraction
 
     # ── run ────────────────────────────────────────────────────────────────────
-    t_total = time.time()
+    t_load = time.time()
     slam = DA3SLAM(config)
+    t_load = time.time() - t_load
+
+    t_run = time.time()
     result = slam.run(image_paths)
-    t_total = time.time() - t_total
+    t_run = time.time() - t_run
+
+    t_total = t_load + t_run
 
     # ── print summary ──────────────────────────────────────────────────────────
     traj = result.trajectory
@@ -158,11 +167,22 @@ def main():
     print(f"  Loop closures:       {len(result.loop_closures)}")
     print(f"  Opt. final error:    {result.optimization.final_error:.6f}")
     print(f"  Trajectory length:   {path_length:.3f} m")
+    print(f"  Model load time:     {t_load:.1f}s")
+    print(f"  Pipeline time:       {t_run:.1f}s")
     print(f"  Total wall time:     {t_total:.1f}s")
+    print(f"  FPS (pipeline):      {len(image_paths) / t_run:.1f}")
     print()
-    print("  Timing breakdown:")
-    for k, v in result.timings.items():
-        print(f"    {k:<25} {v:.1f}s")
+    print("  Timing breakdown (total | per unit):")
+    print(f"    {'keyframe_selection':<25} {result.timings['keyframe_selection']:6.2f}s  "
+          f"| {result.timings['keyframe_selection'] / len(image_paths) * 1000:.2f} ms/frame")
+    print(f"    {'submap_building':<25} {result.timings['submap_building']:6.2f}s  "
+          f"| {result.timings['submap_building'] / max(len(result.submaps), 1):.2f} s/submap")
+    print(f"    {'loop_closure':<25} {result.timings['loop_closure']:6.2f}s  "
+          f"| {result.timings['loop_closure'] / max(len(result.submaps), 1):.2f} s/submap")
+    print(f"    {'graph_building':<25} {result.timings['graph_building']:6.2f}s  "
+          f"| {result.timings['graph_building'] / max(len(result.submaps), 1) * 1000:.1f} ms/submap")
+    print(f"    {'optimization':<25} {result.timings['optimization']:6.2f}s  "
+          f"| {result.timings['optimization'] / max(len(result.submaps), 1) * 1000:.1f} ms/submap")
 
     # ── save outputs ───────────────────────────────────────────────────────────
     out = Path(args.out_dir)
@@ -184,6 +204,30 @@ def main():
     result.save_tum(tum_path, timestamps=timestamps)
     if not args.skip_ply:
         result.save_ply(ply_path)
+
+    n_frames  = len(image_paths)
+    n_submaps = len(result.submaps)
+    t         = result.timings  # shorthand
+
+    timings_data = {
+        "model_load":    round(t_load, 3),
+        "pipeline":      round(t_run,  3),
+        "wall_total":    round(t_total, 3),
+        "frames":        n_frames,
+        "keyframes":     result.n_keyframes,
+        "submaps":       n_submaps,
+        "loop_closures": len(result.loop_closures),
+        **{k: round(v, 3) for k, v in t.items()},
+        # ── derived per-step metrics ───────────────────────────────────────
+        "fps":                    round(n_frames / t_run, 2) if t_run > 0 else 0,
+        "kf_sel_ms_per_frame":    round(t["keyframe_selection"] / n_frames * 1000, 3) if n_frames > 0 else 0,
+        "submap_s_per_submap":    round(t["submap_building"] / n_submaps, 3) if n_submaps > 0 else 0,
+        "lc_s_per_submap":        round(t["loop_closure"] / n_submaps, 3) if n_submaps > 0 else 0,
+        "graph_ms_per_submap":    round(t["graph_building"] / n_submaps * 1000, 3) if n_submaps > 0 else 0,
+        "opt_ms_per_submap":      round(t["optimization"] / n_submaps * 1000, 3) if n_submaps > 0 else 0,
+    }
+    with open(out / "timings.json", "w") as f:
+        json.dump(timings_data, f, indent=2)
 
     print(f"\n  Outputs saved to {out}/")
     print(f"    trajectory_kitti.txt  ({result.n_keyframes} poses)")

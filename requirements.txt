@@ -8,5 +8,6 @@ pyyaml
 gtsam
 pytorch_lightning
 pytorch_metric_learning
+trimesh
 hatchling
 editables

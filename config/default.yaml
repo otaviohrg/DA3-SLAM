@@ -27,7 +27,7 @@ keyframe:
   flow_window_size: [21, 21]    # calcOpticalFlowPyrLK: window size
   flow_pyramid_levels: 3        # calcOpticalFlowPyrLK: pyramid levels
   flow_stop_criteria: [3, 30, 0.01]  # calcOpticalFlowPyrLK: [type(EPS|COUNT=3), maxCount, epsilon]
-  flow_downsample_factor: 4     # downsample before flow; reduces cost ~factor^2 with negligible accuracy loss
+  flow_downsample_factor: 1     # downsample before flow; reduces cost ~factor^2 with negligible accuracy loss
 
 # ── point cloud filtering ──────────────────────────────────────────────────────
 confidence_percentile: 65.0    # global confidence percentile threshold (0-100)
