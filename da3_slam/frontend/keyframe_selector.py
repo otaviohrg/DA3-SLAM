@@ -1,9 +1,15 @@
 """
 Keyframe selection via Lucas-Kanade optical flow.
 
-A frame is promoted to a keyframe when the mean displacement of tracked
-feature points from the last keyframe exceeds `min_disparity_fraction` pixels.
-Mirrors the strategy used in VGGT-SLAM's frame_overlap.py.
+A frame is promoted to a keyframe when the mean displacement of feature
+points tracked from the last keyframe exceeds
+`min_disparity_fraction × image width`, or when `max_submap_size` frames
+have passed without one.  Mirrors the strategy used in VGGT-SLAM's
+frame_overlap.py.
+
+OnlineKeyframeSelector is the stateful frame-by-frame selector used by the
+pipeline; KeyframeSelector is a thin batch wrapper around it for scripts
+and offline analysis.
 """
 
 from __future__ import annotations
@@ -58,87 +64,21 @@ class KeyframeResult:
         return len(self.indices)
 
 
-# ── selector ──────────────────────────────────────────────────────────────────
-
-class KeyframeSelector:
-    """
-    Selects keyframes from an ordered sequence of RGB images.
-
-    The first frame is always a keyframe. Subsequent frames are promoted
-    when their mean optical flow from the current keyframe exceeds
-    `config.min_disparity_fraction`, or when `config.max_submap_size` is reached.
-    """
-
-    def __init__(self, config: KeyframeSelectorConfig | None = None):
-        self.config = config or KeyframeSelectorConfig()
-
-    def select(self, images: list[np.ndarray]) -> KeyframeResult:
-        """
-        Args:
-            images: ordered list of HxWx3 uint8 RGB frames
-
-        Returns:
-            KeyframeResult with selected indices and per-frame disparities
-        """
-        if not images:
-            return KeyframeResult()
-
-        config = self.config
-        result = KeyframeResult()
-
-        # Frame 0 is always a keyframe
-        reference_gray = _to_flow_gray(images[0], config.flow_downsample_factor)
-        reference_points = _detect_points(reference_gray, config)
-        result.indices.append(0)
-        result.disparities.append(0.0)
-        frames_since_keyframe = 0
-
-        # Threshold is in downsampled-image pixels
-        W = reference_gray.shape[1]
-        min_disparity_pixels = config.min_disparity_fraction * W
-
-        for i, img in enumerate(images[1:], start=1):
-            current_gray = _to_flow_gray(img, config.flow_downsample_factor)
-            disparity = 0.0
-
-            if reference_points is not None and len(reference_points) > 0:
-                disparity = _compute_disparity(reference_gray, current_gray,
-                                               reference_points, config)
-
-            result.disparities.append(disparity)
-            frames_since_keyframe += 1
-
-            is_keyframe = (
-                disparity >= min_disparity_pixels
-                or frames_since_keyframe >= config.max_submap_size
-            )
-
-            if is_keyframe:
-                result.indices.append(i)
-                reference_gray = current_gray  # already downsampled
-                reference_points = _detect_points(reference_gray, config)
-                frames_since_keyframe = 0
-
-        return result
-
-    def select_paths(self, image_paths: list[str]) -> KeyframeResult:
-        """Convenience wrapper that loads images from disk."""
-        images = [_load_rgb(p) for p in image_paths]
-        return self.select(images)
-
-
 # ── online selector ───────────────────────────────────────────────────────────
 
 class OnlineKeyframeSelector:
     """
     Stateful, frame-by-frame keyframe selector.
 
-    Call step() for each incoming frame; returns True when the frame
-    should be promoted to a keyframe. The first frame is always a keyframe.
+    Call step() for each incoming frame; returns True when the frame should
+    be promoted to a keyframe.  The first frame is always a keyframe.
+    The disparity measured for the most recent frame is available as
+    `last_disparity` (0.0 for the first frame).
     """
 
     def __init__(self, config: KeyframeSelectorConfig):
         self.config = config
+        self.last_disparity: float = 0.0
         self._reference_gray: np.ndarray | None = None
         self._reference_points: np.ndarray | None = None
         self._frames_since_keyframe: int = 0
@@ -155,47 +95,78 @@ class OnlineKeyframeSelector:
         gray = _to_flow_gray(image, config.flow_downsample_factor)
 
         if self._reference_gray is None:
-            self._reference_gray = gray
-            self._reference_points = _detect_points(gray, config)
-            self._frames_since_keyframe = 0
+            self._set_reference(gray)
+            self.last_disparity = 0.0
             return True
 
-        # Threshold is in downsampled-image pixels
-        W = gray.shape[1]
-        min_disparity_pixels = config.min_disparity_fraction * W
         disparity = 0.0
         if self._reference_points is not None and len(self._reference_points) > 0:
             disparity = _compute_disparity(self._reference_gray, gray,
                                            self._reference_points, config)
-
+        self.last_disparity = disparity
         self._frames_since_keyframe += 1
+
+        # Threshold is in downsampled-image pixels (gray is already downsampled,
+        # so the fraction-of-width semantics are preserved).
+        min_disparity_pixels = config.min_disparity_fraction * gray.shape[1]
         is_keyframe = (
             disparity >= min_disparity_pixels
             or self._frames_since_keyframe >= config.max_submap_size
         )
-
         if is_keyframe:
-            self._reference_gray = gray  # already downsampled
-            self._reference_points = _detect_points(gray, config)
-            self._frames_since_keyframe = 0
-
+            self._set_reference(gray)
         return is_keyframe
 
     def step_path(self, path: str) -> bool:
         """Convenience wrapper that loads an image from disk."""
         return self.step(_load_rgb(path))
 
+    def _set_reference(self, gray: np.ndarray) -> None:
+        """Make `gray` (already downsampled) the new tracking reference."""
+        self._reference_gray = gray
+        self._reference_points = _detect_points(gray, self.config)
+        self._frames_since_keyframe = 0
+
+
+# ── batch selector ────────────────────────────────────────────────────────────
+
+class KeyframeSelector:
+    """
+    Batch wrapper around OnlineKeyframeSelector for scripts and analysis.
+
+    Selects keyframes from an ordered sequence of RGB images and records the
+    per-frame disparities.
+    """
+
+    def __init__(self, config: KeyframeSelectorConfig):
+        self.config = config
+
+    def select(self, images: list[np.ndarray]) -> KeyframeResult:
+        """
+        Args:
+            images: ordered list of HxWx3 uint8 RGB frames
+
+        Returns:
+            KeyframeResult with selected indices and per-frame disparities
+        """
+        online = OnlineKeyframeSelector(self.config)
+        result = KeyframeResult()
+        for i, image in enumerate(images):
+            if online.step(image):
+                result.indices.append(i)
+            result.disparities.append(online.last_disparity)
+        return result
+
+    def select_paths(self, image_paths: list[str]) -> KeyframeResult:
+        """Convenience wrapper that loads images from disk."""
+        return self.select([_load_rgb(p) for p in image_paths])
+
 
 # ── internal helpers ──────────────────────────────────────────────────────────
 
-def _to_gray(img: np.ndarray) -> np.ndarray:
-    if img.ndim == 3:
-        return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    return img
-
-
 def _to_flow_gray(img: np.ndarray, downsample_factor: int) -> np.ndarray:
-    gray = _to_gray(img)
+    """Convert to grayscale and downsample for cheaper optical flow."""
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
     if downsample_factor > 1:
         h, w = gray.shape[:2]
         gray = cv2.resize(gray, (w // downsample_factor, h // downsample_factor),
@@ -229,7 +200,7 @@ def _compute_disparity(
     reference_points: np.ndarray,
     config: KeyframeSelectorConfig,
 ) -> float:
-    """Track reference_points from reference_gray to current_gray, return mean displacement."""
+    """Track reference_points into current_gray; return mean displacement (px)."""
     tracked_points, status, _ = cv2.calcOpticalFlowPyrLK(
         reference_gray,
         current_gray,

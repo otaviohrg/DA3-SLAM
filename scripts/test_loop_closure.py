@@ -1,165 +1,114 @@
 """
-Test da3_slam.loop_closure.
+Smoke test for da3_slam.backend.processing.loop_closure
+(requires GPU + DA3 + DINO-SALAD).
 
-Verifies descriptor extraction, similarity computation, and ICP transform
-estimation. Uses a synthetic loop (same submap vs itself) to test the
-full pipeline since a short video clip may not contain a real loop.
+Verifies per-frame descriptor extraction, candidate matching, and DA3
+re-inference verification.  Uses a synthetic loop (a copy of the same
+submap registered with a distant index) since a short clip may not contain
+a real loop.
 
 Usage:
     python scripts/test_loop_closure.py --image_dir data/video1_30fps
 """
 
 import argparse
-from pathlib import Path
+import dataclasses
 
 import numpy as np
+
+from smoke_test_utils import header, check, list_images, load_rgb_images
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--submap_size", type=int, default=8)
-    parser.add_argument("--similarity_threshold", type=float, default=0.85)
     return parser.parse_args()
-
-
-def header(title: str) -> None:
-    print(f"\n{'─' * 60}")
-    print(f"  {title}")
-    print('─' * 60)
-
-
-def check(label: str, condition: bool) -> None:
-    status = "PASS" if condition else "FAIL"
-    print(f"  [{status}] {label}")
-    if not condition:
-        raise AssertionError(f"FAIL: {label}")
 
 
 def main():
     args = parse_args()
 
-    exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    all_paths = sorted(
-        str(p) for p in Path(args.image_dir).iterdir()
-        if p.suffix.lower() in exts
-    )
-    check("At least 1 image available", len(all_paths) >= 1)
+    all_paths = list_images(args.image_dir, limit=args.submap_size)
+    check(f"At least {args.submap_size} images available",
+          len(all_paths) >= args.submap_size)
 
     from da3_slam.backend.inference.depth_estimator import DepthEstimator
     from da3_slam.backend.inference.submap import SubmapBuilder
-    from da3_slam.frontend.keyframe_selector import KeyframeSelector
-    from da3_slam.backend.processing.loop_closure import LoopClosureDetector, LoopClosureConfig
-    from da3_slam.config import load_slam_config
-
-    slam_cfg = load_slam_config(submap_size=args.submap_size)
+    from da3_slam.backend.processing.loop_closure import (
+        LoopClosureDetector, LoopClosureConfig, LoopMatchQueue, LoopCandidate,
+    )
 
     estimator = DepthEstimator()
     builder = SubmapBuilder(estimator)
-    selector = KeyframeSelector(slam_cfg.keyframe)
 
-    # Build one submap to test with
+    # ── build one test submap ─────────────────────────────────────────────────
     header("Building test submap")
-    kf_result = selector.select_paths(all_paths)
-    kf_indices = kf_result.indices[:args.submap_size]
-    submap = builder.build(
-        [all_paths[i] for i in kf_indices],
-        kf_indices,
-        submap_idx=0,
-    )
+    images = load_rgb_images(all_paths)
+    submap = builder.build(all_paths, images, list(range(len(all_paths))),
+                           submap_idx=0)
     print(f"  Submap: {submap.n_frames} frames, {len(submap.points_world):,} points")
 
-    # ── descriptor extraction ─────────────────────────────────────────────────
-    header("Descriptor extraction")
-    cfg = LoopClosureConfig(
-        similarity_threshold=args.similarity_threshold,
-        min_submaps_apart=slam_cfg.loop_closure.min_submaps_apart,
-        dinov2_model=slam_cfg.loop_closure.dinov2_model,
-        icp_max_iterations=slam_cfg.loop_closure.icp_max_iterations,
-        icp_tolerance=slam_cfg.loop_closure.icp_tolerance,
-        icp_max_distance=slam_cfg.loop_closure.icp_max_distance,
-        icp_num_points=slam_cfg.loop_closure.icp_num_points,
+    config = LoopClosureConfig(
+        distance_threshold=0.45,
+        min_submaps_apart=3,
+        max_loop_closures=1,
+        min_confidence_ratio=0.0,  # accept everything — we test the mechanics
     )
-    detector = LoopClosureDetector(config=cfg)
+    detector = LoopClosureDetector(config, builder=builder)
 
-    desc = detector._extract_descriptor(submap)
-    check("Descriptor is 1D", desc.ndim == 1)
-    check("Descriptor is float32", desc.dtype == np.float32)
-    check("Descriptor is L2-normalised", abs(np.linalg.norm(desc) - 1.0) < 1e-5)
-    print(f"  Descriptor dim: {len(desc)}")
-    print(f"  Descriptor norm: {np.linalg.norm(desc):.6f}")
+    # ── descriptor extraction ─────────────────────────────────────────────────
+    header("Per-frame descriptor extraction")
+    descriptors = detector._extract_per_frame_descriptors(submap)
+    check("one descriptor per frame", len(descriptors) == submap.n_frames)
+    for d in descriptors:
+        check("descriptor is 1D float32", d.ndim == 1 and d.dtype == np.float32)
+    norms = [float(np.linalg.norm(d)) for d in descriptors]
+    check("descriptors are L2-normalised",
+          all(abs(n - 1.0) < 1e-4 for n in norms))
+    print(f"  Descriptor dim: {len(descriptors[0])}")
 
-    # ── self-similarity ───────────────────────────────────────────────────────
-    header("Self-similarity (same descriptor)")
-    sim_self = float(np.dot(desc, desc))
-    check("Self-similarity = 1.0", abs(sim_self - 1.0) < 1e-5)
-    print(f"  Self-similarity: {sim_self:.6f}")
+    # ── no loop with a single registered submap ───────────────────────────────
+    header("No loop with a single submap")
+    closures = detector.process(submap)
+    check("no closures with only 1 submap", len(closures) == 0)
+    check("retrieval vectors stored on frames",
+          all(f.retrieval_vector is not None for f in submap.frames))
 
-    # ── synthetic loop closure ────────────────────────────────────────────────
-    # Register submap 0, then register a copy as submap 10 (far apart)
-    # to simulate revisiting the same place
-    header("Synthetic loop closure detection")
-    import copy, dataclasses
+    # ── synthetic loop: same content registered far away ──────────────────────
+    header("Synthetic loop closure (copy of submap at idx=10)")
+    submap_copy = dataclasses.replace(submap, idx=10)
+    closures = detector.process(submap_copy)
+    print(f"  Verified closures: {len(closures)}")
+    check("at least one closure found", len(closures) >= 1)
 
-    submap_a = submap  # idx=0
-    submap_b = dataclasses.replace(submap, idx=10)  # same frames, different idx
-
-    pose_identity = np.eye(4, dtype=np.float32)
-    closures_a = detector.process(submap_a, pose_identity)
-    check("No loop when only 1 submap registered", len(closures_a) == 0)
-
-    # Register submaps 1–9 as dummies (different content) to satisfy min_apart
-    import torch
-    for i in range(1, 10):
-        dummy = dataclasses.replace(submap, idx=i)
-        # Assign a random descriptor to make it clearly different
-        dummy_desc = np.random.randn(len(desc)).astype(np.float32)
-        dummy_desc /= np.linalg.norm(dummy_desc)
-        detector._descriptors[i] = dummy_desc
-        detector._submaps[i] = dummy
-        detector._poses[i] = pose_identity
-
-    closures_b = detector.process(submap_b, pose_identity)
-    print(f"  Loop candidates found: {len(closures_b)}")
-    if closures_b:
-        lc = closures_b[0]
-        print(f"  Best match: submap {lc.submap_idx_a}↔{lc.submap_idx_b}  "
-              f"sim={lc.candidate.similarity:.4f}  icp_rmse={lc.icp_rmse:.4f}m")
-        check("Matched against submap 0", lc.submap_idx_a == 0)
-        check("Similarity ≥ threshold", lc.candidate.similarity >= args.similarity_threshold)
-        check("ICP transform shape (4,4)", lc.alignment.world_b_to_world_a.shape == (4, 4))
-        check("ICP det(R) ≈ 1.0",
-              abs(np.linalg.det(lc.alignment.world_b_to_world_a[:3, :3]) - 1.0) < 1e-3)
-        # For a self-loop the transform should be close to identity
-        err = np.linalg.norm(lc.alignment.world_b_to_world_a - np.eye(4))
-        print(f"  Transform error from identity: {err:.4f}")
-        check("Self-loop transform ≈ identity (err < 0.1)", err < 0.1)
-    else:
-        print("  No loop detected (similarity below threshold — expected for non-looping video)")
+    lc = closures[0]
+    check("matched against submap 0", lc.candidate.submap_idx_a == 0)
+    check("distance below threshold",
+          lc.candidate.distance < config.distance_threshold)
+    check("LC submap has 2 frames", lc.lc_submap.n_frames == 2)
+    check("LC submap flagged", lc.lc_submap.is_lc_submap)
+    check("relative_b_to_a shape (4,4)", lc.relative_b_to_a.shape == (4, 4))
+    # Same image pair → the relative pose should be near identity
+    identity_err = float(np.linalg.norm(lc.relative_b_to_a - np.eye(4)))
+    print(f"  |relative_b_to_a − I| = {identity_err:.4f}  "
+          f"confidence = {lc.lc_confidence:.3f}")
+    check("self-loop transform ≈ identity (err < 0.1)", identity_err < 0.1)
 
     # ── min_submaps_apart enforcement ─────────────────────────────────────────
     header("min_submaps_apart enforcement")
-    detector2 = LoopClosureDetector(config=LoopClosureConfig(
-        similarity_threshold=0.0,
-        min_submaps_apart=3,
-        dinov2_model=slam_cfg.loop_closure.dinov2_model,
-        icp_max_iterations=slam_cfg.loop_closure.icp_max_iterations,
-        icp_tolerance=slam_cfg.loop_closure.icp_tolerance,
-        icp_max_distance=slam_cfg.loop_closure.icp_max_distance,
-        icp_num_points=slam_cfg.loop_closure.icp_num_points,
-    ))
-    # Register submaps 0, 1, 2 with identical descriptors
-    for i in range(3):
-        sm_i = dataclasses.replace(submap, idx=i)
-        detector2._descriptors[i] = desc
-        detector2._submaps[i] = sm_i
-        detector2._poses[i] = pose_identity
+    near_copy = dataclasses.replace(submap, idx=12)  # only 2 from idx=10
+    candidates = detector._find_candidates(near_copy)
+    check("gap-2 submap (idx 10) excluded as candidate",
+          all(c.submap_idx_a != 10 for c in candidates))
 
-    # Submap 2 is only 2 apart from 0 — should NOT be returned
-    candidates = detector2._find_candidates(2)
-    check("Adjacent submaps (gap ≤ 3) not returned as candidates",
-          all(abs(c.submap_idx_a - 2) > 3 for c in candidates))
-    print(f"  Candidates for submap 2 (min_apart=3): {[(c.submap_idx_a, c.similarity) for c in candidates]}")
+    # ── LoopMatchQueue (pure data structure) ──────────────────────────────────
+    header("LoopMatchQueue keeps the K best candidates")
+    queue = LoopMatchQueue(max_size=2)
+    for i, dist in enumerate([0.4, 0.1, 0.3, 0.2]):
+        queue.push(LoopCandidate(0, 0, 5, i, dist))
+    best = queue.get_best()
+    check("queue keeps 2 best", [c.distance for c in best] == [0.1, 0.2])
 
     header("All checks passed")
 

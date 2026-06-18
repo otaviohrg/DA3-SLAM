@@ -1,15 +1,13 @@
 """
-Test da3_slam.keyframe_selector.
+Smoke test for da3_slam.frontend.keyframe_selector (no GPU required).
 
 Usage:
     python scripts/test_keyframe_selector.py --image_dir data/video1_5fps
 """
 
 import argparse
-from pathlib import Path
 
-import cv2
-import numpy as np
+from smoke_test_utils import header, check, list_images, load_rgb_images
 
 
 def parse_args():
@@ -24,37 +22,17 @@ def parse_args():
     return parser.parse_args()
 
 
-def header(title: str) -> None:
-    print(f"\n{'─' * 60}")
-    print(f"  {title}")
-    print('─' * 60)
-
-
-def check(label: str, condition: bool) -> None:
-    status = "PASS" if condition else "FAIL"
-    print(f"  [{status}] {label}")
-    if not condition:
-        raise AssertionError(f"FAIL: {label}")
-
-
 def main():
     args = parse_args()
 
-    exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    paths = sorted(
-        str(p) for p in Path(args.image_dir).iterdir()
-        if p.suffix.lower() in exts
-    )
+    paths = list_images(args.image_dir)
     check(f"Found {len(paths)} images", len(paths) > 0)
 
-    from da3_slam.frontend.keyframe_selector import KeyframeSelector, KeyframeSelectorConfig
-
+    from da3_slam.frontend.keyframe_selector import KeyframeSelector, OnlineKeyframeSelector
     from da3_slam.config import load_slam_config
-    base_cfg = load_slam_config(
-        submap_size=args.max_submap_size,
-    )
-    base_cfg.keyframe.min_disparity_fraction = args.min_disparity_fraction
-    cfg = base_cfg.keyframe
+
+    cfg = load_slam_config(submap_size=args.max_submap_size).keyframe
+    cfg.min_disparity_fraction = args.min_disparity_fraction
     selector = KeyframeSelector(cfg)
 
     # ── select from paths ─────────────────────────────────────────────────────
@@ -67,13 +45,13 @@ def main():
     check("indices within bounds", max(result.indices) < len(paths))
     check("disparity length == n_frames", len(result.disparities) == len(paths))
     check("first disparity is 0.0", result.disparities[0] == 0.0)
-    check("non-keyframe disparities >= 0", all(d >= 0.0 for d in result.disparities))
+    check("disparities are non-negative", all(d >= 0.0 for d in result.disparities))
 
     # ── per-frame disparity table ─────────────────────────────────────────────
     header("Per-frame disparity")
-    for i, (disp, path) in enumerate(zip(result.disparities, paths)):
-        is_kf = i in result.indices
-        tag = " ← keyframe" if is_kf else ""
+    keyframe_set = set(result.indices)
+    for i, disp in enumerate(result.disparities):
+        tag = " ← keyframe" if i in keyframe_set else ""
         print(f"  frame {i:03d}  disparity={disp:6.2f}px{tag}")
 
     header("Summary")
@@ -86,9 +64,15 @@ def main():
 
     # ── select from numpy arrays ──────────────────────────────────────────────
     header("select() from numpy arrays")
-    images = [cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB) for p in paths]
+    images = load_rgb_images(paths)
     result_np = selector.select(images)
     check("same keyframe indices as path-based", result_np.indices == result.indices)
+
+    # ── online selector agrees with batch selector ────────────────────────────
+    header("OnlineKeyframeSelector.step() agrees with batch select()")
+    online = OnlineKeyframeSelector(cfg)
+    online_indices = [i for i, img in enumerate(images) if online.step(img)]
+    check("online indices match batch indices", online_indices == result.indices)
 
     # ── edge cases ────────────────────────────────────────────────────────────
     header("Edge cases")
@@ -101,10 +85,11 @@ def main():
 
     # ── max_submap_size enforcement ───────────────────────────────────────────
     header("max_submap_size enforcement")
-    cfg_tight = load_slam_config(submap_size=3).keyframe
+    from da3_slam.config import load_slam_config as _load
+    cfg_tight = _load(submap_size=3).keyframe
     cfg_tight.min_disparity_fraction = 999.0
     result_tight = KeyframeSelector(cfg_tight).select(images)
-    gaps = [result_tight.indices[i+1] - result_tight.indices[i]
+    gaps = [result_tight.indices[i + 1] - result_tight.indices[i]
             for i in range(len(result_tight.indices) - 1)]
     check("all gaps <= max_submap_size=3", all(g <= 3 for g in gaps))
     print(f"  Gaps between keyframes: {gaps}")

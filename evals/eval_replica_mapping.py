@@ -17,7 +17,6 @@ Usage:
 
 import argparse
 import json
-import sys
 import traceback
 from pathlib import Path
 
@@ -205,7 +204,6 @@ def try_rendering_metrics(
         psnr_vals.append(float("inf") if mse == 0 else float(20 * np.log10(255.0 / np.sqrt(mse))))
         ssim_vals.append(float(structural_similarity(rendered, gt_rgb, channel_axis=2, data_range=255)))
         if HAS_LPIPS:
-            import torch
             def to_t(img):
                 return torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             with torch.no_grad():

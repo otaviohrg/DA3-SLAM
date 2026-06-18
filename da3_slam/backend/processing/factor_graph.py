@@ -18,7 +18,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-import gtsam
 from gtsam import (
     NonlinearFactorGraph,
     Values,
@@ -31,22 +30,10 @@ from gtsam import (
 )
 from gtsam.symbol_shorthand import X
 
+# Re-exported so callers can import the config next to the component it tunes.
+from da3_slam.config import NoiseConfig
 
-# ── noise model ───────────────────────────────────────────────────────────────
-
-@dataclass
-class NoiseConfig:
-    # SL(4) noise is 15-dimensional (dim of sl(4) Lie algebra).
-    # Canonical values: config/default.yaml → noise.*
-
-    # Prior on the first frame — very tight so the map is anchored at the origin
-    prior_sigma: float
-
-    # Between-factor noise for consecutive frames within a submap
-    between_sigma: float
-
-    # Between-factor noise for loop closure constraints
-    loop_sigma: float
+__all__ = ["NoiseConfig", "OptimizationResult", "PoseGraph"]
 
 
 # ── result ────────────────────────────────────────────────────────────────────

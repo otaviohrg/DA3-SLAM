@@ -36,32 +36,39 @@ class DepthPrediction:
     # (N, H, W, 3) uint8 — images at DA3's processed resolution
     processed_images: np.ndarray
 
-    # Number of frames
     @property
     def n_frames(self) -> int:
         return self.depth.shape[0]
 
-    def confidence_mask(self, percentile: float = 65.0) -> np.ndarray:
+    def confidence_threshold(self, percentile: float = 65.0) -> float:
         """
-        Boolean mask (N, H, W) keeping pixels above `percentile` confidence.
+        Absolute confidence value at `percentile`, computed **globally**
+        across all frames in the batch.
 
-        The threshold is computed **globally** across all frames in the batch
-        so that consistently low-quality frames contribute fewer points than
-        high-quality ones (per-frame normalisation would always keep the same
-        fraction regardless of actual quality).
+        A global (rather than per-frame) threshold means consistently
+        low-quality frames contribute fewer points than high-quality ones —
+        a per-frame threshold would always keep the same fraction regardless
+        of actual quality.
+
+        Compute this once per batch and pass it to to_pointcloud(); the
+        percentile runs over the full (N, H, W) confidence array and is
+        expensive to recompute per frame.
         """
-        threshold = float(np.percentile(self.confidence, percentile))
-        return self.confidence >= threshold
+        return float(np.percentile(self.confidence, percentile))
+
+    def confidence_mask(self, percentile: float = 65.0) -> np.ndarray:
+        """Boolean mask (N, H, W) keeping pixels at/above the global percentile threshold."""
+        return self.confidence >= self.confidence_threshold(percentile)
 
     def to_pointcloud(
-        self, frame_idx: int, confidence_percentile: float = 65.0
+        self, frame_idx: int, confidence_threshold: float
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Lift a single depth frame to a 3D point cloud in camera space.
 
-        Only pixels whose confidence is in the top (100 - confidence_percentile)%
-        across the entire submap batch are included.  Also discards pixels
-        with non-positive or non-finite depth.
+        Keeps pixels whose confidence is >= `confidence_threshold` (an
+        absolute value, typically from confidence_threshold()) and whose
+        depth is positive and finite.
 
         Returns:
             points: (M, 3) float32 — 3D points in camera coordinates
@@ -70,7 +77,7 @@ class DepthPrediction:
         K = self.intrinsics[frame_idx]
         depth = self.depth[frame_idx]
 
-        high_confidence = self.confidence_mask(confidence_percentile)[frame_idx]
+        high_confidence = self.confidence[frame_idx] >= confidence_threshold
         valid_depth = np.isfinite(depth) & (depth > 0.0)
         mask = high_confidence & valid_depth
 

@@ -12,7 +12,6 @@ Usage:
 """
 
 import argparse
-import hashlib
 import tarfile
 import time
 import urllib.request
@@ -156,7 +155,7 @@ def main():
     if failed:
         print(f"Failed: {', '.join(failed)}")
 
-    print(f"\nTo run the benchmark:")
+    print("\\nTo run the benchmark:")
     seq_dirs = " \\\n              ".join(
         f"data/tum/rgbd_dataset_freiburg1_{n}" for n, _ in downloaded
     )

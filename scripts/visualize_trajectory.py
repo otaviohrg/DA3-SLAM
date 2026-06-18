@@ -45,7 +45,6 @@ def main():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     if args.tum:
         path = args.tum
@@ -63,7 +62,9 @@ def main():
     ax.plot(x, y, z, "-o", markersize=3, linewidth=1.5, color="royalblue")
     ax.scatter(x[0],  y[0],  z[0],  color="green", s=80, zorder=5, label="Start")
     ax.scatter(x[-1], y[-1], z[-1], color="red",   s=80, zorder=5, label="End")
-    ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)"); ax.set_zlabel("Z (m)")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
     ax.set_title(f"DA3-SLAM Trajectory  ({len(positions)} keyframes)")
     ax.legend()
     p3d = str(out_dir / "trajectory_3d.png")
@@ -76,9 +77,12 @@ def main():
     ax.plot(x, z, "-o", markersize=3, linewidth=1.5, color="royalblue")
     ax.scatter(x[0],  z[0],  color="green", s=80, zorder=5, label="Start")
     ax.scatter(x[-1], z[-1], color="red",   s=80, zorder=5, label="End")
-    ax.set_xlabel("X (m)"); ax.set_ylabel("Z (m)")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Z (m)")
     ax.set_title("Top-down view (XZ plane)")
-    ax.legend(); ax.set_aspect("equal"); ax.grid(True, alpha=0.3)
+    ax.legend()
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
     p2d = str(out_dir / "trajectory_topdown.png")
     fig.savefig(p2d, dpi=150, bbox_inches="tight")
     plt.close(fig)

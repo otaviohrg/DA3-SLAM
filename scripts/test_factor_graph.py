@@ -1,170 +1,129 @@
 """
-Test da3_slam.factor_graph.
+Smoke test for the graph-building path used by DA3SLAM._processing
+(requires GPU + DA3, and a GTSAM build with SL4 support).
 
-Builds a short sequence of submaps, constructs a pose graph, optimizes,
-and verifies the result is consistent with the anchor-based alignment.
+Builds consecutive submaps from real images exactly like the pipeline
+(1-frame anchor overlap), inserts them into the SL(4) PoseGraph with
+between-factors, optimises, and verifies that the optimised poses are
+consistent with DA3's relative poses.
 
 Usage:
     python scripts/test_factor_graph.py --image_dir data/video1_30fps
 """
 
 import argparse
-from pathlib import Path
 
 import numpy as np
+
+from smoke_test_utils import header, check, list_images, load_rgb_images
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--n_submaps", type=int, default=3,
-                        help="Number of consecutive submaps to build (default: 3)")
+                        help="Number of consecutive submaps to build")
     parser.add_argument("--submap_size", type=int, default=8)
-    parser.add_argument("--save_ply", default=None)
     return parser.parse_args()
-
-
-def header(title: str) -> None:
-    print(f"\n{'─' * 60}")
-    print(f"  {title}")
-    print('─' * 60)
-
-
-def check(label: str, condition: bool) -> None:
-    status = "PASS" if condition else "FAIL"
-    print(f"  [{status}] {label}")
-    if not condition:
-        raise AssertionError(f"FAIL: {label}")
 
 
 def main():
     args = parse_args()
 
-    exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    all_paths = sorted(
-        str(p) for p in Path(args.image_dir).iterdir()
-        if p.suffix.lower() in exts
-    )
-    check("At least 1 image available", len(all_paths) >= 1)
+    # n submaps of submap_size frames, each sharing 1 anchor with the next
+    needed = args.submap_size * args.n_submaps - (args.n_submaps - 1)
+    all_paths = list_images(args.image_dir)
+    check(f"At least {needed} images available", len(all_paths) >= needed)
+    all_paths = all_paths[:needed]
 
     from da3_slam.backend.inference.depth_estimator import DepthEstimator
     from da3_slam.backend.inference.submap import SubmapBuilder
-    from da3_slam.backend.processing.alignment import SubmapAligner
     from da3_slam.backend.processing.factor_graph import PoseGraph
-    from da3_slam.frontend.keyframe_selector import KeyframeSelector
     from da3_slam.config import load_slam_config
 
     slam_cfg = load_slam_config(submap_size=args.submap_size)
-
     estimator = DepthEstimator()
     builder = SubmapBuilder(estimator)
-    aligner = SubmapAligner()
 
-    # ── keyframe selection ────────────────────────────────────────────────────
-    header("Keyframe selection")
-    selector = KeyframeSelector(slam_cfg.keyframe)
-    kf_result = selector.select_paths(all_paths)
-    # Limit to enough keyframes for the requested number of submaps
-    max_kf = args.submap_size * args.n_submaps - (args.n_submaps - 1)
-    kf_indices = kf_result.indices[:max_kf]
-    print(f"  Selected {len(kf_indices)} keyframes from {len(all_paths)} frames")
-    check("Enough keyframes for requested submaps", len(kf_indices) >= max_kf)
+    # ── build submaps with 1-frame anchor overlap ─────────────────────────────
+    header(f"Building {args.n_submaps} submaps (anchor overlap)")
+    images = load_rgb_images(all_paths)
+    submaps = []
+    start = 0
+    for submap_idx in range(args.n_submaps):
+        end = start + args.submap_size
+        seq_indices = list(range(start, end))
+        submap = builder.build(all_paths[start:end], images[start:end],
+                               seq_indices, submap_idx=submap_idx)
+        submaps.append(submap)
+        print(f"  Submap {submap.idx}: seq_idx "
+              f"{submap.frames[0].seq_idx}–{submap.frames[-1].seq_idx}")
+        start = end - 1  # next submap starts at this submap's last frame
 
-    # ── build submaps ─────────────────────────────────────────────────────────
-    header(f"Building {args.n_submaps} submaps")
-    submaps = builder.build_sequence(all_paths, kf_indices, submap_size=args.submap_size)
-    check(f"{args.n_submaps} submaps built", len(submaps) == args.n_submaps)
-    for sm in submaps:
-        print(f"  Submap {sm.idx}: frames {sm.frames[0].seq_idx}–{sm.frames[-1].seq_idx}")
+    for prev, curr in zip(submaps, submaps[1:]):
+        check(f"submaps {prev.idx}/{curr.idx} share anchor",
+              prev.frames[-1].seq_idx == curr.frames[0].seq_idx)
 
-    # ── compute alignments ────────────────────────────────────────────────────
-    header("Computing alignments")
-    alignments = []
-    for i in range(len(submaps) - 1):
-        a = aligner.align(submaps[i], submaps[i + 1])
-        alignments.append(a)
-        print(f"  {i}→{i+1}  rot={a.rotation_angle_deg:.3f}°  "
-              f"t={a.translation.round(4)}")
-
-    # ── build factor graph ────────────────────────────────────────────────────
-    header("Building factor graph")
+    # ── build the graph the way DA3SLAM._processing does ──────────────────────
+    header("Building SL(4) pose graph")
     graph = PoseGraph(slam_cfg.noise)
-    graph.add_submap(submaps[0])
-    for i, (sm, alignment) in enumerate(zip(submaps[1:], alignments)):
-        graph.add_submap(sm, alignment)
 
-    check(f"n_nodes = {args.n_submaps}", graph.n_nodes == args.n_submaps)
-    # prior + between-factors
-    check(f"n_factors = {args.n_submaps}", graph.n_factors == args.n_submaps)
-    print(f"  Nodes:          {graph.n_nodes}")
-    print(f"  Factors:        {graph.n_factors}")
-    print(f"  Initial error:  {graph.initial_error():.6f}")
+    # First submap: frames at DA3 poses, prior on frame 0.
+    # (Scale handling is identity here — single-scale check only; the full
+    # cross-submap scale logic is exercised by the end-to-end pipeline.)
+    for frame in submaps[0].frames:
+        graph.add_frame(frame.seq_idx, frame.cam_to_world.astype(np.float64))
+    graph.add_prior(submaps[0].frames[0].seq_idx)
 
-    # ── optimize ──────────────────────────────────────────────────────────────
+    # Later submaps: place frames via the shared anchor
+    for submap in submaps[1:]:
+        anchor_global = graph.get_pose(submap.frames[0].seq_idx)
+        anchor_local_w2c = submap.frames[0].extrinsic.astype(np.float64)
+        for frame in submap.frames[1:]:
+            rel = anchor_local_w2c @ frame.cam_to_world.astype(np.float64)
+            graph.add_frame(frame.seq_idx, anchor_global @ rel)
+
+    # Between-factors for consecutive frames within each submap
+    for submap in submaps:
+        for prev, curr in zip(submap.frames, submap.frames[1:]):
+            rel = (prev.extrinsic.astype(np.float64)
+                   @ curr.cam_to_world.astype(np.float64))
+            graph.add_between(prev.seq_idx, curr.seq_idx, rel)
+
+    n_keyframes = needed
+    n_factors_expected = 1 + args.n_submaps * (args.submap_size - 1)
+    check(f"n_nodes = {n_keyframes}", graph.n_nodes == n_keyframes)
+    check(f"n_factors = {n_factors_expected} (1 prior + betweens)",
+          graph.n_factors == n_factors_expected)
+
+    # ── optimise ──────────────────────────────────────────────────────────────
     header("Optimizing (Levenberg-Marquardt)")
     result = graph.optimize(verbose=True)
+    print(f"  Final error: {result.final_error:.6f}  iters: {result.iterations}")
+    check("final error is finite", np.isfinite(result.final_error))
 
-    print(f"  Final error:    {result.final_error:.6f}")
-    print(f"  Iterations:     {result.iterations}")
-    check("Final error < initial error",
-          result.final_error <= graph.initial_error() + 1e-9)
+    # ── consistency checks ────────────────────────────────────────────────────
+    header("Optimized pose consistency")
+    first = submaps[0].frames[0]
+    err0 = float(np.linalg.norm(
+        result.pose(first.seq_idx) - first.cam_to_world.astype(np.float64)
+    ))
+    check(f"frame 0 pinned by prior  err={err0:.2e}", err0 < 1e-3)
 
-    # ── inspect optimized poses ───────────────────────────────────────────────
-    header("Optimized submap poses")
-    for idx in sorted(result.poses):
-        T = result.pose(idx)
-        R, t = T[:3, :3], T[:3, 3]
-        det = np.linalg.det(R)
-        print(f"  Submap {idx}  t={t.round(4)}  det(R)={det:.6f}")
-        check(f"Submap {idx} det(R) ≈ 1.0", abs(det - 1.0) < 1e-4)
-
-    # ── verify poses match pre-optimization estimates ─────────────────────────
-    header("Pose consistency with anchor alignment")
-    # Submap 0 should be at identity (prior fixes it)
-    T0 = result.pose(0)
-    check("Submap 0 ≈ identity",
-          np.allclose(T0, np.eye(4), atol=1e-4))
-
-    # Each subsequent pose should match the accumulated alignment
-    accumulated = np.eye(4)
-    for i, alignment in enumerate(alignments):
-        accumulated = accumulated @ alignment.world_b_to_world_a
-        T_opt = result.pose(i + 1)
-        err = np.linalg.norm(T_opt - accumulated)
-        print(f"  Submap {i+1}: alignment vs optimized error = {err:.2e}")
-        check(f"Submap {i+1} pose matches alignment (err < 1e-3)", err < 1e-3)
-
-    # ── apply optimized poses to rebuild global point cloud ───────────────────
-    if args.save_ply:
-        header(f"Saving global map → {args.save_ply}")
-        all_points, all_colors = [], []
-        for sm in submaps:
-            T_opt = result.pose(sm.idx)
-            # If this is submap 0, T_opt = identity; otherwise apply correction
-            sm_aligned = aligner.apply_to_submap(sm, T_opt) if sm.idx > 0 \
-                else sm
-            all_points.append(sm_aligned.points_world)
-            all_colors.append(sm_aligned.colors)
-
-        pts = np.concatenate(all_points)
-        cols = np.concatenate(all_colors)
-        _save_ply(pts, cols, args.save_ply)
-        print(f"  Saved {len(pts):,} points.")
+    # With consistent measurements the optimised relative poses must match
+    # the DA3 relative poses within each submap.
+    worst = 0.0
+    for submap in submaps:
+        for prev, curr in zip(submap.frames, submap.frames[1:]):
+            measured = (prev.extrinsic.astype(np.float64)
+                        @ curr.cam_to_world.astype(np.float64))
+            optimised = (np.linalg.inv(result.pose(prev.seq_idx))
+                         @ result.pose(curr.seq_idx))
+            worst = max(worst, float(np.linalg.norm(measured - optimised)))
+    print(f"  Worst relative-pose deviation: {worst:.2e}")
+    check("optimised relatives match measurements (err < 1e-3)", worst < 1e-3)
 
     header("All checks passed")
-
-
-def _save_ply(points: np.ndarray, colors: np.ndarray, path: str) -> None:
-    n = len(points)
-    with open(path, "w") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {n}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        f.write("end_header\n")
-        for pt, col in zip(points, colors):
-            f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} "
-                    f"{col[0]} {col[1]} {col[2]}\n")
 
 
 if __name__ == "__main__":

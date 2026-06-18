@@ -5,6 +5,34 @@ Wires together:
   OnlineKeyframeSelector → SubmapBuilder
   → PoseGraph → LoopClosureDetector → optimization
   → trajectory export (KITTI / TUM)
+
+Threading model (DA3SLAM.run):
+  Four daemon threads communicate over bounded queues; None is the
+  end-of-stream sentinel on every queue.
+
+    _frontend  →(batch_queue)→  _inference  →(submap_queue)→  _processing
+                                                  ⇅
+                                  (lc_queue / lc_result_queue)
+                                                  ⇅
+                                          _loop_closure_worker
+
+  Errors in any worker are recorded in _RunContext.backend_error; the other
+  threads poll it and shut down, and run() re-raises it at the end.
+
+Two structural invariants that are easy to break (mirrors VGGT-SLAM):
+
+  1. Anchor-frame submap bridging.  Consecutive submaps share one physical
+     keyframe (last of submap N = first of submap N+1, same seq_idx).  That
+     shared node is the *only* connection between submaps in the pose graph —
+     there is no explicit inter-submap factor.  If the batching in _frontend
+     changes, the 1-frame overlap must be preserved or the graph disconnects.
+
+  2. Per-submap metric scale accumulation.  Each DA3 batch has its own
+     arbitrary metric scale.  The median depth ratio at the shared anchor
+     frame gives the scale change between consecutive submaps; the running
+     product (accumulated_scale) converts every measurement's *translation*
+     into the metric unit of submap 0 before it enters the graph.  Rotation
+     is never scaled.
 """
 
 from __future__ import annotations
@@ -17,42 +45,14 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from da3_slam.frontend.keyframe_selector import OnlineKeyframeSelector, KeyframeSelectorConfig
+from da3_slam.config import SLAMConfig, load_slam_config
+from da3_slam.frontend.keyframe_selector import OnlineKeyframeSelector
 from da3_slam.backend.inference.depth_estimator import DepthEstimator
-from da3_slam.backend.inference.submap import Submap, SubmapBuilder
-from da3_slam.backend.processing.factor_graph import PoseGraph, NoiseConfig, OptimizationResult
-from da3_slam.backend.processing.loop_closure import LoopClosureDetector, LoopClosureConfig, LoopClosure
+from da3_slam.backend.inference.submap import Submap, SubmapBuilder, transform_points
+from da3_slam.backend.processing.factor_graph import PoseGraph, OptimizationResult
+from da3_slam.backend.processing.loop_closure import LoopClosureDetector, LoopClosure
 
-
-# ── config ────────────────────────────────────────────────────────────────────
-
-@dataclass
-class SLAMConfig:
-    # Canonical values: config/default.yaml
-    # Use da3_slam.config.load_slam_config() to construct from YAML.
-
-    keyframe: KeyframeSelectorConfig
-    noise: NoiseConfig
-    loop_closure: LoopClosureConfig
-
-    # Frames per submap (including the 1-frame anchor overlap)
-    submap_size: int
-
-    # Global confidence percentile threshold for point cloud filtering
-    confidence_percentile: float
-
-    # DA3 model
-    depth_model: str
-    depth_model_resolution: int
-
-    # Enable loop closure (can disable for speed during debugging)
-    enable_loop_closure: bool
-
-    # Fields with defaults must come after all non-default fields
-    use_ray_pose: bool = False
-
-    # HuggingFace CLIP model ID for semantic embeddings (None = disabled)
-    semantic_model: str | None = None
+__all__ = ["SLAMConfig", "SLAMResult", "DA3SLAM"]
 
 
 # ── result ────────────────────────────────────────────────────────────────────
@@ -118,12 +118,14 @@ class SLAMResult:
             f.write("# timestamp tx ty tz qx qy qz qw\n")
             for seq_idx, pose in sorted(self.keyframe_poses.items()):
                 translation = pose[:3, 3]
-                quaternion  = Rotation.from_matrix(pose[:3, :3]).as_quat()  # (qx, qy, qz, qw)
-                ts = timestamps[seq_idx] if timestamps is not None and seq_idx in timestamps else seq_idx / fps
+                quaternion = Rotation.from_matrix(pose[:3, :3]).as_quat()  # (qx, qy, qz, qw)
+                ts = timestamps[seq_idx] if timestamps is not None and seq_idx in timestamps \
+                    else seq_idx / fps
                 f.write(
                     f"{ts:.6f} "
                     f"{translation[0]:.9f} {translation[1]:.9f} {translation[2]:.9f} "
-                    f"{quaternion[0]:.9f} {quaternion[1]:.9f} {quaternion[2]:.9f} {quaternion[3]:.9f}\n"
+                    f"{quaternion[0]:.9f} {quaternion[1]:.9f} {quaternion[2]:.9f} "
+                    f"{quaternion[3]:.9f}\n"
                 )
 
     def save_ply(self, path: str) -> None:
@@ -139,15 +141,14 @@ class SLAMResult:
             if submap.is_lc_submap:
                 continue
             for frame in submap.frames:
+                # The anchor frame appears in two submaps; keep it once.
                 if frame.seq_idx in seen_seq_idx:
                     continue
                 seen_seq_idx.add(frame.seq_idx)
-                pts = frame.points_cam              # (M, 3) in camera space
-                if len(pts) == 0:
+                if len(frame.points_cam) == 0:
                     continue
                 global_c2w = self.optimization.pose(frame.seq_idx).astype(np.float64)
-                homo = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
-                all_points.append((global_c2w @ homo.T).T[:, :3].astype(np.float32))
+                all_points.append(transform_points(frame.points_cam, global_c2w))
                 all_colors.append(frame.colors)
 
         all_points = np.concatenate(all_points)  # (N, 3) float32
@@ -168,7 +169,7 @@ class SLAMResult:
         )
         # Pack each vertex as 12 bytes xyz (float32) + 3 bytes rgb (uint8).
         # view(uint8) reinterprets the float32 memory; hstack interleaves them.
-        xyz_bytes   = np.ascontiguousarray(all_points).view(np.uint8).reshape(n, 12)
+        xyz_bytes = np.ascontiguousarray(all_points).view(np.uint8).reshape(n, 12)
         vertex_data = np.hstack([xyz_bytes, all_colors])  # (N, 15)
 
         with open(path, "wb") as f:
@@ -190,63 +191,59 @@ class SLAMResult:
             (submap_idx, frame_index_in_submap, cosine_similarity) of the
             best-matching frame, or None if no semantic embeddings are stored.
         """
-        best_submap_idx = None
-        best_frame_idx  = None
-        best_sim        = -np.inf
-
+        best: tuple[int, int, float] | None = None
         for submap in self.submaps:
             for frame_idx, frame in enumerate(submap.frames):
                 if frame.semantic_vector is None:
                     continue
-                sim = float(np.dot(text_embedding, frame.semantic_vector))
-                if sim > best_sim:
-                    best_sim        = sim
-                    best_submap_idx = submap.idx
-                    best_frame_idx  = frame_idx
-
-        if best_submap_idx is None:
-            return None
-        return best_submap_idx, best_frame_idx, best_sim
+                similarity = float(np.dot(text_embedding, frame.semantic_vector))
+                if best is None or similarity > best[2]:
+                    best = (submap.idx, frame_idx, similarity)
+        return best
 
 
 # ── run context ───────────────────────────────────────────────────────────────
 
 @dataclass
 class _RunContext:
-    """Shared mutable state passed between the frontend, inference, processing, and LC threads."""
-    config:          SLAMConfig
-    batch_queue:     queue.Queue   # frontend   → inference  (paths, images, indices)
-    submap_queue:    queue.Queue   # inference  → processing (Submap)
-    lc_queue:        queue.Queue   # processing → lc         (submap, dict snaps)
-    lc_result_queue: queue.Queue   # lc         → processing (factor tuples)
-    lc_done:         threading.Event
-    submaps:         list[Submap]
-    loop_closures:   list[LoopClosure]
-    timings:         dict[str, float]
-    opt_result:      OptimizationResult | None = None
-    backend_error:   BaseException | None = None
+    """Shared mutable state passed between the four pipeline threads."""
+    config: SLAMConfig
+    batch_queue: queue.Queue       # frontend   → inference  (paths, images, indices)
+    submap_queue: queue.Queue      # inference  → processing (Submap)
+    lc_queue: queue.Queue          # processing → lc worker  (submap + dict snapshots)
+    lc_result_queue: queue.Queue   # lc worker  → processing (seq_b, seq_a, relative, closure)
+    lc_done: threading.Event
+    submaps: list[Submap]
+    loop_closures: list[LoopClosure]
+    timings: dict[str, float]
+    opt_result: OptimizationResult | None = None
+
+    # First exception raised by any worker thread; checked by the others to
+    # shut down early, and re-raised by run().
+    backend_error: BaseException | None = None
 
 
 def _drain_lc_results(ctx: _RunContext, pose_graph: PoseGraph) -> None:
-    """Add all completed LC results from lc_result_queue into the pose graph."""
+    """Move all completed loop-closure results from lc_result_queue into the graph."""
     tag = f"[{threading.current_thread().name}]"
     while True:
         try:
-            seq_b, seq_a, relative_lc, closure = ctx.lc_result_queue.get_nowait()
-            ctx.loop_closures.append(closure)
-            pose_graph.add_between(seq_b, seq_a, relative_lc, loop=True)
-            print(f"{tag} LC {closure.candidate.submap_idx_b}"
-                  f"[f{closure.candidate.frame_idx_b}]"
-                  f" ↔ {closure.candidate.submap_idx_a}"
-                  f"[f{closure.candidate.frame_idx_a}]")
+            seq_b, seq_a, relative_b_to_a, closure = ctx.lc_result_queue.get_nowait()
         except queue.Empty:
-            break
+            return
+        ctx.loop_closures.append(closure)
+        pose_graph.add_between(seq_b, seq_a, relative_b_to_a, loop=True)
+        print(f"{tag} LC {closure.candidate.submap_idx_b}"
+              f"[f{closure.candidate.frame_idx_b}]"
+              f" ↔ {closure.candidate.submap_idx_a}"
+              f"[f{closure.candidate.frame_idx_a}]")
 
 
 def _blocking_put(ctx: _RunContext, q: queue.Queue, item) -> bool:
-    """Put item on q, retrying every 0.5 s until space is available or a thread error is set.
+    """Put item on q, retrying every 0.5 s until space is available.
 
-    Returns False if a thread error was set before the item could be placed.
+    Returns False if another thread recorded an error before the item could
+    be placed (the pipeline is shutting down).
     """
     while True:
         try:
@@ -255,6 +252,38 @@ def _blocking_put(ctx: _RunContext, q: queue.Queue, item) -> bool:
         except queue.Full:
             if ctx.backend_error is not None:
                 return False
+
+
+def _scaled_translation(transform: np.ndarray, scale: float) -> np.ndarray:
+    """Copy of a (4, 4) transform with the translation multiplied by `scale`.
+
+    Rotation is never scaled — only translation carries the metric unit.
+    """
+    scaled = transform.copy()
+    scaled[:3, 3] *= scale
+    return scaled
+
+
+def _adjust_boundary_scale(
+    delta_scale: float,
+    damping: float,
+    clamp: float | None,
+) -> float:
+    """Damp and/or clamp a raw inter-submap boundary scale ratio.
+
+    Boundary ratios are chained multiplicatively (see module docstring), so
+    estimation noise compounds into scale drift over long sequences.  DA3
+    depth is nominally metric, so the true ratio should be near 1.0:
+
+      - damping g in [0, 1] applies delta^(1-g): 0 keeps the raw ratio
+        (full chaining), 1 forces 1.0 (trust DA3's metric consistency).
+      - clamp c (> 1) bounds the applied ratio to [1/c, c], guarding
+        against a single bad depth estimate at one boundary.
+    """
+    adjusted = float(delta_scale) ** (1.0 - damping)
+    if clamp is not None and clamp > 1.0:
+        adjusted = min(max(adjusted, 1.0 / clamp), clamp)
+    return adjusted
 
 
 # ── runner ────────────────────────────────────────────────────────────────────
@@ -271,7 +300,9 @@ class DA3SLAM:
     """
 
     def __init__(self, config: SLAMConfig | None = None):
-        self.config = config or SLAMConfig()
+        # Default to the canonical YAML config.  (Constructing SLAMConfig()
+        # directly is not possible — it has required fields.)
+        self.config = config or load_slam_config()
         cfg = self.config
 
         self.estimator = DepthEstimator(
@@ -283,11 +314,14 @@ class DA3SLAM:
             self.estimator,
             confidence_percentile=cfg.confidence_percentile,
         )
-        self.detector = LoopClosureDetector(cfg.loop_closure, builder=self.builder) \
+        self.detector = (
+            LoopClosureDetector(cfg.loop_closure, builder=self.builder)
             if cfg.enable_loop_closure else None
+        )
 
         self.semantic_embedder = None
         if cfg.semantic_model:
+            # Imported lazily: requires the optional `transformers` package.
             from da3_slam.backend.inference.semantic_embedder import SemanticEmbedder
             self.semantic_embedder = SemanticEmbedder(cfg.semantic_model)
 
@@ -307,69 +341,77 @@ class DA3SLAM:
             loop_closures=[],
             timings={
                 "keyframe_selection": 0.0,
-                "submap_building":    0.0,
-                "graph_building":     0.0,
-                "loop_closure":       0.0,
-                "optimization":       0.0,
+                "submap_building": 0.0,
+                "graph_building": 0.0,
+                "loop_closure": 0.0,
+                "optimization": 0.0,
             },
         )
 
         # Start consumers before producers so they are ready immediately.
-        processing_thread = threading.Thread(target=self._processing, args=(ctx,),
-                                             name="da3-processing", daemon=True)
-        inference_thread  = threading.Thread(target=self._inference,  args=(ctx,),
-                                             name="da3-inference",   daemon=True)
-        frontend_thread   = threading.Thread(target=self._frontend, args=(image_paths, ctx),
-                                             name="da3-frontend",    daemon=True)
+        threads = [
+            threading.Thread(target=self._processing, args=(ctx,),
+                             name="da3-processing", daemon=True),
+            threading.Thread(target=self._inference, args=(ctx,),
+                             name="da3-inference", daemon=True),
+        ]
+        if self.detector is not None:
+            threads.append(threading.Thread(target=self._loop_closure_worker,
+                                            args=(ctx,), name="da3-lc", daemon=True))
+        threads.append(threading.Thread(target=self._frontend, args=(image_paths, ctx),
+                                        name="da3-frontend", daemon=True))
+
         wall_start = time.time()
-        processing_thread.start()
-        inference_thread.start()
-        if self.detector is not None:
-            lc_thread = threading.Thread(target=self._lc, args=(ctx,),
-                                         name="da3-lc", daemon=True)
-            lc_thread.start()
-        frontend_thread.start()
-        frontend_thread.join()
-        inference_thread.join()
-        processing_thread.join()
-        if self.detector is not None:
-            lc_thread.join()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
         wall_elapsed = time.time() - wall_start
 
         if ctx.backend_error is not None:
             raise ctx.backend_error
 
-        timings = ctx.timings
+        self._print_timing_breakdown(ctx.timings, wall_elapsed)
+
+        return SLAMResult(
+            keyframe_poses=_build_keyframe_poses(ctx.submaps, ctx.opt_result),
+            submaps=ctx.submaps,
+            optimization=ctx.opt_result,
+            loop_closures=ctx.loop_closures,
+            timings=ctx.timings,
+        )
+
+    @staticmethod
+    def _print_timing_breakdown(timings: dict[str, float], wall_elapsed: float) -> None:
         col = max(len(k) for k in timings)
         tag = f"[{threading.current_thread().name}]"
         print(f"{tag} Timing breakdown (per-module compute time, threads overlap):")
         for module, seconds in timings.items():
             print(f"  {module:<{col}}  {seconds:6.1f}s")
-        print(f"  {'':-<{col+9}}")
+        print(f"  {'':-<{col + 9}}")
         print(f"  {'compute total':<{col}}  {sum(timings.values()):6.1f}s")
         print(f"  {'wall-clock':<{col}}  {wall_elapsed:6.1f}s")
 
-        keyframe_poses = _build_keyframe_poses(ctx.submaps, ctx.opt_result)
-
-        return SLAMResult(
-            keyframe_poses=keyframe_poses,
-            submaps=ctx.submaps,
-            optimization=ctx.opt_result,
-            loop_closures=ctx.loop_closures,
-            timings=timings,
-        )
+    # ── frontend thread ───────────────────────────────────────────────────────
 
     def _frontend(self, image_paths: list[str], ctx: _RunContext) -> None:
+        """Keyframe selection: reads images, batches keyframes into batch_queue.
+
+        Each batch shares its last keyframe with the next batch (the anchor
+        frame) — see the module docstring.
+        """
         selector = OnlineKeyframeSelector(ctx.config.keyframe)
-        keyframe_paths:   list[str]        = []
-        keyframe_images:  list[np.ndarray] = []
-        keyframe_indices: list[int]        = []
+        keyframe_paths: list[str] = []
+        keyframe_images: list[np.ndarray] = []
+        keyframe_indices: list[int] = []
         try:
             for i, path in enumerate(image_paths):
                 if ctx.backend_error is not None:
                     break
 
                 bgr = cv2.imread(path)
+                if bgr is None:
+                    raise FileNotFoundError(f"Could not read image: {path}")
                 image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
                 t0 = time.time()
@@ -388,28 +430,32 @@ class DA3SLAM:
                         list(keyframe_indices),
                     ))
                     # 1-frame overlap: anchor next submap on the last keyframe
-                    keyframe_paths[:]   = [keyframe_paths[-1]]
-                    keyframe_images[:]  = [keyframe_images[-1]]
+                    keyframe_paths[:] = [keyframe_paths[-1]]
+                    keyframe_images[:] = [keyframe_images[-1]]
                     keyframe_indices[:] = [keyframe_indices[-1]]
 
+            # Flush the final partial batch (a single leftover frame is only
+            # the anchor copy of the previous batch — nothing new to add).
             if len(keyframe_paths) >= 2 and ctx.backend_error is None:
                 _blocking_put(ctx, ctx.batch_queue, (
                     list(keyframe_paths),
                     list(keyframe_images),
                     list(keyframe_indices),
                 ))
+        except Exception as exc:
+            ctx.backend_error = exc
         finally:
             ctx.batch_queue.put(None)  # sentinel — always sent, even on error
 
+    # ── inference thread ──────────────────────────────────────────────────────
+
     def _inference(self, ctx: _RunContext) -> None:
-        """DA3 inference: pops batches from batch_queue, pushes built Submaps to submap_queue."""
+        """DA3 inference: pops keyframe batches, pushes built Submaps."""
         submap_idx = 0
         try:
             while True:
                 item = ctx.batch_queue.get()
-                if item is None:
-                    break
-                if ctx.backend_error is not None:
+                if item is None or ctx.backend_error is not None:
                     break
                 paths, images, indices = item
 
@@ -432,71 +478,59 @@ class DA3SLAM:
             except queue.Full:
                 pass  # processing is already dead; sentinel is not needed
 
+    # ── processing thread ─────────────────────────────────────────────────────
+
     def _processing(self, ctx: _RunContext) -> None:
-        """Graph building and incremental optimisation. LC is dispatched to _lc thread."""
+        """Graph building and incremental optimisation.
+
+        Loop closure detection is dispatched to _loop_closure_worker; its
+        results are drained back into the graph between optimisations.
+        """
         pose_graph = PoseGraph(ctx.config.noise)
 
+        # Running product of inter-submap scale ratios: converts translations
+        # from the current submap's metric unit to submap 0's unit.
         accumulated_scale: float = 1.0
+        # Snapshots handed to the LC worker (it runs concurrently and must
+        # not observe later mutations).
         submap_scales: dict[int, float] = {}
-        submap_dict:   dict[int, Submap] = {}
+        submaps_by_idx: dict[int, Submap] = {}
 
+        tag = f"[{threading.current_thread().name}]"
         try:
             while True:
                 submap = ctx.submap_queue.get()
                 if submap is None:
                     break
 
-                # ── build per-frame graph nodes ────────────────────────────
-                t0  = time.time()
-                tag = f"[{threading.current_thread().name}]"
+                t0 = time.time()
                 prev_submap = ctx.submaps[-1] if ctx.submaps else None
-
                 if prev_submap is None:
-                    for frame in submap.frames:
-                        pose_graph.add_frame(
-                            frame.seq_idx,
-                            frame.cam_to_world.astype(np.float64),
-                        )
-                    pose_graph.add_prior(submap.frames[0].seq_idx)
+                    self._add_first_submap_to_graph(pose_graph, submap)
                 else:
-                    delta_scale = _estimate_boundary_scale(prev_submap, submap)
+                    raw_delta_scale = _estimate_boundary_scale(prev_submap, submap)
+                    delta_scale = _adjust_boundary_scale(
+                        raw_delta_scale,
+                        ctx.config.boundary_scale_damping,
+                        ctx.config.boundary_scale_clamp,
+                    )
                     accumulated_scale *= delta_scale
-                    anchor_global_c2w = pose_graph.get_pose(submap.frames[0].seq_idx)
-                    anchor_local_w2c  = submap.frames[0].extrinsic.astype(np.float64)
-                    for frame in submap.frames[1:]:
-                        local_c2w       = frame.cam_to_world.astype(np.float64)
-                        relative        = anchor_local_w2c @ local_c2w
-                        relative_scaled = relative.copy()
-                        relative_scaled[:3, 3] *= accumulated_scale
-                        pose_graph.add_frame(
-                            frame.seq_idx,
-                            anchor_global_c2w @ relative_scaled,
-                        )
+                    self._add_submap_to_graph(pose_graph, submap, accumulated_scale)
                     print(f"{tag} Submap {submap.idx}: scale={accumulated_scale:.4f} "
-                          f"(Δ={delta_scale:.4f})")
-
-                for i in range(1, len(submap.frames)):
-                    f_prev = submap.frames[i - 1]
-                    f_curr = submap.frames[i]
-                    relative        = f_prev.extrinsic.astype(np.float64) @ f_curr.cam_to_world.astype(np.float64)
-                    relative_scaled = relative.copy()
-                    relative_scaled[:3, 3] *= accumulated_scale
-                    pose_graph.add_between(f_prev.seq_idx, f_curr.seq_idx, relative_scaled)
+                          f"(Δ raw={raw_delta_scale:.4f} applied={delta_scale:.4f})")
+                self._add_consecutive_frame_factors(pose_graph, submap, accumulated_scale)
 
                 ctx.submaps.append(submap)
                 submap_scales[submap.idx] = accumulated_scale
-                submap_dict[submap.idx]   = submap
+                submaps_by_idx[submap.idx] = submap
                 ctx.timings["graph_building"] += time.time() - t0
 
-                # ── dispatch submap to LC thread ───────────────────────────
                 if self.detector is not None:
-                    ctx.lc_queue.put((submap, dict(submap_dict), dict(submap_scales)))
+                    ctx.lc_queue.put((submap, dict(submaps_by_idx), dict(submap_scales)))
 
-                # ── drain any completed LC results into the graph ──────────
                 _drain_lc_results(ctx, pose_graph)
 
-                # ── incremental optimisation ───────────────────────────────
-                t0  = time.time()
+                t0 = time.time()
                 opt = pose_graph.optimize()
                 ctx.timings["optimization"] += time.time() - t0
                 print(f"{tag} Submap {submap.idx}: "
@@ -512,14 +546,12 @@ class DA3SLAM:
                     "No submaps built — sequence too short or no keyframes detected."
                 )
 
-            # ── wait for LC thread to finish, then incorporate final results ──
+            # Wait for the LC worker to finish, then incorporate its last results.
             if self.detector is not None:
                 ctx.lc_queue.put(None)  # sentinel
                 ctx.lc_done.wait()
             _drain_lc_results(ctx, pose_graph)
 
-            # ── final optimisation ─────────────────────────────────────────
-            tag = f"[{threading.current_thread().name}]"
             print(f"{tag} Final optimisation "
                   f"({pose_graph.n_nodes} nodes, {pose_graph.n_factors} factors) ...")
             t0 = time.time()
@@ -533,43 +565,99 @@ class DA3SLAM:
         except Exception as exc:
             ctx.backend_error = exc
 
-    def _lc(self, ctx: _RunContext) -> None:
-        """Loop closure thread: detects and scores candidates, posts results for _processing."""
+    @staticmethod
+    def _add_first_submap_to_graph(pose_graph: PoseGraph, submap: Submap) -> None:
+        """Insert the first submap's frames at their DA3 poses and pin frame 0."""
+        for frame in submap.frames:
+            pose_graph.add_frame(frame.seq_idx, frame.cam_to_world.astype(np.float64))
+        pose_graph.add_prior(submap.frames[0].seq_idx)
+
+    @staticmethod
+    def _add_submap_to_graph(
+        pose_graph: PoseGraph,
+        submap: Submap,
+        accumulated_scale: float,
+    ) -> None:
+        """Insert a later submap's frames, placed via the shared anchor frame.
+
+        The anchor (frames[0]) already exists in the graph with an optimised
+        global pose; each new frame's initial global pose is that anchor pose
+        composed with DA3's local anchor-to-frame transform (translation
+        rescaled to the global metric unit).
+        """
+        anchor_global_c2w = pose_graph.get_pose(submap.frames[0].seq_idx)
+        anchor_local_w2c = submap.frames[0].extrinsic.astype(np.float64)
+        for frame in submap.frames[1:]:
+            local_c2w = frame.cam_to_world.astype(np.float64)
+            relative = anchor_local_w2c @ local_c2w
+            pose_graph.add_frame(
+                frame.seq_idx,
+                anchor_global_c2w @ _scaled_translation(relative, accumulated_scale),
+            )
+
+    @staticmethod
+    def _add_consecutive_frame_factors(
+        pose_graph: PoseGraph,
+        submap: Submap,
+        accumulated_scale: float,
+    ) -> None:
+        """Add a between-factor for each consecutive frame pair in the submap."""
+        for previous, current in zip(submap.frames, submap.frames[1:]):
+            relative = (
+                previous.extrinsic.astype(np.float64)
+                @ current.cam_to_world.astype(np.float64)
+            )
+            pose_graph.add_between(
+                previous.seq_idx,
+                current.seq_idx,
+                _scaled_translation(relative, accumulated_scale),
+            )
+
+    # ── loop closure thread ───────────────────────────────────────────────────
+
+    def _loop_closure_worker(self, ctx: _RunContext) -> None:
+        """Detects and verifies loop closures; posts scaled factors for _processing.
+
+        Receives (submap, submaps_by_idx, submap_scales) snapshots so it can
+        run concurrently with graph building.
+        """
         try:
             while True:
                 item = ctx.lc_queue.get()
-                if item is None:
+                if item is None or ctx.backend_error is not None:
                     break
-                if ctx.backend_error is not None:
-                    break
-
-                submap, submap_dict_snap, submap_scales_snap = item
+                submap, submaps_by_idx, submap_scales = item
 
                 t0 = time.time()
-                closures = self.detector.process(submap, None)
+                closures = self.detector.process(submap)
                 ctx.timings["loop_closure"] += time.time() - t0
 
                 for closure in closures:
-                    lc_e0 = closure.lc_submap.frames[0].extrinsic.astype(np.float64)
-                    lc_e1 = closure.lc_submap.frames[1].extrinsic.astype(np.float64)
-                    relative_lc = lc_e0 @ np.linalg.inv(lc_e1)
+                    candidate = closure.candidate
+                    frame_b = (submaps_by_idx[candidate.submap_idx_b]
+                               .frames[candidate.frame_idx_b])
+                    frame_a = (submaps_by_idx[candidate.submap_idx_a]
+                               .frames[candidate.frame_idx_a])
 
-                    submap_b = submap_dict_snap[closure.candidate.submap_idx_b]
-                    frame_b  = submap_b.frames[closure.candidate.frame_idx_b]
-
-                    s_lc = _estimate_depth_scale(
+                    # The LC re-inference has its own arbitrary metric scale.
+                    # Convert its translation to the global unit in two steps:
+                    # LC unit → query submap unit (depth ratio at the shared
+                    # query frame), then → global unit (the query submap's
+                    # accumulated scale).
+                    lc_to_query_scale = _estimate_depth_scale(
                         frame_b.depth,
                         closure.lc_submap.frames[0].depth,
                     )
-                    relative_lc[:3, 3] *= s_lc * submap_scales_snap[closure.candidate.submap_idx_b]
+                    global_scale = (
+                        lc_to_query_scale * submap_scales[candidate.submap_idx_b]
+                    )
+                    relative_b_to_a = _scaled_translation(
+                        closure.relative_b_to_a, global_scale
+                    )
 
-                    ctx.lc_result_queue.put((
-                        frame_b.seq_idx,
-                        submap_dict_snap[closure.candidate.submap_idx_a]
-                            .frames[closure.candidate.frame_idx_a].seq_idx,
-                        relative_lc,
-                        closure,
-                    ))
+                    ctx.lc_result_queue.put(
+                        (frame_b.seq_idx, frame_a.seq_idx, relative_b_to_a, closure)
+                    )
 
         except Exception as exc:
             ctx.backend_error = exc
@@ -621,7 +709,6 @@ def _estimate_depth_scale(depth_ref: np.ndarray, depth_new: np.ndarray) -> float
     match depth_ref before comparison.  Returns 1.0 if no valid pixels exist.
     """
     if depth_ref.shape != depth_new.shape:
-        import cv2
         depth_new = cv2.resize(
             depth_new, (depth_ref.shape[1], depth_ref.shape[0]),
             interpolation=cv2.INTER_LINEAR,

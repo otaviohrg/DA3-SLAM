@@ -3,16 +3,15 @@ Diagnostic script for map quality issues.
 
 Runs the pipeline on a small number of frames and saves:
   - Per-submap PLY in local (DA3 world) frame
-  - Per-submap PLY in global frame (after T_opt)
+  - Per-submap PLY in global frame (per-frame optimised poses)
   - Combined PLY
-  - Text report with T_opt values and bounding boxes
+  - Text report with bounding boxes and inter-submap alignments
 
 Usage:
     python scripts/debug_map.py --image_dir data/video1_30fps --max_frames 40
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -81,18 +80,19 @@ def main():
     all_global_col = []
 
     for sm in result.submaps:
-        T_opt = result.optimization.pose(sm.idx)
         local_pts = sm.points_world   # (M, 3) in DA3 local frame
         local_col = sm.colors
 
-        # Apply T_opt to get global frame
-        pts_h = np.hstack([local_pts, np.ones((len(local_pts), 1), dtype=np.float32)])
-        global_pts = (T_opt.astype(np.float64) @ pts_h.T.astype(np.float64)).T[:, :3].astype(np.float32)
+        # Global frame via the per-frame optimised cam-to-world poses
+        # (optimisation results are keyed by frame seq_idx, not submap idx)
+        global_pts = sm.get_points_in_world_frame(result.optimization)
         global_col = local_col
 
+        first_pose = result.optimization.pose(sm.frames[0].seq_idx)
         print(f"\nSubmap {sm.idx}  ({sm.n_frames} frames, {len(local_pts):,} pts)")
-        print(f"  T_opt translation : {T_opt[:3, 3]}")
-        print(f"  T_opt det(R)      : {np.linalg.det(T_opt[:3, :3]):.6f}  (should be 1.0)")
+        print(f"  First-frame opt. translation : {first_pose[:3, 3]}")
+        print(f"  First-frame opt. det(R)      : "
+              f"{np.linalg.det(first_pose[:3, :3]):.6f}  (should be 1.0)")
         print(f"  Local bbox        : {bbox_str(local_pts)}")
         print(f"  Global bbox       : {bbox_str(global_pts)}")
         nan_frac = (~np.isfinite(global_pts).all(axis=1)).mean()

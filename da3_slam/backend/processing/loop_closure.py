@@ -2,22 +2,24 @@
 Loop closure detection and pose estimation.
 
 Detection:
-    DINOv2 (ViT-B/14) per-frame L2-norm matching against all stored
-    per-frame descriptors across all eligible previous submaps.
-    A priority queue keeps the top-K candidates (lowest L2 = most similar).
+    Every frame of a new submap is described by a DINO-SALAD descriptor and
+    matched (L2 distance) against all stored per-frame descriptors of all
+    eligible previous submaps.  A fixed-capacity priority queue keeps the
+    top-K candidates (lowest distance = most similar).
 
 Verification & transform estimation:
     DA3 is re-run on the matched image pair [query_frame, detected_frame].
-    The relative pose from DA3 defines the loop constraint directly,
-    replacing the old ICP-based alignment.  A mean depth-confidence gate
-    (analogous to VGGT's image_match_ratio threshold) rejects bad pairs.
+    The relative pose between the two frames in that fresh 2-frame inference
+    defines the loop constraint directly — no ICP or point cloud matching.
+    A mean depth-confidence gate (analogous to VGGT-SLAM's image_match_ratio
+    threshold) rejects bad pairs.
 
-Graph integration:
-    A 2-frame LC submap is built from the re-inference result and wired
-    into the pose graph with two factors:
-      - sequential factor:    query_submap  →  lc_submap
-      - loop closure factor:  detected_submap  ←  lc_submap
-    This mirrors VGGT-SLAM's mechanism exactly.
+Graph integration (performed by DA3SLAM, see slam.py):
+    Each accepted LoopClosure carries `relative_b_to_a`, the measured
+    cam-to-world transform from the query frame to the detected frame.
+    DA3SLAM scales its translation to the global metric unit and posts a
+    single between-factor between the two keyframe nodes
+    (PoseGraph.add_between(..., loop=True)).
 """
 
 from __future__ import annotations
@@ -32,62 +34,58 @@ import torchvision.transforms as T
 from PIL import Image as PILImage
 
 from da3_slam.backend.inference.submap import Submap, SubmapBuilder
-from da3_slam.backend.processing.alignment import AlignmentResult
 
+# Re-exported so callers can import the config next to the component it tunes.
+from da3_slam.config import LoopClosureConfig
 
-# ── config ────────────────────────────────────────────────────────────────────
-
-@dataclass
-class LoopClosureConfig:
-    # L2 distance threshold for frame-level candidate detection.
-    # Lower distance = more similar.
-    distance_threshold: float
-
-    # Minimum submap index gap between the query and any candidate
-    min_submaps_apart: int
-
-    # Maximum loop closures accepted per submap (priority queue capacity)
-    max_loop_closures: int
-
-    # Minimum mean DA3 depth confidence [0, 1] required to accept a closure.
-    # Analogous to VGGT's image_match_ratio >= 0.85 gate.
-    min_confidence_ratio: float
+__all__ = [
+    "LoopClosureConfig",
+    "LoopCandidate",
+    "LoopClosure",
+    "LoopMatchQueue",
+    "LoopClosureDetector",
+]
 
 
 # ── result types ──────────────────────────────────────────────────────────────
 
 @dataclass
 class LoopCandidate:
-    """Frame-level loop closure candidate from descriptor matching."""
-    submap_idx_a: int   # detected (older) submap
-    frame_idx_a:  int   # frame index within the detected submap
-    submap_idx_b: int   # query (current) submap
-    frame_idx_b:  int   # frame index within the query submap
-    distance:     float # L2 norm of descriptor difference (lower = better)
+    """Frame-level loop closure candidate from descriptor matching.
+
+    Naming convention: "a" is the detected (older) side of the loop,
+    "b" is the query (current) side.
+    """
+    submap_idx_a: int    # detected (older) submap
+    frame_idx_a: int     # frame index within the detected submap
+    submap_idx_b: int    # query (current) submap
+    frame_idx_b: int     # frame index within the query submap
+    distance: float      # L2 norm of descriptor difference (lower = better)
 
 
 @dataclass
 class LoopClosure:
+    """Verified loop closure.
+
+    `lc_submap` is the 2-frame submap built from the DA3 re-inference on
+    [query_frame, detected_frame]; its frame 0 is the query and frame 1 the
+    detected frame.  Its depth maps are kept so the caller can estimate the
+    metric scale of the constraint (see DA3SLAM._loop_closure_worker).
     """
-    Verified loop closure with a 2-frame LC submap and two graph alignments.
+    candidate: LoopCandidate
 
-    The LC submap contains [query_frame, detected_frame] as processed by a
-    fresh DA3 inference.  Two AlignmentResults express the LC submap's world
-    frame relative to both the query and the detected submap's world frames.
-    """
-    candidate:            LoopCandidate
-    lc_submap:            Submap          # 2-frame LC submap from re-inference
-    alignment_to_query:   AlignmentResult # world_lc → world_query   (B=LC, A=query)
-    alignment_to_detected: AlignmentResult # world_lc → world_detected (B=LC, A=detected)
-    lc_confidence:        float           # mean depth confidence (diagnostic)
+    # 2-frame submap from re-inference: frames[0]=query, frames[1]=detected
+    lc_submap: Submap
 
-    @property
-    def submap_idx_a(self) -> int:
-        return self.candidate.submap_idx_a
+    # (4, 4) float64 — measured relative cam-to-world transform from the
+    # query frame (b) to the detected frame (a), expressed in the LC
+    # submap's own (arbitrary) metric scale.  This is exactly the
+    # between-factor measurement for cam-to-world graph nodes:
+    # node_b.inverse() ⊗ node_a ≈ relative_b_to_a.
+    relative_b_to_a: np.ndarray
 
-    @property
-    def submap_idx_b(self) -> int:
-        return self.candidate.submap_idx_b
+    # Mean DA3 depth confidence over both LC frames (diagnostic)
+    lc_confidence: float
 
 
 # ── priority queue ────────────────────────────────────────────────────────────
@@ -125,112 +123,86 @@ class LoopMatchQueue:
 
 class LoopClosureDetector:
     """
-    Detects and verifies loop closures using frame-level DINOv2 matching
+    Detects and verifies loop closures using frame-level DINO-SALAD matching
     followed by DA3 re-inference on the matched image pair.
 
     Usage:
         detector = LoopClosureDetector(config, builder)
         for submap in submaps:
-            closures = detector.process(submap, graph_pose)
-            for closure in closures:
-                pose_graph.add_lc_submap(
-                    closure.lc_submap,
-                    closure.candidate.submap_idx_b,
-                    closure.alignment_to_query,
-                )
-                pose_graph.add_loop_closure(
-                    closure.candidate.submap_idx_a,
-                    closure.lc_submap.idx,
-                    closure.alignment_to_detected,
-                )
+            for closure in detector.process(submap):
+                # scale closure.relative_b_to_a translation to global units,
+                # then post a between-factor (see DA3SLAM._loop_closure_worker)
+                ...
     """
 
     # SALAD input size (224×224) and ImageNet normalisation — mirrors VGGT-SLAM
     _INPUT_SIZE = 224
-    _TRANSFORM  = T.Compose([
+    _TRANSFORM = T.Compose([
         T.Resize((_INPUT_SIZE, _INPUT_SIZE), interpolation=T.InterpolationMode.BILINEAR),
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
+    _SALAD_CHECKPOINT_URL = (
+        "https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt"
+    )
+
     def __init__(
         self,
-        config: LoopClosureConfig | None = None,
-        builder: SubmapBuilder | None = None,
+        config: LoopClosureConfig,
+        builder: SubmapBuilder,
         device: torch.device | None = None,
     ):
-        self.config  = config or LoopClosureConfig()
+        self.config = config
         self.builder = builder
-        self.device  = device or torch.device(
+        self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-        self._submaps:            dict[int, Submap]              = {}
+        # All previously seen (non-LC) submaps, keyed by submap idx
+        self._submaps: dict[int, Submap] = {}
         # Per-frame descriptors indexed by (submap_idx, frame_idx)
-        self._frame_descriptors:  dict[tuple[int, int], np.ndarray] = {}
-        # Submap-level aggregated descriptor (mean of all frames, for diagnostics)
-        self._descriptors:        dict[int, np.ndarray]          = {}
+        self._frame_descriptors: dict[tuple[int, int], np.ndarray] = {}
 
         # LC submap indices are negative to avoid collision with regular submaps
         self._next_lc_idx = -1
 
+        self._model = self._load_salad_model()
+
+    def _load_salad_model(self) -> torch.nn.Module:
+        """Load DINO-SALAD, downloading the checkpoint on first use."""
         print("[LoopClosure] Loading DINO-SALAD...")
         from salad.eval import load_model
         ckpt_path = os.path.join(torch.hub.get_dir(), "checkpoints", "dino_salad.ckpt")
         if not os.path.exists(ckpt_path):
             print(f"[LoopClosure] Checkpoint not found — downloading to {ckpt_path}")
             os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            torch.hub.download_url_to_file(
-                "https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt",
-                ckpt_path,
-            )
-        self._model: torch.nn.Module = load_model(ckpt_path).to(self.device).eval()
+            torch.hub.download_url_to_file(self._SALAD_CHECKPOINT_URL, ckpt_path)
+        model = load_model(ckpt_path).to(self.device).eval()
         print("[LoopClosure] Ready.")
-
-    def update_optimized_poses(self, poses: dict[int, np.ndarray]) -> None:
-        """No-op: optimized poses are no longer used (ICP replaced by re-inference)."""
-        pass
+        return model
 
     @torch.no_grad()
-    def process(
-        self,
-        submap: Submap,
-        graph_pose: np.ndarray,
-    ) -> list[LoopClosure]:
+    def process(self, submap: Submap) -> list[LoopClosure]:
         """
-        Register a new submap and return verified loop closures.
+        Register a new submap and return verified loop closures against
+        previously registered submaps.
 
-        Populates submap.retrieval_vectors with per-frame DINOv2 descriptors,
-        then runs frame-level L2 matching against all previous submaps.
-        Each candidate is verified by DA3 re-inference on the matched pair.
-
-        Args:
-            submap:     newly built submap
-            graph_pose: (4, 4) accumulated pose estimate (retained for API compat)
-
-        Returns:
-            list of LoopClosure objects, each carrying a 2-frame LC submap
+        Side effect: stores per-frame DINO-SALAD descriptors on the submap's
+        frames (frame.retrieval_vector) and in the detector's index.
         """
         self._submaps[submap.idx] = submap
 
-        # Extract per-frame descriptors; store on submap and in local flat index
         per_frame = self._extract_per_frame_descriptors(submap)
         submap.set_all_retrieval_vectors(per_frame)
-        for frame_idx, desc in enumerate(per_frame):
-            self._frame_descriptors[(submap.idx, frame_idx)] = desc
+        for frame_idx, descriptor in enumerate(per_frame):
+            self._frame_descriptors[(submap.idx, frame_idx)] = descriptor
 
-        # Submap-level aggregated descriptor (for diagnostics / future use)
-        mean_desc = np.mean(per_frame, axis=0)
-        mean_desc /= np.linalg.norm(mean_desc) + 1e-8
-        self._descriptors[submap.idx] = mean_desc
-
-        candidates = self._find_candidates(submap)
-        closures   = []
-        for candidate in candidates:
+        closures = []
+        for candidate in self._find_candidates(submap):
             closure = self._verify(candidate)
             if closure is not None:
                 closures.append(closure)
-
         return closures
 
     # ── descriptor extraction ─────────────────────────────────────────────────
@@ -240,88 +212,91 @@ class LoopClosureDetector:
         """
         Extract one L2-normalised DINO-SALAD descriptor per frame in the submap.
 
-        All frames are processed as a single batch for efficiency.
-        Each (H, W, 3) uint8 numpy image is resized to 224×224, normalised
-        with ImageNet statistics, then fed to the SALAD model — identical
-        to VGGT-SLAM's ImageRetrieval.get_batch_descriptors().
+        All frames are processed as a single batch.  Each (H, W, 3) uint8
+        image is resized to 224×224 and normalised with ImageNet statistics —
+        identical to VGGT-SLAM's ImageRetrieval.get_batch_descriptors().
         """
         tensors = torch.stack([
             self._TRANSFORM(PILImage.fromarray(f.image))
             for f in submap.frames
         ]).to(self.device)                               # (N, 3, 224, 224)
 
-        feats = self._model(tensors)                     # (N, D) on device
-        feats_np = feats.cpu().numpy().astype(np.float32)
-        norms = np.linalg.norm(feats_np, axis=1, keepdims=True)
-        feats_np /= norms + 1e-8
-        return [feats_np[i] for i in range(len(submap.frames))]
+        feats = self._model(tensors).cpu().numpy().astype(np.float32)  # (N, D)
+        feats /= np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8
+        return [feats[i] for i in range(len(submap.frames))]
 
     # ── frame-level candidate detection ──────────────────────────────────────
 
     def _find_candidates(self, query_submap: Submap) -> list[LoopCandidate]:
         """
         Compare every frame of query_submap against every stored frame of all
-        eligible previous submaps using L2 distance on DINOv2 descriptors.
+        eligible previous submaps using L2 distance on DINO-SALAD descriptors.
 
-        Returns the top-K candidates from the priority queue (K = max_loop_closures).
+        Returns the top-K candidates (K = max_loop_closures) below the
+        distance threshold.
         """
-        config  = self.config
-        queue   = LoopMatchQueue(config.max_loop_closures)
+        config = self.config
+        queue = LoopMatchQueue(config.max_loop_closures)
 
         eligible = [
-            idx for idx in self._submaps
+            idx for idx, submap in self._submaps.items()
             if abs(idx - query_submap.idx) > config.min_submaps_apart
-            and not self._submaps[idx].is_lc_submap
+            and not submap.is_lc_submap
         ]
 
+        best_distance = float("inf")
         for frame_idx_b, frame_b in enumerate(query_submap.frames):
             if frame_b.retrieval_vector is None:
                 continue
-            q_vec = frame_b.retrieval_vector
-
-            for a_idx in eligible:
-                a_submap = self._submaps[a_idx]
-                for frame_idx_a in range(len(a_submap.frames)):
-                    desc_a = self._frame_descriptors.get((a_idx, frame_idx_a))
-                    if desc_a is None:
+            for idx_a in eligible:
+                for frame_idx_a in range(len(self._submaps[idx_a].frames)):
+                    descriptor_a = self._frame_descriptors.get((idx_a, frame_idx_a))
+                    if descriptor_a is None:
                         continue
-                    dist = float(np.linalg.norm(q_vec - desc_a))
-                    if dist < config.distance_threshold:
+                    distance = float(np.linalg.norm(frame_b.retrieval_vector - descriptor_a))
+                    best_distance = min(best_distance, distance)
+                    if distance < config.distance_threshold:
                         queue.push(LoopCandidate(
-                            submap_idx_a=a_idx,
+                            submap_idx_a=idx_a,
                             frame_idx_a=frame_idx_a,
                             submap_idx_b=query_submap.idx,
                             frame_idx_b=frame_idx_b,
-                            distance=dist,
+                            distance=distance,
                         ))
 
-        return queue.get_best()
+        candidates = queue.get_best()
+        # Diagnostic: the best distance seen (even above threshold) tells you
+        # where the threshold should sit for the current dataset/domain.
+        if eligible:
+            best_str = f"{best_distance:.3f}" if np.isfinite(best_distance) else "n/a"
+            print(f"[LoopClosure] submap {query_submap.idx}: "
+                  f"best descriptor distance {best_str} "
+                  f"(threshold {config.distance_threshold:g}), "
+                  f"{len(eligible)} eligible submap(s), "
+                  f"{len(candidates)} candidate(s)")
+        return candidates
 
     # ── re-inference verification ─────────────────────────────────────────────
 
     def _verify(self, candidate: LoopCandidate) -> LoopClosure | None:
         """
-        Verify a candidate by re-running DA3 on [query_frame, detected_frame].
+        Verify a candidate by re-running DA3 on [query_frame, detected_frame]
+        and derive the loop constraint from the resulting relative pose.
 
-        Alignment derivation (anchor frame principle):
-            Both frames share a physical camera viewpoint with the corresponding
-            frame in each original submap.  The world-to-cam extrinsic must be
-            identical for the same physical camera, so:
+        The two frames of the fresh inference share one consistent (if
+        arbitrary) local world, so the relative cam-to-world transform between
+        them is well defined:
 
-                world_lc_to_world_X = inv(frame_X.extrinsic) @ lc_frameN.extrinsic
+            relative_b_to_a = w2c_query_lc @ c2w_detected_lc
+                            = lc_frame0.extrinsic @ inv(lc_frame1.extrinsic)
 
-            This gives an exact transform without any ICP or point cloud matching.
+        The translation is in the LC inference's own metric scale; the caller
+        rescales it before inserting the factor into the graph.
         """
-        if self.builder is None:
-            raise RuntimeError(
-                "LoopClosureDetector requires a SubmapBuilder for re-inference. "
-                "Pass builder= to the constructor."
-            )
-
         submap_a = self._submaps[candidate.submap_idx_a]  # detected
         submap_b = self._submaps[candidate.submap_idx_b]  # query
-        frame_a  = submap_a.frames[candidate.frame_idx_a]
-        frame_b  = submap_b.frames[candidate.frame_idx_b]
+        frame_a = submap_a.frames[candidate.frame_idx_a]
+        frame_b = submap_b.frames[candidate.frame_idx_b]
 
         tag = (
             f"[LoopClosure] "
@@ -331,51 +306,29 @@ class LoopClosureDetector:
         )
 
         # Run DA3 on [query_frame, detected_frame] — order matters:
-        # LC frame 0 = query, LC frame 1 = detected
+        # LC frame 0 = query (b), LC frame 1 = detected (a)
         prediction = self.builder.estimator.infer([frame_b.image, frame_a.image])
 
         # Quality gate: mean depth confidence across both LC frames
         mean_conf = float(np.mean(prediction.confidence))
         if mean_conf < self.config.min_confidence_ratio:
-            print(f"{tag}  REJECTED (confidence={mean_conf:.3f} < {self.config.min_confidence_ratio})")
+            print(f"{tag}  REJECTED (confidence={mean_conf:.3f} "
+                  f"< {self.config.min_confidence_ratio})")
             return None
 
-        # Build 2-frame LC submap from the re-inference result
-        lc_idx    = self._next_lc_idx
+        lc_idx = self._next_lc_idx
         self._next_lc_idx -= 1
         lc_submap = self.builder.build_from_prediction(prediction, lc_idx)
-        lc_submap.set_lc_status(True)
-        lc_submap.set_last_non_loop_frame_index(1)
+        lc_submap.is_lc_submap = True
 
-        # Anchor frame alignment: derive world_lc_to_world_X for both submaps.
-        # lc_submap.frames[0].extrinsic: world_lc → cam  (same cam as frame_b)
-        # frame_b.extrinsic:             world_query → cam
-        # => world_lc_to_world_query = inv(frame_b.extrinsic) @ lc_frame0.extrinsic
-        world_lc_to_world_query = (
-            np.linalg.inv(frame_b.extrinsic.astype(np.float64))
-            @ lc_submap.frames[0].extrinsic.astype(np.float64)
-        )
-        world_lc_to_world_detected = (
-            np.linalg.inv(frame_a.extrinsic.astype(np.float64))
-            @ lc_submap.frames[1].extrinsic.astype(np.float64)
-        )
-
-        alignment_to_query = AlignmentResult(
-            world_b_to_world_a=world_lc_to_world_query.astype(np.float32),
-            method="lc_inference",
-            scale=1.0,
-        )
-        alignment_to_detected = AlignmentResult(
-            world_b_to_world_a=world_lc_to_world_detected.astype(np.float32),
-            method="lc_inference",
-            scale=1.0,
-        )
+        lc_extrinsic_query = lc_submap.frames[0].extrinsic.astype(np.float64)
+        lc_extrinsic_detected = lc_submap.frames[1].extrinsic.astype(np.float64)
+        relative_b_to_a = lc_extrinsic_query @ np.linalg.inv(lc_extrinsic_detected)
 
         print(f"{tag}  conf={mean_conf:.3f}  lc_idx={lc_idx}  ACCEPTED")
         return LoopClosure(
             candidate=candidate,
             lc_submap=lc_submap,
-            alignment_to_query=alignment_to_query,
-            alignment_to_detected=alignment_to_detected,
+            relative_b_to_a=relative_b_to_a,
             lc_confidence=mean_conf,
         )

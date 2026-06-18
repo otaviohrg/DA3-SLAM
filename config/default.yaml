@@ -16,9 +16,21 @@ semantic_model: null
 # ── submap ─────────────────────────────────────────────────────────────────────
 submap_size: 20                # max keyframes per submap (including anchor overlap)
 
+# ── inter-submap scale chaining ────────────────────────────────────────────────
+# Each DA3 batch has its own metric scale; consecutive submaps are chained by
+# the median depth ratio at the shared anchor frame.  Ratio noise compounds
+# multiplicatively over boundaries (= scale drift on long sequences).  DA3
+# depth is nominally metric, so the true ratio should be near 1.0:
+boundary_scale_damping: 0.0    # g in [0,1]: each ratio is raised to (1-g).
+                                # 0 = full chaining (default); 1 = ignore ratios
+                                # and trust DA3's metric consistency.
+boundary_scale_clamp: null     # c > 1 clamps each applied ratio to [1/c, c],
+                                # guarding against one bad boundary estimate.
+                                # null = off.
+
 # ── keyframe selection (Lucas-Kanade optical flow) ─────────────────────────────
 keyframe:
-  min_disparity_fraction: 0.40  # min mean flow as fraction of image width
+  min_disparity_fraction: 0.10  # min mean flow as fraction of image width
   max_submap_size: 20           # kept in sync with top-level submap_size
   max_corners: 500              # goodFeaturesToTrack: number of corners
   quality_level: 0.01           # goodFeaturesToTrack: minimum quality
@@ -45,6 +57,6 @@ noise:
 loop_closure:
   enable: true
   distance_threshold: 0.45     # DINO-SALAD L2 distance to flag a frame-level candidate
-  min_submaps_apart: 3          # minimum index gap to consider a loop
+  min_submaps_apart: 1          # minimum index gap to consider a loop
   max_loop_closures: 1          # top-K candidates kept per submap (priority queue)
   min_confidence_ratio: 0.3     # minimum mean DA3 confidence to accept a closure

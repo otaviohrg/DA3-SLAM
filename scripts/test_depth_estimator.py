@@ -89,8 +89,10 @@ def main():
 
     # ── to_pointcloud ─────────────────────────────────────────────────────────
     header("to_pointcloud()")
+    threshold = pred.confidence_threshold(args.confidence_percentile)
+    print(f"  global threshold at p{args.confidence_percentile:g}: {threshold:.4f}")
     for i in range(N):
-        points, pc_mask = pred.to_pointcloud(i, confidence_percentile=args.confidence_percentile)
+        points, pc_mask = pred.to_pointcloud(i, threshold)
         check(f"frame {i:02d}: points shape = (M, 3)", points.ndim == 2 and points.shape[1] == 3)
         check(f"frame {i:02d}: z > 0 (all points in front of camera)", (points[:, 2] > 0).all())
         print(f"           {len(points):,} points — "

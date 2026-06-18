@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from PIL import Image
 
 
 class SemanticEmbedder:
@@ -57,8 +58,6 @@ class SemanticEmbedder:
         Returns a list of (D,) float32 arrays, one per frame, in the same
         order as submap.frames.
         """
-        from PIL import Image
-
         vectors = []
         for frame in submap.frames:
             pil_image = Image.fromarray(frame.image)

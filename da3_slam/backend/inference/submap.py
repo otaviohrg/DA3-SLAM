@@ -2,30 +2,49 @@
 Submap construction.
 
 A submap is a local map built from a batch of keyframes processed together
-by DA3. It stores:
-  - Per-frame sparse point clouds (confidence-filtered) in camera and world coords
-  - Per-frame raw depth and confidence maps for re-thresholding
-  - Per-frame retrieval vectors (DINOv2 descriptors, populated by LoopClosureDetector)
-  - Per-frame semantic vectors (CLIP embeddings, populated by SemanticEmbedder)
-  - Inverse intrinsics (proj_mat) for reprojection
-  - Image names and parsed frame IDs for logging and retrieval
-  - Loop closure metadata (is_lc_submap, last_non_loop_frame_index)
+by DA3.  All frames in one batch share a single arbitrary "local world"
+coordinate system and a single arbitrary metric scale chosen by DA3; the
+pose graph (factor_graph.py) is responsible for stitching submaps into a
+globally consistent map.
+
+Each Frame stores:
+  - A sparse confidence-filtered point cloud in camera and local-world coords
+  - The raw depth and confidence maps (so points can be re-thresholded later)
+  - DA3's estimated extrinsic (world-to-cam) and intrinsic matrices
+  - Optional retrieval/semantic descriptors (set by LoopClosureDetector and
+    SemanticEmbedder respectively)
 
 The SubmapBuilder orchestrates:
   1. DA3 inference on the keyframe batch
-  2. Confidence-filtered point cloud extraction per frame
+  2. Confidence-filtered point cloud extraction per frame, using a single
+     threshold computed globally across the whole batch
   3. Camera-to-world transform using DA3's estimated extrinsics
 """
 
 from __future__ import annotations
 
-import os
-import re
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 
 from da3_slam.backend.inference.depth_estimator import DepthEstimator, DepthPrediction
+
+
+# ── geometry helper ───────────────────────────────────────────────────────────
+
+def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """
+    Apply a (4, 4) homogeneous transform to (M, 3) points.
+
+    Returns (M, 3) float32.  Used to project camera-space points into world
+    space throughout the pipeline (submaps, PLY export, debugging scripts).
+    """
+    if len(points) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    rotation = transform[:3, :3]
+    translation = transform[:3, 3]
+    return ((points @ rotation.T) + translation).astype(np.float32)
 
 
 # ── data types ────────────────────────────────────────────────────────────────
@@ -59,15 +78,12 @@ class Frame:
     depth: np.ndarray
 
     # (H, W) float32 — per-pixel confidence in [0, 1] (kept for re-thresholding)
-    conf: np.ndarray
+    confidence: np.ndarray
 
     # (H, W) bool — pixels that survived the confidence filter at build time
-    conf_mask: np.ndarray
+    confidence_mask: np.ndarray
 
-    # (4, 4) float32 — inverse camera intrinsics K⁻¹ padded to 4×4
-    proj_mat: np.ndarray
-
-    # (D,) float32 — DINOv2 retrieval descriptor; set by LoopClosureDetector
+    # (D,) float32 — DINO-SALAD retrieval descriptor; set by LoopClosureDetector
     retrieval_vector: np.ndarray | None = None
 
     # (D,) float32 — CLIP semantic descriptor; set by SemanticEmbedder
@@ -90,7 +106,7 @@ class Frame:
     def get_dense_pointcloud_cam(self, conf_threshold: float | None = None) -> np.ndarray:
         """
         Reconstruct a dense (H, W, 3) point cloud in camera space from the
-        stored depth map. Pixels that fail the optional threshold or have
+        stored depth map.  Pixels that fail the optional threshold or have
         invalid depth are set to NaN so the spatial layout is preserved.
         """
         K = self.intrinsic
@@ -99,7 +115,7 @@ class Frame:
 
         mask = np.isfinite(self.depth) & (self.depth > 0.0)
         if conf_threshold is not None:
-            mask &= (self.conf >= conf_threshold)
+            mask &= (self.confidence >= conf_threshold)
 
         z = np.where(mask, self.depth, np.nan)
         x = (u - K[0, 2]) * z / K[0, 0]
@@ -111,31 +127,24 @@ class Frame:
 class Submap:
     """Local map built from a batch of keyframes."""
 
-    # Position of this submap in the global sequence
+    # Position of this submap in the global sequence.  Negative indices mark
+    # 2-frame loop-closure submaps created by re-inference (see loop_closure.py).
     idx: int
 
     # Ordered list of frames in this submap
     frames: list[Frame] = field(default_factory=list)
 
-    # Loop closure metadata
+    # True for 2-frame loop-closure submaps built from DA3 re-inference.
+    # LC submaps are excluded from trajectory export and from loop-closure
+    # candidate search.
     is_lc_submap: bool = False
-    last_non_loop_frame_index: int | None = None
 
-    # Original file paths and parsed numeric frame IDs
-    img_names: list[str] = field(default_factory=list)
-    frame_ids: list[float] = field(default_factory=list)
+    # Original keyframe file paths (provenance / debugging; empty for
+    # LC submaps, whose frames come from in-memory images)
+    image_paths: list[str] = field(default_factory=list)
 
-    # Per-frame CLIP semantic embeddings (set by SemanticEmbedder)
-    semantic_vectors: list = field(default_factory=list)
-
-    # Global confidence threshold used at build time; enables re-filtering
+    # Global confidence threshold used at build time (absolute value in [0, 1])
     conf_threshold: float | None = None
-
-    def __post_init__(self):
-        # Cached Open3D PointCloud for voxelization — not serialised
-        self._voxelized_points = None
-
-    # ── basic properties ──────────────────────────────────────────────────────
 
     @property
     def n_frames(self) -> int:
@@ -161,250 +170,42 @@ class Submap:
         """(N_frames, 3) camera centres in local world space."""
         return np.stack([f.position_world for f in self.frames], axis=0)
 
-    @property
-    def conf(self) -> np.ndarray:
-        """(N_frames, H, W) float32 raw confidence maps stacked from all frames."""
-        return np.stack([f.conf for f in self.frames], axis=0)
-
-    @property
-    def conf_masks(self) -> np.ndarray:
-        """(N_frames, H, W) bool build-time confidence masks stacked from all frames."""
-        return np.stack([f.conf_mask for f in self.frames], axis=0)
-
-    @property
-    def retrieval_vectors(self) -> np.ndarray | None:
-        """(N_frames, D) per-frame DINOv2 descriptors, or None if not set."""
-        vecs = [f.retrieval_vector for f in self.frames]
-        if any(v is None for v in vecs):
-            return None
-        return np.stack(vecs, axis=0)
-
-    # ── loop closure metadata ─────────────────────────────────────────────────
-
-    def set_lc_status(self, is_lc_submap: bool) -> None:
-        self.is_lc_submap = is_lc_submap
-
-    def get_lc_status(self) -> bool:
-        return self.is_lc_submap
-
-    def set_last_non_loop_frame_index(self, idx: int) -> None:
-        self.last_non_loop_frame_index = idx
-
-    def get_last_non_loop_frame_index(self) -> int | None:
-        return self.last_non_loop_frame_index
-
-    # ── image provenance ──────────────────────────────────────────────────────
-
-    def set_img_names(self, img_names: list[str]) -> None:
-        self.img_names = list(img_names)
-
-    def get_img_names_at_index(self, index: int) -> str:
-        return self.img_names[index]
-
-    def set_frame_ids(self, file_paths: list[str]) -> None:
-        """Parse integer/decimal frame numbers from file paths; fall back to index."""
-        ids = []
-        for i, path in enumerate(file_paths):
-            filename = os.path.basename(path)
-            match = re.search(r'\d+(?:\.\d+)?', filename)
-            ids.append(float(match.group()) if match else float(i))
-        self.frame_ids = ids
-
-    def get_frame_ids(self) -> list[float]:
-        return self.frame_ids
-
-    # ── retrieval vectors ─────────────────────────────────────────────────────
-
-    def set_all_retrieval_vectors(self, vectors: list[np.ndarray]) -> None:
-        """Set per-frame DINOv2 retrieval descriptors."""
+    def set_all_retrieval_vectors(self, vectors: Sequence[np.ndarray]) -> None:
+        """Attach per-frame DINO-SALAD retrieval descriptors."""
         for frame, vec in zip(self.frames, vectors):
             frame.retrieval_vector = vec
 
-    def get_all_retrieval_vectors(self) -> np.ndarray | None:
-        return self.retrieval_vectors
-
-    # ── semantic vectors ──────────────────────────────────────────────────────
-
-    def set_all_semantic_vectors(self, vectors: list[np.ndarray]) -> None:
-        """Set per-frame CLIP semantic embeddings."""
-        self.semantic_vectors = list(vectors)
+    def set_all_semantic_vectors(self, vectors: Sequence[np.ndarray]) -> None:
+        """Attach per-frame CLIP semantic embeddings."""
         for frame, vec in zip(self.frames, vectors):
             frame.semantic_vector = vec
 
-    def get_all_semantic_vectors(self) -> list:
-        return self.semantic_vectors
-
-    # ── confidence utilities ──────────────────────────────────────────────────
-
-    def get_conf_threshold(self) -> float | None:
-        return self.conf_threshold
-
-    def get_conf_masks_frame(self, index: int) -> np.ndarray:
-        """(H, W) bool confidence mask for the frame at `index`."""
-        return self.frames[index].conf_mask
-
-    def filter_data_by_confidence(self, data: np.ndarray) -> np.ndarray:
-        """
-        Apply the global confidence mask to dense (N, H, W, ...) data.
-        Returns the subset of elements where confidence >= conf_threshold.
-        """
-        if self.conf_threshold is None:
-            return data
-        mask = self.conf >= self.conf_threshold  # (N, H, W)
-        return data[mask]
-
-    # ── world-frame point access ──────────────────────────────────────────────
-
     def get_points_in_world_frame(self, opt_result) -> np.ndarray:
         """
-        All global-world-space points using per-frame optimised poses.
+        All points in the *global* world frame, using per-frame optimised poses.
 
-        Each frame's camera-space points are projected to global world via
-        the frame's optimised cam-to-world pose: global_pts = c2w @ pts_cam.
+        Each frame's camera-space points are projected via the frame's
+        optimised cam-to-world pose from the given OptimizationResult.
 
         Returns (N_total, 3) float32.
         """
-        all_pts: list[np.ndarray] = []
-        for frame in self.frames:
-            pts = frame.points_cam  # (M, 3) in camera space
-            if len(pts) == 0:
-                continue
-            global_c2w = opt_result.pose(frame.seq_idx).astype(np.float64)
-            homo = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
-            all_pts.append((global_c2w @ homo.T).T[:, :3].astype(np.float32))
+        all_pts = [
+            transform_points(
+                frame.points_cam,
+                opt_result.pose(frame.seq_idx).astype(np.float64),
+            )
+            for frame in self.frames
+            if len(frame.points_cam) > 0
+        ]
         if not all_pts:
             return np.empty((0, 3), dtype=np.float32)
         return np.concatenate(all_pts, axis=0)
-
-    def get_points_list_in_world_frame(
-        self,
-        opt_result,
-    ) -> tuple[list[np.ndarray], list[float], list[np.ndarray]]:
-        """
-        Per-frame global-world-space points, frame IDs, and confidence masks.
-
-        Returns:
-            point_list:      list of (M_i, 3) float32 arrays (one per frame)
-            frame_id_list:   list of float frame IDs
-            frame_conf_mask: list of (H, W) bool masks
-        """
-        point_list, frame_id_list, frame_conf_mask = [], [], []
-        for i, frame in enumerate(self.frames):
-            pts = frame.points_cam  # (M, 3)
-            if len(pts) > 0:
-                global_c2w = opt_result.pose(frame.seq_idx).astype(np.float64)
-                homo = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
-                pts_global = (global_c2w @ homo.T).T[:, :3].astype(np.float32)
-            else:
-                pts_global = np.empty((0, 3), dtype=np.float32)
-            point_list.append(pts_global)
-            fid = self.frame_ids[i] if i < len(self.frame_ids) else float(frame.seq_idx)
-            frame_id_list.append(fid)
-            frame_conf_mask.append(frame.conf_mask)
-        return point_list, frame_id_list, frame_conf_mask
-
-    def get_all_poses_world(self, opt_result) -> np.ndarray:
-        """(N_frames, 4, 4) optimised cam-to-world poses in global frame."""
-        return np.stack(
-            [opt_result.pose(f.seq_idx).astype(np.float32) for f in self.frames],
-            axis=0,
-        )
-
-    def get_first_pose_world(self, opt_result) -> np.ndarray:
-        """(4, 4) cam-to-world for the first frame in global space."""
-        return opt_result.pose(self.frames[0].seq_idx).astype(np.float32)
-
-    def get_last_pose_world(self, opt_result) -> np.ndarray:
-        """(4, 4) cam-to-world for the last non-LC frame in global space."""
-        last_idx = (
-            self.last_non_loop_frame_index
-            if self.last_non_loop_frame_index is not None
-            else len(self.frames) - 1
-        )
-        return opt_result.pose(self.frames[last_idx].seq_idx).astype(np.float32)
-
-    # ── voxelization ──────────────────────────────────────────────────────────
-
-    def get_voxel_points_in_world_frame(
-        self,
-        opt_result,
-        voxel_size: float,
-        nb_points: int = 8,
-        outlier_radius_factor: float = 2.0,
-    ):
-        """
-        Voxel-downsample and radius-filter the submap's global point cloud.
-
-        Returns an Open3D PointCloud in global world coordinates.
-        Global points are computed per-frame using the optimised SL(4) poses,
-        then merged before downsampling (no caching — poses change each call).
-        """
-        import open3d as o3d
-
-        if voxel_size <= 0.0:
-            raise ValueError("`voxel_size` must be > 0.0")
-
-        global_pts    = self.get_points_in_world_frame(opt_result)
-        global_colors = self.colors.astype(np.float64) / 255.0
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(global_pts.astype(np.float64))
-        pcd.colors = o3d.utility.Vector3dVector(global_colors)
-        pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
-        if nb_points > 0:
-            pcd, _ = pcd.remove_radius_outlier(
-                nb_points=nb_points,
-                radius=voxel_size * outlier_radius_factor,
-            )
-        return pcd
-
-    # ── semantic mask extraction ──────────────────────────────────────────────
-
-    def get_points_in_mask(
-        self,
-        frame_index: int,
-        mask: np.ndarray,
-        opt_result,
-    ) -> np.ndarray:
-        """
-        World-space points that fall within a 2D segmentation mask.
-
-        Reconstructs the dense point cloud from the stored depth map for the
-        requested frame, then transforms to global world via opt_result.
-
-        Args:
-            frame_index: index within this submap's frame list
-            mask:        (H, W) bool — pixels to include
-            opt_result:  OptimizationResult providing the global Sim3
-
-        Returns:
-            (N_mask, 3) float32 global world-space points
-        """
-        frame = self.frames[frame_index]
-        K     = frame.intrinsic
-        depth = frame.depth  # (H, W)
-        H, W  = depth.shape
-
-        u, v  = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
-        valid = mask & np.isfinite(depth) & (depth > 0.0)
-        if not valid.any():
-            return np.empty((0, 3), dtype=np.float32)
-
-        z = depth[valid]
-        x = (u[valid] - K[0, 2]) * z / K[0, 0]
-        y = (v[valid] - K[1, 2]) * z / K[1, 1]
-        points_cam = np.stack([x, y, z], axis=-1).astype(np.float32)
-
-        # Camera space → global world via per-frame optimised pose
-        global_c2w = opt_result.pose(frame.seq_idx).astype(np.float64)
-        homo = np.hstack([points_cam, np.ones((len(points_cam), 1), dtype=np.float32)])
-        return (global_c2w @ homo.T).T[:, :3].astype(np.float32)
 
 
 # ── builder ───────────────────────────────────────────────────────────────────
 
 class SubmapBuilder:
-    """Builds a Submap from a batch of keyframe image paths."""
+    """Builds a Submap from a batch of keyframe images."""
 
     def __init__(
         self,
@@ -414,47 +215,6 @@ class SubmapBuilder:
         self.estimator = estimator
         self.confidence_percentile = confidence_percentile
 
-    def build_from_prediction(
-        self,
-        prediction: DepthPrediction,
-        submap_idx: int,
-    ) -> Submap:
-        """
-        Build a Submap directly from an already-computed DepthPrediction.
-
-        Used by LoopClosureDetector to build 2-frame LC submaps from DA3
-        re-inference without hitting the filesystem again.
-        """
-        conf_threshold = float(np.percentile(prediction.confidence, self.confidence_percentile))
-        submap = Submap(idx=submap_idx, conf_threshold=conf_threshold)
-
-        for i in range(len(prediction.extrinsics)):
-            points_cam, mask = prediction.to_pointcloud(i, self.confidence_percentile)
-            points_world = _transform_to_world(points_cam, prediction.extrinsics[i])
-            colors = _extract_colors(prediction.processed_images[i], mask)
-
-            K = prediction.intrinsics[i]
-            K_inv = np.eye(4, dtype=np.float32)
-            K_inv[:3, :3] = np.linalg.inv(K)
-
-            frame = Frame(
-                seq_idx=i,
-                image=prediction.processed_images[i],
-                points_cam=points_cam,
-                points_world=points_world,
-                colors=colors,
-                extrinsic=prediction.extrinsics[i],
-                intrinsic=K,
-                depth=prediction.depth[i],
-                conf=prediction.confidence[i],
-                conf_mask=mask,
-                proj_mat=K_inv,
-            )
-            submap.frames.append(frame)
-
-        submap.set_last_non_loop_frame_index(len(submap.frames) - 1)
-        return submap
-
     def build(
         self,
         image_paths: list[str],
@@ -463,70 +223,63 @@ class SubmapBuilder:
         submap_idx: int = 0,
     ) -> Submap:
         """
-        Build a Submap from a batch of keyframes.
-
-        In addition to sparse filtered point clouds, stores per-frame raw depth
-        and confidence maps (for re-thresholding), inverse intrinsics, and
-        image provenance metadata.
+        Run DA3 on a batch of keyframes and build a Submap.
 
         Args:
-            image_paths:  ordered list of keyframe file paths (used for metadata only)
+            image_paths:  ordered list of keyframe file paths (metadata only)
             images:       pre-loaded HxWx3 uint8 RGB arrays, one per keyframe
             seq_indices:  corresponding indices in the original full sequence
             submap_idx:   position of this submap in the global sequence
-
-        Returns:
-            Submap with per-frame point clouds, raw maps, and metadata
         """
         assert len(image_paths) == len(seq_indices) == len(images)
+        prediction = self.estimator.infer(images)
+        submap = self.build_from_prediction(prediction, submap_idx, seq_indices)
+        submap.image_paths = list(image_paths)
+        return submap
 
-        prediction: DepthPrediction = self.estimator.infer(images)
+    def build_from_prediction(
+        self,
+        prediction: DepthPrediction,
+        submap_idx: int,
+        seq_indices: Sequence[int] | None = None,
+    ) -> Submap:
+        """
+        Build a Submap from an already-computed DepthPrediction.
 
-        # Global confidence threshold computed across all frames in this batch
-        conf_threshold = float(np.percentile(prediction.confidence, self.confidence_percentile))
+        Also used by LoopClosureDetector to build 2-frame LC submaps from DA3
+        re-inference without re-running the model.
 
+        Args:
+            prediction:  normalised DA3 outputs for the batch
+            submap_idx:  position of this submap in the global sequence
+                         (negative for LC submaps)
+            seq_indices: per-frame indices into the original sequence;
+                         defaults to 0..N-1 (used for LC submaps, whose
+                         frames don't correspond to sequence positions)
+        """
+        if seq_indices is None:
+            seq_indices = range(prediction.n_frames)
+
+        # One global threshold across the whole batch: consistently
+        # low-confidence frames contribute fewer points than high-confidence
+        # ones (a per-frame threshold would always keep the same fraction).
+        conf_threshold = prediction.confidence_threshold(self.confidence_percentile)
         submap = Submap(idx=submap_idx, conf_threshold=conf_threshold)
 
         for i, seq_idx in enumerate(seq_indices):
-            points_cam, mask = prediction.to_pointcloud(i, self.confidence_percentile)
-            points_world = _transform_to_world(points_cam, prediction.extrinsics[i])
-            colors = _extract_colors(prediction.processed_images[i], mask)
-
-            K = prediction.intrinsics[i]       # (3, 3)
-            K_inv = np.eye(4, dtype=np.float32)
-            K_inv[:3, :3] = np.linalg.inv(K)  # inverse intrinsics padded to (4, 4)
-
-            frame = Frame(
+            points_cam, mask = prediction.to_pointcloud(i, conf_threshold)
+            cam_to_world = np.linalg.inv(prediction.extrinsics[i])
+            submap.frames.append(Frame(
                 seq_idx=seq_idx,
                 image=prediction.processed_images[i],
                 points_cam=points_cam,
-                points_world=points_world,
-                colors=colors,
+                points_world=transform_points(points_cam, cam_to_world),
+                colors=prediction.processed_images[i][mask].astype(np.uint8),
                 extrinsic=prediction.extrinsics[i],
-                intrinsic=K,
+                intrinsic=prediction.intrinsics[i],
                 depth=prediction.depth[i],
-                conf=prediction.confidence[i],
-                conf_mask=mask,
-                proj_mat=K_inv,
-            )
-            submap.frames.append(frame)
-
-        # Provenance metadata
-        submap.set_img_names(image_paths)
-        submap.set_frame_ids(image_paths)
-        submap.set_last_non_loop_frame_index(len(image_paths) - 1)
+                confidence=prediction.confidence[i],
+                confidence_mask=mask,
+            ))
 
         return submap
-
-
-# ── internal helpers ──────────────────────────────────────────────────────────
-
-def _transform_to_world(
-    points_cam: np.ndarray, extrinsic: np.ndarray
-) -> np.ndarray:
-    cam_to_world = np.linalg.inv(extrinsic)
-    return (points_cam @ cam_to_world[:3, :3].T) + cam_to_world[:3, 3]
-
-
-def _extract_colors(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    return image[mask].astype(np.uint8)

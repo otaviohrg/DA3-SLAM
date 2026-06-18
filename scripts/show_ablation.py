@@ -16,9 +16,9 @@ import json
 import sys
 from pathlib import Path
 
-# Import table-printing functions from the ablation script.
-_SCRIPTS_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_SCRIPTS_DIR))
+# Table-printing functions live in the ablation script.  Both scripts are run
+# from the repo root as `python scripts/<name>.py`, which puts scripts/ on
+# sys.path, so this import resolves without path manipulation.
 from ablation_tum import (
     BASELINE,
     SWEEPS,
@@ -130,7 +130,7 @@ def _print_accuracy_table_sorted(
     label_col = max(len(r["label"]) for r in completed) + 2
     header = (
         f"{'Configuration':<{label_col}}  "
-        f"{'sub':>4}  {'disp':>5}  {'conf':>5}  {'thr':>5}  "
+        f"{'sub':>4}  {'disp':>5}  {'conf':>5}  {'lc_thr':>6}  "
         f"{'avg ATE':>9}  {'avg Sim3':>9}  "
         f"{'avg RPE-t':>10}  {'avg RPE-r':>10}  "
         f"{'avg KFs':>8}  {'avg LCs':>8}  {'avg wall':>9}"
@@ -152,7 +152,7 @@ def _print_accuracy_table_sorted(
             f"{p['submap_size']:>4}  "
             f"{p['min_disparity_fraction']:>5.2f}  "
             f"{p['confidence_percentile']:>5.1f}  "
-            f"{p['loop_threshold']:>5.2f}  "
+            f"{p['lc_distance_threshold']:>6.2f}  "
             f"{avg['ate_se3_rmse']:>9.4f}  "
             f"{avg['ate_sim3_rmse']:>9.4f}  "
             f"{avg['rpe_trans_rmse']:>10.4f}  "
@@ -165,7 +165,7 @@ def _print_accuracy_table_sorted(
     print("  " + "─" * len(header))
     best = completed[0]
     print(f"  Best: {best['label']}  →  {sort_label} {best['avg'].get(sort_metric, '?')}")
-    print(f"  (* = baseline config)")
+    print("  (* = baseline config)")
     print(sep)
 
 
@@ -186,7 +186,6 @@ def _print_single_axis(
               f"{'avg KFs':>8}  {'avg LCs':>8}  {'s/frame':>8}")
         print(f"  {'─'*64}")
 
-        import numpy as np
         for val in values:
             cfg = dict(baseline_params)
             cfg[sweep_key] = val

@@ -1,14 +1,18 @@
 """
-Test da3_slam.submap.
+Smoke test for da3_slam.backend.inference.submap (requires GPU + DA3).
+
+Builds one submap from the first few images of a directory and checks the
+shapes, dtypes, and geometric consistency of its frames.
 
 Usage:
     python scripts/test_submap.py --image_dir data/video1_5fps
 """
 
 import argparse
-from pathlib import Path
 
 import numpy as np
+
+from smoke_test_utils import header, check, list_images, load_rgb_images, save_ascii_ply
 
 
 def parse_args():
@@ -21,27 +25,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def header(title: str) -> None:
-    print(f"\n{'─' * 60}")
-    print(f"  {title}")
-    print('─' * 60)
-
-
-def check(label: str, condition: bool) -> None:
-    status = "PASS" if condition else "FAIL"
-    print(f"  [{status}] {label}")
-    if not condition:
-        raise AssertionError(f"FAIL: {label}")
-
-
 def main():
     args = parse_args()
 
-    exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    paths = sorted(
-        str(p) for p in Path(args.image_dir).iterdir()
-        if p.suffix.lower() in exts
-    )[: args.submap_size]
+    paths = list_images(args.image_dir, limit=args.submap_size)
     check(f"Found {len(paths)} images", len(paths) > 0)
 
     from da3_slam.backend.inference.depth_estimator import DepthEstimator
@@ -52,8 +39,9 @@ def main():
 
     # ── build submap ──────────────────────────────────────────────────────────
     header("SubmapBuilder.build()")
+    images = load_rgb_images(paths)
     seq_indices = list(range(len(paths)))
-    submap = builder.build(paths, seq_indices, submap_idx=0)
+    submap = builder.build(paths, images, seq_indices, submap_idx=0)
     N = len(paths)
 
     # ── submap-level checks ───────────────────────────────────────────────────
@@ -65,6 +53,8 @@ def main():
     check("colors dtype uint8", submap.colors.dtype == np.uint8)
     check(f"extrinsics shape ({N}, 4, 4)", submap.extrinsics.shape == (N, 4, 4))
     check(f"positions_world shape ({N}, 3)", submap.positions_world.shape == (N, 3))
+    check("conf_threshold recorded", submap.conf_threshold is not None)
+    check("image_paths recorded", submap.image_paths == paths)
 
     total_pts = len(submap.points_world)
     print(f"  Total points: {total_pts:,}")
@@ -88,6 +78,10 @@ def main():
             f"frame {frame.seq_idx:03d}: det(R) ≈ 1.0",
             abs(np.linalg.det(frame.extrinsic[:3, :3]) - 1.0) < 1e-3,
         )
+        check(
+            f"frame {frame.seq_idx:03d}: confidence_mask count matches points",
+            int(frame.confidence_mask.sum()) == len(frame.points_cam),
+        )
         print(
             f"  frame {frame.seq_idx:03d}  "
             f"{frame.n_points:,} pts  "
@@ -99,7 +93,6 @@ def main():
     # ── cam-to-world roundtrip ────────────────────────────────────────────────
     header("cam-to-world roundtrip")
     frame = submap.frames[0]
-    # Transform a cam point to world and back, should recover original
     pt_cam = frame.points_cam[:1]
     E = frame.extrinsic
     c2w = frame.cam_to_world
@@ -112,7 +105,7 @@ def main():
     header("Trajectory sanity")
     positions = submap.positions_world
     dists = np.linalg.norm(np.diff(positions, axis=0), axis=1)
-    print(f"  Camera positions (world):")
+    print("  Camera positions (world):")
     for i, pos in enumerate(positions):
         print(f"    frame {i:02d}  [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
     print(f"  Inter-frame distances: {dists.round(3)}")
@@ -121,24 +114,10 @@ def main():
     # ── optional PLY export ───────────────────────────────────────────────────
     if args.save_ply:
         header(f"Saving PLY → {args.save_ply}")
-        _save_ply(submap.points_world, submap.colors, args.save_ply)
+        save_ascii_ply(submap.points_world, submap.colors, args.save_ply)
         print(f"  Saved {total_pts:,} points.")
 
     header("All checks passed")
-
-
-def _save_ply(points: np.ndarray, colors: np.ndarray, path: str) -> None:
-    """Write a coloured point cloud to a PLY file."""
-    n = len(points)
-    with open(path, "w") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {n}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        f.write("end_header\n")
-        for pt, col in zip(points, colors):
-            f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} "
-                    f"{col[0]} {col[1]} {col[2]}\n")
 
 
 if __name__ == "__main__":

@@ -1,29 +1,50 @@
 """
-Benchmark DA3-SLAM on TUM RGB-D sequences.
+Benchmark DA3-SLAM on EuRoC MAV sequences.
 
 Evaluates Absolute Trajectory Error (ATE) and Relative Pose Error (RPE)
-against the motion-capture ground truth provided by each TUM sequence.
+against the Vicon/Leica ground truth shipped with each EuRoC sequence.
+Uses the left camera (cam0) as the monocular input.
 
-Dataset: https://cvg.cit.tum.de/data/datasets/rgbd-dataset
+Dataset: https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets
 
-Usage — single sequence:
-    python scripts/benchmark_tum.py \\
-        --seq_dir data/tum/rgbd_dataset_freiburg1_xyz \\
-        --out_dir outputs/benchmark/fr1_xyz
+EuRoC sequences are distributed in the ASL format:
 
-Usage — multiple sequences (summary table printed at the end):
-    python scripts/benchmark_tum.py \\
-        --seq_dir data/tum/rgbd_dataset_freiburg1_xyz \\
-                  data/tum/rgbd_dataset_freiburg1_desk \\
-                  data/tum/rgbd_dataset_freiburg2_xyz \\
-        --out_dir outputs/benchmark
+    <seq>/mav0/cam0/data/<timestamp_ns>.png      left grayscale frames
+    <seq>/mav0/cam0/data.csv                      timestamp,filename index
+    <seq>/mav0/cam0/sensor.yaml                   intrinsics, distortion, T_BS
+    <seq>/mav0/state_groundtruth_estimate0/data.csv   body pose @ ~200 Hz
 
-Outputs per sequence (inside <out_dir>/<seq_name>/):
-    trajectory_est.txt      TUM-format estimated trajectory (real timestamps)
-    trajectory_gt.txt       GT subset matched to estimated keyframes
-    results.json            all metrics
-    trajectory_xy.png       top-down estimated vs GT comparison
-    ate_errors.png          per-frame ATE over time
+Three EuRoC-specific details handled here (vs. the TUM benchmark):
+
+  1. Ground truth is the **IMU/body** pose in the world frame, with a
+     (w, x, y, z) quaternion.  DA3-SLAM estimates the **camera** trajectory,
+     so GT is converted to the camera frame with the body→camera extrinsic
+     T_BS from cam0/sensor.yaml:  T_WC = T_WB @ T_BS.  A constant body↔camera
+     offset does not commute with the single global ATE alignment, so this
+     conversion is required for a fair comparison.
+
+  2. Timestamps are integer nanoseconds; they are converted to seconds so the
+     shared association / metric code (scripts/tum_eval_common.py) applies
+     unchanged.
+
+  3. EuRoC frames carry significant radial-tangential distortion, but DA3
+     assumes a pinhole model.  Frames are undistorted by default (cv2.undistort
+     with the sensor.yaml intrinsics); pass --no_undistort to skip.
+
+DA3-SLAM is monocular, so its trajectory has an arbitrary global scale.
+The meaningful accuracy number is therefore the **Sim3 ATE**.
+
+Usage — single sequence (point --seq_dir at the directory containing mav0,
+or any ancestor of it):
+    python scripts/benchmark_euroc.py \\
+        --seq_dir data/EuRoC/vicon_room2/V2_01_easy \\
+        --out_dir outputs/euroc/V2_01_easy
+
+Usage — multiple sequences (summary table at the end):
+    python scripts/benchmark_euroc.py \\
+        --seq_dir data/EuRoC/vicon_room1/V1_01_easy \\
+                  data/EuRoC/vicon_room2/V2_01_easy \\
+        --out_dir outputs/euroc
 
 SLAM config knobs (same as run_slam.py):
     --config, --submap_size, --confidence_percentile,
@@ -37,136 +58,60 @@ import json
 import traceback
 from pathlib import Path
 
-import numpy as np
+from scipy.spatial.transform import Rotation
 
+from euroc_common import (
+    find_mav0,
+    load_camera_calibration,
+    load_euroc_images,
+    load_euroc_groundtruth,
+    undistort_images,
+)
 from tum_eval_common import (
     SharedSLAM,
-    load_rgb_list,
-    load_groundtruth,
     associate,
     compute_ate,
     compute_rpe,
 )
-
-
-# ── formatting helpers ────────────────────────────────────────────────────────
-
-def _m_str(v: float) -> str:
-    return f"{v:.4f} m"
-
-
-def _cm_str(v: float) -> str:
-    return f"{v * 100:.2f} cm"
-
-
-def _deg_str(d: float) -> str:
-    return f"{d:.3f}°"
-
-
-# ── visualisation ─────────────────────────────────────────────────────────────
-
-def plot_results(
-    gt_poses: list[np.ndarray],
-    est_poses: list[np.ndarray],
-    ate_result: dict,
-    out_dir: Path,
-    seq_name: str,
-) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    gt_pos = np.array([p[:3, 3] for p in gt_poses])
-    est_pos = np.array([p[:3, 3] for p in est_poses])
-
-    # Align estimated for visualisation
-    T_align = np.array(ate_result["align_T"])
-    est_h = np.hstack([est_pos, np.ones((len(est_pos), 1))])
-    est_aligned = (T_align @ est_h.T).T[:, :3]
-
-    # ── top-down XZ comparison ────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(9, 9))
-    ax.plot(gt_pos[:, 0], gt_pos[:, 2], "g-", linewidth=1.5, label="Ground truth")
-    ax.plot(est_aligned[:, 0], est_aligned[:, 2], "b--", linewidth=1.5,
-            label="DA3-SLAM (aligned)")
-    ax.scatter(gt_pos[0, 0], gt_pos[0, 2], color="green", s=80, zorder=5)
-    ax.scatter(gt_pos[-1, 0], gt_pos[-1, 2], color="darkgreen", s=80, marker="*", zorder=5)
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Z (m)")
-    ax.set_title(f"{seq_name} — top-down view  ATE RMSE {ate_result['rmse']*100:.1f} cm")
-    ax.legend()
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-    fig.savefig(str(out_dir / "trajectory_xy.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-    # ── ATE per frame ─────────────────────────────────────────────────────────
-    errors = np.array(ate_result["per_frame_errors"])
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(errors * 100, linewidth=1.2, color="royalblue")
-    ax.axhline(ate_result["rmse"] * 100, color="red", linestyle="--",
-               linewidth=1, label=f"RMSE = {ate_result['rmse']*100:.1f} cm")
-    ax.axhline(ate_result["mean"] * 100, color="orange", linestyle=":",
-               linewidth=1, label=f"Mean = {ate_result['mean']*100:.1f} cm")
-    ax.set_xlabel("Keyframe index")
-    ax.set_ylabel("ATE (cm)")
-    ax.set_title(f"{seq_name} — ATE over time")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.savefig(str(out_dir / "ate_errors.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-    print(f"  Plots saved to {out_dir}/")
+# plot_results and the metric-formatting helpers are dataset-agnostic.
+from benchmark_tum import plot_results, _m_str, _cm_str, _deg_str
 
 
 # ── single-sequence benchmark ─────────────────────────────────────────────────
 
-def build_config(args: argparse.Namespace):
-    """Build the SLAMConfig from YAML + CLI overrides."""
-    from da3_slam.config import load_slam_config
-
-    config = load_slam_config(
-        args.config,
-        submap_size=args.submap_size,
-        confidence_percentile=args.confidence_percentile,
-        depth_model=args.depth_model,
-        depth_model_resolution=args.depth_model_resolution,
-    )
-    if args.no_loop_closure:
-        config.enable_loop_closure = False
-    if args.loop_distance_threshold is not None:
-        config.loop_closure.distance_threshold = args.loop_distance_threshold
-    if args.min_disparity_fraction is not None:
-        config.keyframe.min_disparity_fraction = args.min_disparity_fraction
-    return config
-
-
 def benchmark_sequence(slam, seq_dir: Path, out_dir: Path, args) -> dict | None:
-    """
-    Run the full benchmark for one TUM sequence.
+    """Run SLAM on one EuRoC sequence and score it against ground truth.
+
     Returns the metrics dict, or None if the sequence could not be evaluated.
     """
     seq_name = seq_dir.name
 
-    rgb_txt = seq_dir / "rgb.txt"
-    gt_txt = seq_dir / "groundtruth.txt"
-    if not rgb_txt.exists():
-        print(f"  [SKIP] {seq_name}: rgb.txt not found in {seq_dir}")
-        return None
-    if not gt_txt.exists():
-        print(f"  [SKIP] {seq_name}: groundtruth.txt not found in {seq_dir}")
+    mav0 = find_mav0(seq_dir)
+    if mav0 is None:
+        print(f"  [SKIP] {seq_name}: no extracted mav0/ found under {seq_dir} "
+              f"(is the sequence still a .zip?)")
         return None
 
-    image_paths, timestamps = load_rgb_list(seq_dir, args.max_frames)
-    print(f"\n  {len(image_paths)} RGB frames  "
+    calibration = load_camera_calibration(mav0, cam=args.cam)
+    image_paths, timestamps = load_euroc_images(mav0, cam=args.cam,
+                                                max_frames=args.max_frames)
+    if not image_paths:
+        print(f"  [SKIP] {seq_name}: no images listed in {args.cam}/data.csv")
+        return None
+    print(f"\n  {len(image_paths)} {args.cam} frames  "
           f"({timestamps[0]:.3f}s – {timestamps[-1]:.3f}s)")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.undistort:
+        image_paths = undistort_images(
+            image_paths, calibration, out_dir / f"undistorted_{args.cam}"
+        )
 
     result = slam.run(image_paths)
 
     ts_map = {i: ts for i, ts in enumerate(timestamps)}
 
-    # ── save estimated trajectory with real timestamps ─────────────────────────
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # ── save estimated trajectory (real timestamps, seconds) ──────────────────
     est_tum = str(out_dir / "trajectory_est.txt")
     result.save_tum(est_tum, timestamps=ts_map)
     print(f"  Saved estimated trajectory → {est_tum}")
@@ -177,7 +122,7 @@ def benchmark_sequence(slam, seq_dir: Path, out_dir: Path, args) -> dict | None:
         for seq_idx, pose in result.keyframe_poses.items()
         if seq_idx in ts_map
     }
-    gt_all = load_groundtruth(gt_txt)
+    gt_all = load_euroc_groundtruth(mav0, calibration["T_BS"])
     gt_stamps = [e[0] for e in gt_all]
     est_stamps = sorted(est_ts_to_pose.keys())
 
@@ -192,8 +137,7 @@ def benchmark_sequence(slam, seq_dir: Path, out_dir: Path, args) -> dict | None:
     gt_poses_matched = [gt_all[ib][1] for _, ib in pairs]
     est_poses_matched = [est_ts_to_pose[est_stamps[ia]] for ia, _ in pairs]
 
-    # ── save matched GT subset ────────────────────────────────────────────────
-    from scipy.spatial.transform import Rotation
+    # ── save matched GT subset (camera frame, TUM format) ─────────────────────
     gt_tum = str(out_dir / "trajectory_gt.txt")
     with open(gt_tum, "w") as f:
         f.write("# timestamp tx ty tz qx qy qz qw\n")
@@ -206,19 +150,18 @@ def benchmark_sequence(slam, seq_dir: Path, out_dir: Path, args) -> dict | None:
                     f"{t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "
                     f"{q[0]:.9f} {q[1]:.9f} {q[2]:.9f} {q[3]:.9f}\n")
 
-    # ── compute metrics ───────────────────────────────────────────────────────
+    # ── metrics ───────────────────────────────────────────────────────────────
     ate_se3 = compute_ate(gt_poses_matched, est_poses_matched, align="se3")
     ate_sim3 = compute_ate(gt_poses_matched, est_poses_matched, align="sim3")
     rpe_1 = compute_rpe(gt_poses_matched, est_poses_matched, delta=1)
     rpe_n = compute_rpe(gt_poses_matched, est_poses_matched,
                         delta=max(1, n_matched // 8))
 
-    # ── print results ─────────────────────────────────────────────────────────
-    print("\n  ┌─ ATE (SE3 alignment) ──────────────────────────────────┐")
-    print(f"  │  RMSE   {_m_str(ate_se3['rmse']):<14}  Mean   {_m_str(ate_se3['mean']):<14}  │")
-    print(f"  │  Median {_m_str(ate_se3['median']):<14}  Max    {_m_str(ate_se3['max']):<14}  │")
-    print(f"  ├─ ATE (Sim3 alignment, scale={ate_sim3['scale']:.4f}) ───────────────┤")
+    print("\n  ┌─ ATE (Sim3 alignment — the monocular metric) ──────────┐")
     print(f"  │  RMSE   {_m_str(ate_sim3['rmse']):<14}  Mean   {_m_str(ate_sim3['mean']):<14}  │")
+    print(f"  │  Median {_m_str(ate_sim3['median']):<14}  scale  {ate_sim3['scale']:<14.4f}  │")
+    print("  ├─ ATE (SE3 alignment, no scale) ──────────────────────────┤")
+    print(f"  │  RMSE   {_m_str(ate_se3['rmse']):<14}  Mean   {_m_str(ate_se3['mean']):<14}  │")
     print("  ├─ RPE  δ=1 frame ─────────────────────────────────────────┤")
     print(f"  │  Trans  {_cm_str(rpe_1['trans_rmse']):<14}  Rot    {_deg_str(rpe_1['rot_rmse_deg']):<14}  │")
     print(f"  ├─ RPE  δ={rpe_n['delta']} frames ────────────────────────────────────┤")
@@ -227,7 +170,6 @@ def benchmark_sequence(slam, seq_dir: Path, out_dir: Path, args) -> dict | None:
     print(f"  Keyframes: {result.n_keyframes}  Submaps: {len(result.submaps)}  "
           f"Loop closures: {len(result.loop_closures)}")
 
-    # ── save full results ─────────────────────────────────────────────────────
     metrics = {
         "sequence": seq_name,
         "n_frames": len(image_paths),
@@ -249,8 +191,9 @@ def benchmark_sequence(slam, seq_dir: Path, out_dir: Path, args) -> dict | None:
         json.dump(metrics, f, indent=2)
     print(f"  Results saved → {out_dir}/results.json")
 
+    # Plot against the Sim3-aligned trajectory (the meaningful one for monocular).
     try:
-        plot_results(gt_poses_matched, est_poses_matched, ate_se3, out_dir, seq_name)
+        plot_results(gt_poses_matched, est_poses_matched, ate_sim3, out_dir, seq_name)
     except Exception as e:
         print(f"  [warn] Plotting failed: {e}")
 
@@ -262,52 +205,79 @@ def benchmark_sequence(slam, seq_dir: Path, out_dir: Path, args) -> dict | None:
 def print_summary(all_metrics: list[dict]) -> None:
     if not all_metrics:
         return
-    # Strip common prefix for cleaner sequence names
-    seqs = [m["sequence"] for m in all_metrics]
-    prefix = "rgbd_dataset_freiburg1_"
-    names = [s[len(prefix):] if s.startswith(prefix) else s for s in seqs]
+    names = [m["sequence"] for m in all_metrics]
     col = max(len(n) for n in names) + 2
 
     header = (f"{'Sequence':<{col}}  "
-              f"{'ATE RMSE (m)':>13}  {'ATE Sim3 (m)':>13}  "
+              f"{'ATE Sim3 (m)':>13}  {'ATE SE3 (m)':>13}  "
               f"{'RPE-t (m)':>10}  {'RPE-r (°)':>10}  {'KFs':>5}  {'LCs':>4}")
     sep = "═" * (len(header) + 2)
     print(f"\n{sep}")
-    print("  BENCHMARK SUMMARY  —  ATE RMSE of the Absolute Trajectory Error")
+    print("  EuRoC BENCHMARK SUMMARY  —  ATE RMSE (Sim3 = monocular metric)")
     print(sep)
     print("  " + header)
     print("  " + "─" * len(header))
-    ate_values = []
+    sim3_values = []
     for m, name in zip(all_metrics, names):
-        ate = m["ate_se3"]["rmse"]
-        ate_values.append(ate)
+        sim3 = m["ate_sim3"]["rmse"]
+        sim3_values.append(sim3)
         print(f"  {name:<{col}}  "
-              f"{ate:>13.4f}  {m['ate_sim3']['rmse']:>13.4f}  "
+              f"{sim3:>13.4f}  {m['ate_se3']['rmse']:>13.4f}  "
               f"{m['rpe_delta1']['trans_rmse']:>10.4f}  "
               f"{m['rpe_delta1']['rot_rmse_deg']:>10.3f}  "
               f"{m['n_keyframes']:>5}  {m['n_loop_closures']:>4}")
 
-    avg = sum(ate_values) / len(ate_values)
     print("  " + "─" * len(header))
-    print(f"  {'avg':<{col}}  {avg:>13.4f}")
+    print(f"  {'avg':<{col}}  {sum(sim3_values) / len(sim3_values):>13.4f}")
     print(sep)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def build_config(args: argparse.Namespace):
+    """Build the SLAMConfig from YAML + CLI overrides (mirrors benchmark_tum)."""
+    from da3_slam.config import load_slam_config
+
+    config = load_slam_config(
+        args.config,
+        submap_size=args.submap_size,
+        confidence_percentile=args.confidence_percentile,
+        depth_model=args.depth_model,
+        depth_model_resolution=args.depth_model_resolution,
+        boundary_scale_damping=args.boundary_scale_damping,
+        boundary_scale_clamp=args.boundary_scale_clamp,
+    )
+    if args.no_loop_closure:
+        config.enable_loop_closure = False
+    if args.loop_distance_threshold is not None:
+        config.loop_closure.distance_threshold = args.loop_distance_threshold
+    if args.min_submaps_apart is not None:
+        config.loop_closure.min_submaps_apart = args.min_submaps_apart
+    if args.max_loop_closures is not None:
+        config.loop_closure.max_loop_closures = args.max_loop_closures
+    if args.min_disparity_fraction is not None:
+        config.keyframe.min_disparity_fraction = args.min_disparity_fraction
+    return config
+
+
 def parse_args() -> argparse.Namespace:
     from da3_slam.config import DEFAULT_YAML
 
     parser = argparse.ArgumentParser(
-        description="Benchmark DA3-SLAM on TUM RGB-D sequences",
+        description="Benchmark DA3-SLAM on EuRoC MAV sequences",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--seq_dir", nargs="+", required=True,
-                        help="Path(s) to TUM sequence directory/directories")
-    parser.add_argument("--out_dir", default="/app/outputs/benchmark",
+                        help="EuRoC sequence directory/directories "
+                             "(the mav0 parent, or any ancestor of it)")
+    parser.add_argument("--out_dir", default="outputs/euroc",
                         help="Root output directory")
     parser.add_argument("--config", default=str(DEFAULT_YAML),
                         help="YAML config file")
+    parser.add_argument("--cam", default="cam0",
+                        help="Which camera to use (cam0 = left)")
+    parser.add_argument("--no_undistort", dest="undistort", action="store_false",
+                        help="Skip radial-tangential undistortion of the frames")
     parser.add_argument("--max_frames", type=int, default=None,
                         help="Cap frames per sequence (for quick tests)")
 
@@ -316,11 +286,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence_percentile", type=float, default=None)
     parser.add_argument("--min_disparity_fraction", type=float, default=None)
     parser.add_argument("--no_loop_closure", action="store_true")
-    # --loop_threshold kept as an alias for backwards compatibility
     parser.add_argument("--loop_distance_threshold", "--loop_threshold",
                         type=float, default=None,
                         help="DINO-SALAD descriptor L2 distance threshold "
                              "(lower = stricter)")
+    parser.add_argument("--min_submaps_apart", type=int, default=None,
+                        help="Min submap index gap for loop-closure candidates")
+    parser.add_argument("--max_loop_closures", type=int, default=None,
+                        help="Max verified loop closures kept per submap")
+    parser.add_argument("--boundary_scale_damping", type=float, default=None,
+                        help="Damping g for inter-submap scale chaining: each "
+                             "boundary depth-ratio is raised to (1-g). "
+                             "0 = full chaining, 1 = trust DA3 metric depth")
+    parser.add_argument("--boundary_scale_clamp", type=float, default=None,
+                        help="Clamp each boundary scale ratio to [1/c, c] "
+                             "(unset = no clamping)")
     parser.add_argument("--depth_model", default=None)
     parser.add_argument("--depth_model_resolution", type=int, default=None)
 
@@ -337,11 +317,10 @@ def main() -> None:
     all_metrics = []
     for seq_path in args.seq_dir:
         seq_dir = Path(seq_path)
-        seq_name = seq_dir.name
-        out_dir = Path(args.out_dir) / seq_name
+        out_dir = Path(args.out_dir) / seq_dir.name
 
         print(f"\n{'═'*60}")
-        print(f"  Sequence: {seq_name}")
+        print(f"  Sequence: {seq_dir.name}")
         print(f"  Input:    {seq_dir}")
         print(f"  Output:   {out_dir}")
         print(f"{'═'*60}")
@@ -351,14 +330,14 @@ def main() -> None:
             if m is not None:
                 all_metrics.append(m)
         except Exception as e:
-            print(f"\n  [ERROR] {seq_name}: {e}")
+            print(f"\n  [ERROR] {seq_dir.name}: {e}")
             traceback.print_exc()
 
     if len(all_metrics) > 1:
         print_summary(all_metrics)
 
     if all_metrics:
-        agg_path = Path(args.out_dir) / "benchmark_summary.json"
+        agg_path = Path(args.out_dir) / "euroc_summary.json"
         agg_path.parent.mkdir(parents=True, exist_ok=True)
         with open(agg_path, "w") as f:
             json.dump(all_metrics, f, indent=2)

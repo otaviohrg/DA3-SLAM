@@ -4,11 +4,11 @@ Ablation study for DA3-SLAM on TUM RGB-D sequences.
 Sweeps key hyperparameters one-at-a-time (OFAT) around a baseline and
 reports average ATE across all sequences in a ranked comparison table.
 
-Parameters swept:
+Parameters swept (edit SWEEPS below to change the study):
     submap_size              — keyframes per submap (including 1-frame anchor)
     min_disparity_fraction   — keyframe selection aggressiveness (optical flow)
-    confidence_percentile    — point cloud filtering threshold
-    loop_threshold           — DINOv2 cosine similarity for loop closure
+    lc_distance_threshold    — DINO-SALAD L2 distance for loop closure
+                               candidates (lower = stricter)
 
 Usage:
     python scripts/ablation_tum.py \\
@@ -26,86 +26,62 @@ Usage:
 Outputs:
     <out_dir>/ablation_results.json    all per-sequence metrics per config
     <out_dir>/<config_name>/           per-sequence trajectory + plots
+
+Note: earlier revisions of this script swept a `loop_threshold` parameter
+interpreted as a DINOv2 cosine similarity.  Loop closure detection now uses
+DINO-SALAD L2 *distance*, so the sweep axis is `lc_distance_threshold` and
+old ablation_results.json files (keyed on `loop_threshold`) are not
+compatible with the current tables.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
-import sys
-import time
+
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+from tum_eval_common import SharedSLAM, evaluate_sequence, average_metrics
 
-
-# ── sweep specification (round 2) ────────────────────────────────────────────
-#
-# Round 1 findings:
-#   - submap_size=20 is clearly best; updated as new YAML default.
-#   - confidence_percentile=65 is a stable local optimum; not swept again.
-#   - min_disparity_fraction was confounded at sub=8 (max_submap_size cap was
-#     always the binding constraint → all disp values gave identical KF counts).
-#     Properly tested here at sub=20.
-#   - Loop closure produced 0 LCs at sub=20 with thr≥0.85 (too few submaps to
-#     find candidates). Threshold lowered to exercise loop closure.
+# ── sweep specification ───────────────────────────────────────────────────────
 #
 # Baseline: current config/default.yaml values.
 BASELINE: dict[str, Any] = {
     "submap_size":            20,
-    "min_disparity_fraction": 0.10,
+    "min_disparity_fraction": 0.40,
     "confidence_percentile":  65.0,
-    "loop_threshold":         0.90,
+    "lc_distance_threshold":  0.45,
 }
 
 # Each entry: (param_key, display_short, values_to_sweep)
 # The baseline value must appear somewhere in each sweep so the baseline row
 # is included once and naturally compared to every variant.
 #
-# Parameter guidance (round 2):
-#   submap_size:            Fine sweep around the round-1 optimum (20).
-#                           DA3 joint estimation improves with more frames per
-#                           batch, but very large values leave too few submaps
-#                           for the pose graph to correct drift.
-#   min_disparity_fraction: At sub=20, max_submap_size=20 is no longer always
-#                           the binding constraint. Lower values (≥0.10) select
-#                           more keyframes → more context per submap.  Higher
-#                           values select fewer, sparser keyframes.
-#   loop_threshold:         At sub=20 the graph has 2–4 nodes per sequence;
-#                           loop closure requires lower similarity thresholds to
-#                           fire at all. Sweep 0.70–0.90 to find whether any
-#                           loop closures actually help at this submap size.
-#   confidence_percentile:  Not swept — well characterised in round 1 (65 optimal).
+# confidence_percentile is not swept — well characterised in earlier rounds
+# (65 was a stable local optimum).
 SWEEPS: list[tuple[str, str, list]] = [
-    ("submap_size",            "sub",  [14, 16, 18, 20, 22, 25]),
-    ("min_disparity_fraction", "disp", [0.10, 0.20, 0.30, 0.40, 0.50]),
-    ("loop_threshold",         "thr",  [0.70, 0.75, 0.80, 0.85, 0.90]),
+    ("submap_size",            "sub",    [14, 16, 18, 20, 22, 25]),
+    ("min_disparity_fraction", "disp",   [0.10, 0.20, 0.30, 0.40, 0.50]),
+    ("lc_distance_threshold",  "lc_thr", [0.35, 0.45, 0.55]),
 ]
+
+# Short display names used in labels and table columns.
+SHORT: dict[str, str] = {
+    "submap_size":            "sub",
+    "min_disparity_fraction": "disp",
+    "confidence_percentile":  "conf",
+    "lc_distance_threshold":  "lc_thr",
+}
 
 # Specific multi-parameter combos (optional — set to [] to skip)
-COMBO_CONFIGS: list[dict[str, Any]] = [
-    # Example: pair best submap_size with best disparity found from OFAT sweeps
-    # Fill in after a first OFAT pass.
-]
-
+COMBO_CONFIGS: list[dict[str, Any]] = []
 
 # ── config generation ─────────────────────────────────────────────────────────
 
-def _config_label(params: dict[str, Any]) -> str:
+def config_label(params: dict[str, Any]) -> str:
     """Short human-readable label for a parameter dict."""
-    parts = []
-    for key, val in params.items():
-        short = {
-            "submap_size":            "sub",
-            "min_disparity_fraction": "disp",
-            "confidence_percentile":  "conf",
-            "loop_threshold":         "thr",
-        }.get(key, key)
-        parts.append(f"{short}={val}")
-    return "  ".join(parts)
-
+    return "  ".join(f"{SHORT.get(k, k)}={v}" for k, v in params.items())
 
 def generate_configs() -> list[dict[str, Any]]:
     """
@@ -117,7 +93,6 @@ def generate_configs() -> list[dict[str, Any]]:
     """
     seen: list[dict] = []
 
-    # OFAT: vary one param at a time
     for sweep_key, _, values in SWEEPS:
         for val in values:
             cfg = dict(BASELINE)
@@ -125,7 +100,6 @@ def generate_configs() -> list[dict[str, Any]]:
             if cfg not in seen:
                 seen.append(cfg)
 
-    # Explicit combos
     for extra in COMBO_CONFIGS:
         cfg = dict(BASELINE)
         cfg.update(extra)
@@ -134,55 +108,21 @@ def generate_configs() -> list[dict[str, Any]]:
 
     return seen
 
+def build_config(params: dict[str, Any]):
+    """Construct a SLAMConfig from an ablation params dict."""
+    from da3_slam.config import load_slam_config
 
-# ── benchmark helpers (mirrored from benchmark_tum.py) ───────────────────────
-
-def _import_benchmark():
-    """Import utility functions from benchmark_tum.py (same directory)."""
-    script_dir = Path(__file__).resolve().parent
-    sys.path.insert(0, str(script_dir))
-    import benchmark_tum as bm
-    return bm
-
+    config = load_slam_config(
+        submap_size=params["submap_size"],
+        confidence_percentile=params["confidence_percentile"],
+    )
+    # Nested fields not reachable via load_slam_config overrides
+    config.keyframe.min_disparity_fraction = params["min_disparity_fraction"]
+    config.keyframe.max_submap_size = params["submap_size"]
+    config.loop_closure.distance_threshold = params["lc_distance_threshold"]
+    return config
 
 # ── per-config runner ─────────────────────────────────────────────────────────
-
-class SharedSLAM:
-    """
-    Wraps DA3SLAM so the expensive DepthEstimator (GPU model) is loaded
-    once and reused across all configs.  Only the cheap components
-    (SubmapBuilder, LoopClosureDetector) are rebuilt per config.
-    """
-
-    def __init__(self, base_config):
-        from da3_slam.slam import DA3SLAM
-        # Load model once
-        self._slam = DA3SLAM(base_config)
-
-    def reconfigure(self, config) -> None:
-        """Swap in new config without reloading the depth model."""
-        from da3_slam.backend.inference.submap import SubmapBuilder
-        from da3_slam.backend.processing.loop_closure import LoopClosureDetector
-
-        self._slam.config  = config
-        self._slam.builder = SubmapBuilder(
-            self._slam.estimator,
-            confidence_percentile=config.confidence_percentile,
-        )
-        self._slam.detector = (
-            LoopClosureDetector(config.loop_closure)
-            if config.enable_loop_closure else None
-        )
-
-    def run(self, image_paths: list[str]):
-        # Reset detector before each sequence so embeddings from a previous
-        # sequence don't produce cross-sequence loop closures with stale indices.
-        from da3_slam.backend.processing.loop_closure import LoopClosureDetector
-        cfg = self._slam.config
-        if cfg.enable_loop_closure:
-            self._slam.detector = LoopClosureDetector(cfg.loop_closure)
-        return self._slam.run(image_paths)
-
 
 def run_config(
     params: dict[str, Any],
@@ -190,143 +130,45 @@ def run_config(
     out_root: Path,
     max_frames: int | None,
     shared_slam: SharedSLAM,
-    bm,
 ) -> dict:
     """
     Run all sequences for one parameter configuration.
     Returns a summary dict with per-sequence metrics and averages.
     """
-    from da3_slam.config import load_slam_config
-
-    label = _config_label(params)
+    label = config_label(params)
     cfg_name = label.replace(" ", "").replace("=", "").replace(".", "p")
 
-    config = load_slam_config(
-        submap_size=params["submap_size"],
-        confidence_percentile=params["confidence_percentile"],
-    )
-    # Patch sub-level fields not reachable via load_slam_config overrides
-    config.keyframe.min_disparity_fraction = params["min_disparity_fraction"]
-    config.keyframe.max_submap_size        = params["submap_size"]
-    config.loop_closure.similarity_threshold = params["loop_threshold"]
-
-    shared_slam.reconfigure(config)
+    shared_slam.reconfigure(build_config(params))
 
     seq_metrics: list[dict] = []
     for seq_dir in seq_dirs:
-        seq_name = seq_dir.name
-        out_dir  = out_root / cfg_name / seq_name
-
-        rgb_txt = seq_dir / "rgb.txt"
-        gt_txt  = seq_dir / "groundtruth.txt"
-        if not rgb_txt.exists() or not gt_txt.exists():
-            print(f"  [SKIP] {seq_name}: missing rgb.txt or groundtruth.txt")
-            continue
-
-        rgb_entries = bm.parse_tum_file(rgb_txt)
-        image_paths = [str(seq_dir / e[1]) for e in rgb_entries]
-        timestamps  = [e[0] for e in rgb_entries]
-
-        if max_frames:
-            image_paths = image_paths[:max_frames]
-            timestamps  = timestamps[:max_frames]
-
         try:
-            t0     = time.time()
-            result = shared_slam.run(image_paths)
-            wall   = time.time() - t0
-
-            ts_map = {i: timestamps[i] for i in range(len(timestamps))}
-            out_dir.mkdir(parents=True, exist_ok=True)
-            est_tum = str(out_dir / "trajectory_est.txt")
-            result.save_tum(est_tum, timestamps=ts_map)
-
-            est_ts_to_pose: dict[float, np.ndarray] = {}
-            for seq_idx, pose in result.keyframe_poses.items():
-                if seq_idx in ts_map:
-                    est_ts_to_pose[ts_map[seq_idx]] = pose
-
-            gt_all     = bm.load_groundtruth(gt_txt)
-            gt_stamps  = [e[0] for e in gt_all]
-            est_stamps = sorted(est_ts_to_pose.keys())
-            pairs      = bm.associate(est_stamps, gt_stamps, max_diff=0.02)
-
-            if len(pairs) < 3:
-                print(f"  [SKIP] {seq_name}: too few matched poses")
-                continue
-
-            gt_matched  = [gt_all[ib][1]                    for _, ib in pairs]
-            est_matched = [est_ts_to_pose[est_stamps[ia]]   for ia, _ in pairs]
-
-            ate_se3  = bm.compute_ate(gt_matched, est_matched, align="se3")
-            ate_sim3 = bm.compute_ate(gt_matched, est_matched, align="sim3")
-            rpe_1    = bm.compute_rpe(gt_matched, est_matched, delta=1)
-
-            m = {
-                "sequence":         seq_name,
-                "ate_se3_rmse":     ate_se3["rmse"],
-                "ate_sim3_rmse":    ate_sim3["rmse"],
-                "rpe_trans_rmse":   rpe_1["trans_rmse"],
-                "rpe_rot_rmse_deg": rpe_1["rot_rmse_deg"],
-                "n_frames":         len(image_paths),
-                "n_keyframes":      result.n_keyframes,
-                "n_submaps":        len(result.submaps),
-                "n_loop_closures":  len(result.loop_closures),
-                "wall_seconds":     round(wall, 1),
-            }
-            seq_metrics.append(m)
-
-            print(f"  {seq_name:<30}  ATE={ate_se3['rmse']:.4f}m  "
-                  f"Sim3={ate_sim3['rmse']:.4f}m  "
-                  f"KFs={result.n_keyframes}  LCs={len(result.loop_closures)}")
-
+            m = evaluate_sequence(
+                shared_slam.run, seq_dir, out_root / cfg_name / seq_dir.name, max_frames
+            )
         except Exception as exc:
             import traceback
-            print(f"  [ERROR] {seq_name}: {exc}")
+            print(f"  [ERROR] {seq_dir.name}: {exc}")
             traceback.print_exc()
-
-    if not seq_metrics:
-        return {"params": params, "label": label, "sequences": [], "avg": {}}
-
-    avg_ate      = float(np.mean([m["ate_se3_rmse"]     for m in seq_metrics]))
-    avg_ate_sim3 = float(np.mean([m["ate_sim3_rmse"]    for m in seq_metrics]))
-    avg_rpe_t    = float(np.mean([m["rpe_trans_rmse"]   for m in seq_metrics]))
-    avg_rpe_r    = float(np.mean([m["rpe_rot_rmse_deg"] for m in seq_metrics]))
-    avg_lcs      = float(np.mean([m["n_loop_closures"]  for m in seq_metrics]))
-    avg_kfs      = float(np.mean([m["n_keyframes"]      for m in seq_metrics]))
-    avg_wall     = float(np.mean([m["wall_seconds"]     for m in seq_metrics]))
-    # Normalized timing: compute per-sequence ratios then average (avoids
-    # longer sequences dominating the mean).
-    avg_s_per_frame = float(np.mean(
-        [m["wall_seconds"] / m["n_frames"] for m in seq_metrics]
-    ))
-    avg_s_per_kf = float(np.mean(
-        [m["wall_seconds"] / m["n_keyframes"] for m in seq_metrics if m["n_keyframes"] > 0]
-    ))
+            continue
+        if m is None:
+            continue
+        seq_metrics.append(m)
+        print(f"  {m['sequence']:<30}  ATE={m['ate_se3_rmse']:.4f}m  "
+              f"Sim3={m['ate_sim3_rmse']:.4f}m  "
+              f"KFs={m['n_keyframes']}  LCs={m['n_loop_closures']}")
 
     return {
-        "params":    params,
-        "label":     label,
+        "params": params,
+        "label": label,
         "sequences": seq_metrics,
-        "avg": {
-            "ate_se3_rmse":     avg_ate,
-            "ate_sim3_rmse":    avg_ate_sim3,
-            "rpe_trans_rmse":   avg_rpe_t,
-            "rpe_rot_rmse_deg": avg_rpe_r,
-            "n_loop_closures":  avg_lcs,
-            "n_keyframes":      avg_kfs,
-            "wall_seconds":     avg_wall,
-            "s_per_frame":      avg_s_per_frame,
-            "s_per_kf":         avg_s_per_kf,
-        },
+        "avg": average_metrics(seq_metrics),
     }
-
 
 # ── table printing ────────────────────────────────────────────────────────────
 
 def print_table(results: list[dict], baseline_params: dict) -> None:
     """Print ranked ablation table sorted by avg ATE SE3 (ascending)."""
-
     completed = [r for r in results if r.get("avg")]
     if not completed:
         print("No completed configs to report.")
@@ -334,12 +176,11 @@ def print_table(results: list[dict], baseline_params: dict) -> None:
 
     completed.sort(key=lambda r: r["avg"]["ate_se3_rmse"])
 
-    # Column widths
     label_col = max(len(r["label"]) for r in completed) + 2
 
     header = (
         f"{'Configuration':<{label_col}}  "
-        f"{'sub':>4}  {'disp':>5}  {'conf':>5}  {'thr':>5}  "
+        f"{'sub':>4}  {'disp':>5}  {'conf':>5}  {'lc_thr':>6}  "
         f"{'avg ATE':>9}  {'avg Sim3':>9}  "
         f"{'avg RPE-t':>10}  {'avg RPE-r':>10}  "
         f"{'avg KFs':>8}  {'avg LCs':>8}  {'avg wall':>9}"
@@ -352,19 +193,16 @@ def print_table(results: list[dict], baseline_params: dict) -> None:
     print("  " + header)
     print("  " + "─" * len(header))
 
-    for rank, r in enumerate(completed, 1):
-        p   = r["params"]
+    for r in completed:
+        p = r["params"]
         avg = r["avg"]
-        is_baseline = (p == baseline_params)
-        marker = " *" if is_baseline else "  "
-        label  = r["label"]
-
+        marker = " *" if p == baseline_params else "  "
         print(
-            f"{marker}{label:<{label_col}}  "
+            f"{marker}{r['label']:<{label_col}}  "
             f"{p['submap_size']:>4}  "
             f"{p['min_disparity_fraction']:>5.2f}  "
             f"{p['confidence_percentile']:>5.1f}  "
-            f"{p['loop_threshold']:>5.2f}  "
+            f"{p['lc_distance_threshold']:>6.2f}  "
             f"{avg['ate_se3_rmse']:>9.4f}  "
             f"{avg['ate_sim3_rmse']:>9.4f}  "
             f"{avg['rpe_trans_rmse']:>10.4f}  "
@@ -377,11 +215,8 @@ def print_table(results: list[dict], baseline_params: dict) -> None:
     print("  " + "─" * len(header))
     best = completed[0]
     print(f"  Best: {best['label']}  →  avg ATE {best['avg']['ate_se3_rmse']:.4f} m")
-    print(f"  (* = baseline config)")
+    print("  (* = baseline config)")
     print(sep)
-
-
-# ── timing table ─────────────────────────────────────────────────────────────
 
 def print_timing_table(results: list[dict], baseline_params: dict) -> None:
     """
@@ -401,9 +236,9 @@ def print_timing_table(results: list[dict], baseline_params: dict) -> None:
 
     header = (
         f"{'Configuration':<{label_col}}  "
-        f"{'sub':>4}  {'disp':>5}  {'conf':>5}  {'thr':>5}  "
+        f"{'sub':>4}  {'disp':>5}  {'conf':>5}  {'lc_thr':>6}  "
         f"{'avg wall':>9}  {'s/frame':>8}  {'s/KF':>8}  "
-        f"{'avg KFs':>8}  {'KF rate':>8}"
+        f"{'avg KFs':>8}"
     )
     sep = "═" * (len(header) + 2)
 
@@ -414,43 +249,35 @@ def print_timing_table(results: list[dict], baseline_params: dict) -> None:
     print("  " + "─" * len(header))
 
     for r in completed:
-        p   = r["params"]
+        p = r["params"]
         avg = r["avg"]
-        is_baseline = (p == baseline_params)
-        marker = " *" if is_baseline else "  "
-        # KF rate: fraction of frames selected as keyframes
-        kf_rate = avg["n_keyframes"] / (avg["wall_seconds"] / avg["s_per_frame"]) \
-                  if avg["s_per_frame"] > 0 else 0.0
-
+        marker = " *" if p == baseline_params else "  "
         print(
             f"{marker}{r['label']:<{label_col}}  "
             f"{p['submap_size']:>4}  "
             f"{p['min_disparity_fraction']:>5.2f}  "
             f"{p['confidence_percentile']:>5.1f}  "
-            f"{p['loop_threshold']:>5.2f}  "
+            f"{p['lc_distance_threshold']:>6.2f}  "
             f"{avg['wall_seconds']:>9.1f}s  "
             f"{avg['s_per_frame']:>7.3f}s  "
             f"{avg['s_per_kf']:>7.2f}s  "
-            f"{avg['n_keyframes']:>8.1f}  "
-            f"{kf_rate:>7.1%}"
+            f"{avg['n_keyframes']:>8.1f}"
         )
 
     print("  " + "─" * len(header))
     best = completed[0]
     print(f"  Fastest: {best['label']}  →  {best['avg']['s_per_frame']:.3f} s/frame")
-    print(f"  (* = baseline config)")
+    print("  (* = baseline config)")
     print(sep)
 
-
-# ── per-axis per-sequence breakdown ──────────────────────────────────────────
-
 def print_per_axis_breakdown(results: list[dict], baseline_params: dict) -> None:
-    """For each sweep axis, print a mini-table showing how that parameter alone affects results."""
+    """For each sweep axis, print a mini-table of that parameter's effect alone."""
     completed = {tuple(sorted(r["params"].items())): r for r in results if r.get("avg")}
 
-    for sweep_key, short, values in SWEEPS:
+    for sweep_key, _, values in SWEEPS:
         print(f"\n  ── Sweep: {sweep_key} ({'  '.join(str(v) for v in values)}) ──")
-        print(f"  {'value':>8}  {'avg ATE':>9}  {'avg Sim3':>9}  {'avg KFs':>8}  {'avg LCs':>8}  {'s/frame':>8}")
+        print(f"  {'value':>8}  {'avg ATE':>9}  {'avg Sim3':>9}  "
+              f"{'avg KFs':>8}  {'avg LCs':>8}  {'s/frame':>8}")
         print(f"  {'─'*64}")
 
         for val in values:
@@ -472,6 +299,10 @@ def print_per_axis_breakdown(results: list[dict], baseline_params: dict) -> None
                 f"{s_per_frame:>7.3f}s"
             )
 
+def print_all_tables(results: list[dict]) -> None:
+    print_table(results, BASELINE)
+    print_timing_table(results, BASELINE)
+    print_per_axis_breakdown(results, BASELINE)
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -492,19 +323,16 @@ def parse_args() -> argparse.Namespace:
                         help="Only print table from saved ablation_results.json, no new runs")
     return parser.parse_args()
 
-
 def main() -> None:
-    args   = parse_args()
-    bm     = _import_benchmark()
+    args = parse_args()
     configs = generate_configs()
 
-    out_root     = Path(args.out_dir)
+    out_root = Path(args.out_dir)
     results_path = out_root / "ablation_results.json"
     out_root.mkdir(parents=True, exist_ok=True)
 
     seq_dirs = [Path(p) for p in args.seq_dir]
 
-    # ── load previous results ─────────────────────────────────────────────────
     all_results: list[dict] = []
     if results_path.exists():
         with open(results_path) as f:
@@ -512,21 +340,16 @@ def main() -> None:
         print(f"Loaded {len(all_results)} existing result(s) from {results_path}")
 
     if args.table_only:
-        print_table(all_results, BASELINE)
-        print_timing_table(all_results, BASELINE)
-        print_per_axis_breakdown(all_results, BASELINE)
+        print_all_tables(all_results)
         return
 
-    # ── identify configs to run ───────────────────────────────────────────────
     completed_params = [r["params"] for r in all_results]
     pending = [c for c in configs if c not in completed_params] \
-              if args.resume else configs
+        if args.resume else configs
 
     if not pending:
         print("All configs already completed. Use --table_only to view results.")
-        print_table(all_results, BASELINE)
-        print_timing_table(all_results, BASELINE)
-        print_per_axis_breakdown(all_results, BASELINE)
+        print_all_tables(all_results)
         return
 
     if args.resume and len(pending) < len(configs):
@@ -540,21 +363,17 @@ def main() -> None:
     print(f"  Output: {out_root}")
     print(f"{'═'*70}")
 
-    # ── load model once ───────────────────────────────────────────────────────
     from da3_slam.config import load_slam_config
-    base_config = load_slam_config()
     print("\n  Loading depth model (once for all configs)…")
-    shared_slam = SharedSLAM(base_config)
+    shared_slam = SharedSLAM(load_slam_config())
     print("  Model ready.\n")
 
-    # ── run ablation ──────────────────────────────────────────────────────────
     for ci, params in enumerate(pending, 1):
-        label = _config_label(params)
         print(f"\n{'─'*70}")
-        print(f"  Config {ci}/{len(pending)}: {label}")
+        print(f"  Config {ci}/{len(pending)}: {config_label(params)}")
         print(f"{'─'*70}")
 
-        r = run_config(params, seq_dirs, out_root, args.max_frames, shared_slam, bm)
+        r = run_config(params, seq_dirs, out_root, args.max_frames, shared_slam)
 
         # Merge with previous results (replace if re-running same config)
         all_results = [x for x in all_results if x["params"] != params]
@@ -572,15 +391,11 @@ def main() -> None:
                   f"wall {avg['wall_seconds']:.0f}s  "
                   f"({avg['s_per_frame']:.3f} s/frame)")
 
-    # ── final tables ──────────────────────────────────────────────────────────
-    print_table(all_results, BASELINE)
-    print_timing_table(all_results, BASELINE)
-    print_per_axis_breakdown(all_results, BASELINE)
+    print_all_tables(all_results)
 
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nFull results saved → {results_path}")
-
 
 if __name__ == "__main__":
     main()

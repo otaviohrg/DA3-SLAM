@@ -32,12 +32,18 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from tum_eval_common import (
+    SharedSLAM,
+    TIMING_MODULES,
+    average_metrics,
+    evaluate_sequence,
+)
 
 
 # ── Search grid ───────────────────────────────────────────────────────────────
@@ -84,45 +90,7 @@ def config_label(params: dict[str, Any]) -> str:
     return "  ".join(f"{SHORT.get(k, k)}={v}" for k, v in params.items())
 
 
-# ── SLAM wrapper ──────────────────────────────────────────────────────────────
-
-class SharedSLAM:
-    """
-    Loads the DA3 depth model once and reuses it across all configurations.
-    Only the cheap components (SubmapBuilder, LoopClosureDetector) are rebuilt
-    for each config.
-    """
-
-    def __init__(self, base_config) -> None:
-        from da3_slam.slam import DA3SLAM
-        self._slam = DA3SLAM(base_config)
-
-    def reconfigure(self, config) -> None:
-        """Swap in a new config without reloading the depth model."""
-        from da3_slam.backend.inference.submap import SubmapBuilder
-        from da3_slam.backend.processing.loop_closure import LoopClosureDetector
-
-        self._slam.config  = config
-        self._slam.builder = SubmapBuilder(
-            self._slam.estimator,
-            confidence_percentile=config.confidence_percentile,
-        )
-        self._slam.detector = (
-            LoopClosureDetector(config.loop_closure, builder=self._slam.builder)
-            if config.enable_loop_closure else None
-        )
-
-    def run(self, image_paths: list[str]):
-        """Run SLAM, resetting the loop-closure detector between sequences."""
-        from da3_slam.backend.processing.loop_closure import LoopClosureDetector
-        cfg = self._slam.config
-        if cfg.enable_loop_closure:
-            # Reset so embeddings from a previous sequence don't leak into this one.
-            self._slam.detector = LoopClosureDetector(
-                cfg.loop_closure, builder=self._slam.builder
-            )
-        return self._slam.run(image_paths)
-
+# ── SLAM config construction ──────────────────────────────────────────────────
 
 def build_config(params: dict[str, Any]):
     """Construct a SLAMConfig from a params dict."""
@@ -141,145 +109,50 @@ def build_config(params: dict[str, Any]):
 # ── Per-config runner ─────────────────────────────────────────────────────────
 
 def run_config(
-    params:       dict[str, Any],
-    seq_dirs:     list[Path],
-    out_root:     Path,
-    max_frames:   int | None,
-    shared_slam:  SharedSLAM,
-    bm,
+    params: dict[str, Any],
+    seq_dirs: list[Path],
+    out_root: Path,
+    max_frames: int | None,
+    shared_slam: SharedSLAM,
 ) -> dict:
     """
     Run every sequence for one parameter configuration.
     Returns a result dict with per-sequence metrics and cross-sequence averages.
     """
-    label    = config_label(params)
+    label = config_label(params)
     cfg_name = label.replace(" ", "").replace("=", "").replace(".", "p")
 
-    config = build_config(params)
-    shared_slam.reconfigure(config)
+    shared_slam.reconfigure(build_config(params))
 
     seq_metrics: list[dict] = []
-
     for seq_dir in seq_dirs:
-        seq_name = seq_dir.name
-        out_dir  = out_root / cfg_name / seq_name
-
-        rgb_txt = seq_dir / "rgb.txt"
-        gt_txt  = seq_dir / "groundtruth.txt"
-        if not rgb_txt.exists() or not gt_txt.exists():
-            print(f"  [SKIP] {seq_name}: missing rgb.txt or groundtruth.txt")
-            continue
-
-        rgb_entries = bm.parse_tum_file(rgb_txt)
-        image_paths = [str(seq_dir / e[1]) for e in rgb_entries]
-        timestamps  = [e[0] for e in rgb_entries]
-
-        if max_frames:
-            image_paths = image_paths[:max_frames]
-            timestamps  = timestamps[:max_frames]
-
         try:
-            t0     = time.time()
-            result = shared_slam.run(image_paths)
-            wall   = time.time() - t0
-
-            ts_map = {i: timestamps[i] for i in range(len(timestamps))}
-            out_dir.mkdir(parents=True, exist_ok=True)
-            result.save_tum(str(out_dir / "trajectory_est.txt"), timestamps=ts_map)
-
-            est_ts_to_pose: dict[float, np.ndarray] = {
-                ts_map[seq_idx]: pose
-                for seq_idx, pose in result.keyframe_poses.items()
-                if seq_idx in ts_map
-            }
-
-            gt_all     = bm.load_groundtruth(gt_txt)
-            gt_stamps  = [e[0] for e in gt_all]
-            est_stamps = sorted(est_ts_to_pose.keys())
-            pairs      = bm.associate(est_stamps, gt_stamps, max_diff=0.02)
-
-            if len(pairs) < 3:
-                print(f"  [SKIP] {seq_name}: too few matched poses ({len(pairs)})")
-                continue
-
-            gt_matched  = [gt_all[ib][1]                  for _, ib in pairs]
-            est_matched = [est_ts_to_pose[est_stamps[ia]] for ia, _ in pairs]
-
-            ate_se3  = bm.compute_ate(gt_matched, est_matched, align="se3")
-            ate_sim3 = bm.compute_ate(gt_matched, est_matched, align="sim3")
-            rpe_1    = bm.compute_rpe(gt_matched, est_matched, delta=1)
-
-            n_submaps_real = len([s for s in result.submaps if not s.is_lc_submap])
-
-            m: dict[str, Any] = {
-                "sequence":         seq_name,
-                "ate_se3_rmse":     ate_se3["rmse"],
-                "ate_sim3_rmse":    ate_sim3["rmse"],
-                "rpe_trans_rmse":   rpe_1["trans_rmse"],
-                "rpe_rot_rmse_deg": rpe_1["rot_rmse_deg"],
-                "n_frames":         len(image_paths),
-                "n_keyframes":      result.n_keyframes,
-                "n_submaps":        n_submaps_real,
-                "n_loop_closures":  len(result.loop_closures),
-                "wall_seconds":     round(wall, 1),
-                "timings":          result.timings,
-            }
-            seq_metrics.append(m)
-
-            short_seq = seq_name.replace("rgbd_dataset_freiburg1_", "")
-            print(
-                f"  {short_seq:<10}  "
-                f"ATE={ate_se3['rmse']:.4f}m  Sim3={ate_sim3['rmse']:.4f}m  "
-                f"KFs={result.n_keyframes}  sub={n_submaps_real}  "
-                f"LCs={len(result.loop_closures)}  "
-                f"wall={wall:.0f}s"
+            m = evaluate_sequence(
+                shared_slam.run, seq_dir, out_root / cfg_name / seq_dir.name, max_frames
             )
-
         except Exception as exc:
             import traceback
-            print(f"  [ERROR] {seq_name}: {exc}")
+            print(f"  [ERROR] {seq_dir.name}: {exc}")
             traceback.print_exc()
+            continue
+        if m is None:
+            continue
+        seq_metrics.append(m)
 
-    if not seq_metrics:
-        return {"params": params, "label": label, "sequences": [], "avg": {}}
-
-    def _mean(key: str) -> float:
-        return float(np.mean([m[key] for m in seq_metrics]))
-
-    avg_s_per_frame   = float(np.mean(
-        [m["wall_seconds"] / m["n_frames"]               for m in seq_metrics]
-    ))
-    avg_s_per_submap  = float(np.mean(
-        [m["wall_seconds"] / max(m["n_submaps"], 1)      for m in seq_metrics]
-    ))
-
-    _MODULES = ("keyframe_selection", "submap_building",
-                "graph_building", "loop_closure", "optimization")
-    module_ms_per_frame: dict[str, float] = {}
-    for mod in _MODULES:
-        vals = [
-            m["timings"].get(mod, 0.0) / max(m["n_frames"], 1) * 1000
-            for m in seq_metrics
-        ]
-        module_ms_per_frame[mod] = float(np.mean(vals))
+        short_seq = m["sequence"].replace("rgbd_dataset_freiburg1_", "")
+        print(
+            f"  {short_seq:<10}  "
+            f"ATE={m['ate_se3_rmse']:.4f}m  Sim3={m['ate_sim3_rmse']:.4f}m  "
+            f"KFs={m['n_keyframes']}  sub={m['n_submaps']}  "
+            f"LCs={m['n_loop_closures']}  "
+            f"wall={m['wall_seconds']:.0f}s"
+        )
 
     return {
-        "params":    params,
-        "label":     label,
+        "params": params,
+        "label": label,
         "sequences": seq_metrics,
-        "avg": {
-            "ate_se3_rmse":       _mean("ate_se3_rmse"),
-            "ate_sim3_rmse":      _mean("ate_sim3_rmse"),
-            "rpe_trans_rmse":     _mean("rpe_trans_rmse"),
-            "rpe_rot_rmse_deg":   _mean("rpe_rot_rmse_deg"),
-            "n_keyframes":        _mean("n_keyframes"),
-            "n_submaps":          _mean("n_submaps"),
-            "n_loop_closures":    _mean("n_loop_closures"),
-            "wall_seconds":       _mean("wall_seconds"),
-            "s_per_frame":        avg_s_per_frame,
-            "s_per_submap":       avg_s_per_submap,
-            "module_ms_per_frame": module_ms_per_frame,
-        },
+        "avg": average_metrics(seq_metrics),
     }
 
 
@@ -346,7 +219,7 @@ def print_main_table(results: list[dict]) -> None:
     print("  " + "─" * (len(header) - 2))
     best = completed[0]
     print(f"  Best: {best['label']}  →  avg ATE {best['avg']['ate_se3_rmse']:.4f} m")
-    print(f"  (* = baseline from config/default.yaml)")
+    print("  (* = baseline from config/default.yaml)")
     print(sep)
 
 
@@ -399,7 +272,7 @@ def print_per_param_breakdown(results: list[dict]) -> None:
                 f"  {np.mean(spf_vals):>7.3f}s"
             )
 
-    print(f"\n  (* = baseline value from config/default.yaml)")
+    print("\n  (* = baseline value from config/default.yaml)")
     print(f"{'═' * 80}")
 
 
@@ -452,8 +325,6 @@ def print_timing_breakdown(results: list[dict]) -> None:
     Modules: keyframe_selection, submap_building, graph_building,
              loop_closure, optimization.
     """
-    _MODULES = ("keyframe_selection", "submap_building",
-                "graph_building", "loop_closure", "optimization")
     _SHORT_MOD = {
         "keyframe_selection": "KF-sel",
         "submap_building":    "sub-bld",
@@ -482,7 +353,7 @@ def print_timing_breakdown(results: list[dict]) -> None:
         + "  "
         + f"{'total ms/f':>10}"
         + "  "
-        + "  ".join(f"{_SHORT_MOD[m]:>{mod_w}}" for m in _MODULES)
+        + "  ".join(f"{_SHORT_MOD[m]:>{mod_w}}" for m in TIMING_MODULES)
     )
     sep = "═" * len(header)
 
@@ -501,14 +372,14 @@ def print_timing_breakdown(results: list[dict]) -> None:
         param_cols = "  ".join(f"{p[k]:>{col_w[k]}}" for k in keys)
         total_ms = avg["s_per_frame"] * 1000
         mod_cols = "  ".join(
-            f"{mod.get(m, 0.0):>{mod_w}.1f}" for m in _MODULES
+            f"{mod.get(m, 0.0):>{mod_w}.1f}" for m in TIMING_MODULES
         )
         print(f"{marker}{param_cols}  {total_ms:>10.1f}  {mod_cols}")
 
     print("  " + "─" * (len(header) - 2))
     best = completed[0]
     print(f"  Fastest: {best['label']}  →  {best['avg']['s_per_frame']*1000:.1f} ms/frame")
-    print(f"  (* = baseline from config/default.yaml)")
+    print("  (* = baseline from config/default.yaml)")
     print(sep)
 
 
@@ -546,13 +417,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _import_benchmark():
-    script_dir = Path(__file__).resolve().parent
-    sys.path.insert(0, str(script_dir))
-    import benchmark_tum as bm
-    return bm
-
-
 def main() -> None:
     args    = parse_args()
     configs = generate_configs()
@@ -560,7 +424,7 @@ def main() -> None:
 
     # ── dry run ───────────────────────────────────────────────────────────────
     if args.dry_run:
-        print(f"\nGrid definition:")
+        print("\nGrid definition:")
         for k, vals in GRID.items():
             print(f"  {SHORT[k]:<8} = {vals}")
         print(f"\nTotal configurations : {len(configs)}")
@@ -582,8 +446,6 @@ def main() -> None:
         with open(results_path) as f:
             all_results = json.load(f)
         print(f"Loaded {len(all_results)} existing result(s) from {results_path}")
-
-    bm = _import_benchmark()
 
     if args.table_only:
         print_main_table(all_results)
@@ -619,7 +481,7 @@ def main() -> None:
     if args.max_frames:
         print(f"  Capped at {args.max_frames} frames per sequence")
     print(f"  Output: {out_root}")
-    print(f"  Grid: " + "  ".join(f"{SHORT[k]}∈{GRID[k]}" for k in GRID))
+    print("  Grid: " + "  ".join(f"{SHORT[k]}∈{GRID[k]}" for k in GRID))
     print(f"{'═' * 72}\n")
 
     # ── load model once ───────────────────────────────────────────────────────
@@ -639,7 +501,7 @@ def main() -> None:
         print(f"  Config {ci}/{len(pending)}{marker}: {label}")
         print(f"{'─' * 72}")
 
-        r = run_config(params, seq_dirs, out_root, args.max_frames, shared_slam, bm)
+        r = run_config(params, seq_dirs, out_root, args.max_frames, shared_slam)
 
         # Replace or append
         all_results = [x for x in all_results if x["params"] != params]

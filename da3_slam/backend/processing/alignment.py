@@ -1,9 +1,14 @@
 """
-Cross-submap alignment.
+Cross-submap alignment (diagnostic utility).
 
 Each submap is processed independently by DA3, which picks its own reference
-frame. This module computes the rigid transform that maps submap B's world
-frame into submap A's world frame, enabling a globally consistent map.
+frame.  This module computes the rigid transform that maps submap B's world
+frame into submap A's world frame.
+
+The live pipeline does not use this module — DA3SLAM composes poses through
+the shared anchor frame directly (see slam.py).  It is kept for debugging
+and analysis scripts (e.g. scripts/debug_map.py) that want to inspect
+inter-submap transforms in isolation.
 
 Strategy — anchor frame:
     Consecutive submaps share one physical frame (last of A = first of B).
@@ -29,22 +34,13 @@ from da3_slam.backend.inference.submap import Submap
 
 @dataclass
 class AlignmentResult:
-    # (4, 4) float32 — transforms points expressed in world_B into world_A.
-    # For SE3 anchor alignment: [:3,:3] = R.
-    # For Sim3 ICP alignment:   [:3,:3] = scale * R.
+    # (4, 4) float32 — transforms points expressed in world_B into world_A
     world_b_to_world_a: np.ndarray
-
-    # Alignment method used
-    method: str  # "anchor" | "icp"
-
-    # Sim3 scale factor (1.0 for pure SE3 anchor alignment).
-    # For ICP results this is the Umeyama scale: s such that [:3,:3] = s·R.
-    scale: float = 1.0
 
     @property
     def rotation(self) -> np.ndarray:
-        """(3, 3) pure SO3 rotation (scale-normalised for Sim3 ICP results)."""
-        return self.world_b_to_world_a[:3, :3] / self.scale
+        """(3, 3) rotation component."""
+        return self.world_b_to_world_a[:3, :3]
 
     @property
     def translation(self) -> np.ndarray:
@@ -69,11 +65,10 @@ class SubmapAligner:
 
     def align(self, submap_a: Submap, submap_b: Submap) -> AlignmentResult:
         """
-        Compute the transform that maps submap B's world frame to submap A's.
-
-        Uses the anchor frame (last of A / first of B) for an exact solution.
-        Scale is left at 1.0; the Sim3 pose graph optimizer finds per-submap
-        scales from loop closure constraints.
+        Compute the transform that maps submap B's world frame to submap A's,
+        using the shared anchor frame (last of A / first of B) for an exact
+        solution.  Scale is not estimated — DA3SLAM resolves inter-submap
+        scale separately via depth ratios.
         """
         assert submap_a.frames[-1].seq_idx == submap_b.frames[0].seq_idx, (
             f"Submaps {submap_a.idx} and {submap_b.idx} do not share an anchor frame "
@@ -90,5 +85,4 @@ class SubmapAligner:
 
         return AlignmentResult(
             world_b_to_world_a=world_b_to_world_a.astype(np.float32),
-            method="anchor",
         )
