@@ -40,6 +40,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 import cv2
@@ -52,7 +53,14 @@ from da3_slam.backend.inference.submap import Submap, SubmapBuilder, transform_p
 from da3_slam.backend.processing.factor_graph import PoseGraph, OptimizationResult
 from da3_slam.backend.processing.loop_closure import LoopClosureDetector, LoopClosure
 
-__all__ = ["SLAMConfig", "SLAMResult", "DA3SLAM"]
+__all__ = ["SLAMConfig", "SLAMResult", "DA3SLAM", "FrameItem"]
+
+# A streamed input frame: (RGB image HxWx3 uint8, seq_idx, label).
+#   seq_idx must be unique and strictly increasing in arrival order — it keys
+#           the pose-graph node and orders the output trajectory.
+#   label   is provenance metadata only (file path, topic+timestamp, …); it is
+#           stored on the submap but never used for computation.
+FrameItem = tuple[np.ndarray, int, str]
 
 
 # ── result ────────────────────────────────────────────────────────────────────
@@ -326,6 +334,33 @@ class DA3SLAM:
             self.semantic_embedder = SemanticEmbedder(cfg.semantic_model)
 
     def run(self, image_paths: list[str]) -> SLAMResult:
+        """Offline entry point: run SLAM over a fixed list of image files.
+
+        Thin wrapper over run_stream() — images are read lazily inside the
+        frontend thread (preserving I/O / inference overlap) by the disk
+        frame source below.
+        """
+        return self.run_stream(self._disk_frame_source(image_paths))
+
+    @staticmethod
+    def _disk_frame_source(image_paths: list[str]) -> Iterator[FrameItem]:
+        """Yield (RGB image, seq_idx, path) for each image on disk."""
+        for i, path in enumerate(image_paths):
+            bgr = cv2.imread(path)
+            if bgr is None:
+                raise FileNotFoundError(f"Could not read image: {path}")
+            yield cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), i, path
+
+    def run_stream(self, frame_source: Iterable[FrameItem]) -> SLAMResult:
+        """Streaming entry point: run SLAM over an iterable of input frames.
+
+        `frame_source` yields (RGB image, seq_idx, label) tuples in arrival
+        order — see FrameItem.  It may block between items (e.g. a live ROS
+        stream); the frontend thread consumes it one frame at a time and the
+        pipeline runs incrementally, so this works for both offline lists and
+        unbounded real-time streams.  The iterator is fully consumed (or an
+        end-of-stream is signalled by it simply terminating).
+        """
         lc_done = threading.Event()
         if self.detector is None:
             lc_done.set()  # no LC thread — event is immediately done
@@ -358,7 +393,7 @@ class DA3SLAM:
         if self.detector is not None:
             threads.append(threading.Thread(target=self._loop_closure_worker,
                                             args=(ctx,), name="da3-lc", daemon=True))
-        threads.append(threading.Thread(target=self._frontend, args=(image_paths, ctx),
+        threads.append(threading.Thread(target=self._frontend, args=(frame_source, ctx),
                                         name="da3-frontend", daemon=True))
 
         wall_start = time.time()
@@ -394,34 +429,31 @@ class DA3SLAM:
 
     # ── frontend thread ───────────────────────────────────────────────────────
 
-    def _frontend(self, image_paths: list[str], ctx: _RunContext) -> None:
-        """Keyframe selection: reads images, batches keyframes into batch_queue.
+    def _frontend(self, frame_source: Iterable[FrameItem], ctx: _RunContext) -> None:
+        """Keyframe selection: pulls input frames, batches keyframes into batch_queue.
 
-        Each batch shares its last keyframe with the next batch (the anchor
-        frame) — see the module docstring.
+        Consumes `frame_source` one (image, seq_idx, label) at a time — the
+        same code path serves an offline file list and a live stream.  Each
+        batch shares its last keyframe with the next batch (the anchor frame)
+        — see the module docstring.
         """
         selector = OnlineKeyframeSelector(ctx.config.keyframe)
         keyframe_paths: list[str] = []
         keyframe_images: list[np.ndarray] = []
         keyframe_indices: list[int] = []
         try:
-            for i, path in enumerate(image_paths):
+            for image, seq_idx, label in frame_source:
                 if ctx.backend_error is not None:
                     break
-
-                bgr = cv2.imread(path)
-                if bgr is None:
-                    raise FileNotFoundError(f"Could not read image: {path}")
-                image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
                 t0 = time.time()
                 is_keyframe = selector.step(image)
                 ctx.timings["keyframe_selection"] += time.time() - t0
 
                 if is_keyframe:
-                    keyframe_paths.append(path)
+                    keyframe_paths.append(label)
                     keyframe_images.append(image)
-                    keyframe_indices.append(i)
+                    keyframe_indices.append(seq_idx)
 
                 if len(keyframe_paths) >= ctx.config.submap_size:
                     _blocking_put(ctx, ctx.batch_queue, (

@@ -26,6 +26,32 @@ python scripts/run_slam.py --image_dir DIR --submap_size 12 \
 
 Outputs in `--out_dir`: `trajectory_kitti.txt`, `trajectory_tum.txt`, `map.ply` (merged colored point cloud), and `timings.json`.
 
+## Real-time ROS 2 (rosbag / live topics)
+
+DA3-SLAM runs in a container without ROS, while ROS 2 + the data live on the host.
+They are bridged over a **bind-mounted spool directory** — no ROS inside the container,
+no networking. The host bridge subscribes to the camera + ground-truth topics, applies a
+**drop-oldest** real-time policy, and writes frames + a TUM ground-truth log into the spool;
+the container runner tails the spool and feeds frames into `DA3SLAM.run_stream()`.
+
+```bash
+# ── host (system python3.12, ROS 2 jazzy) ──────────────────────────────────
+source /opt/ros/jazzy/setup.bash
+# (one-time, if the bag has no metadata.yaml) ros2 bag reindex <bag_dir> -s sqlite3
+python3 scripts/ros_spool_bridge.py --spool_dir /tmp/da3_spool --clean \
+    --image_topic /camera_frames_0 --odom_topic /ground_truth/odom
+# in a second host terminal — replay the bag (or just run live sensors):
+ros2 bag play <bag_dir>
+
+# ── container (the SLAM env) — mount the same spool dir ─────────────────────
+#   docker run ... -v /tmp/da3_spool:/spool ...
+python scripts/run_slam_ros.py --spool_dir /spool --out_dir outputs/ros_run
+```
+
+The runner stops on the bridge's `DONE` sentinel (bag finished / idle / Ctrl-C) and writes
+the usual trajectory/map outputs plus a copy of `ground_truth_tum.txt` for `evo_ape ... -as`.
+Use `--process_all` to disable drop-oldest (process every frame; not real-time but reproducible).
+
 ## Repository layout
 
 ```

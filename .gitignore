@@ -209,3 +209,6 @@ __marimo__/
 data/
 outputs/
 logs/
+plots/
+salad/
+Depth-Anything-3/
