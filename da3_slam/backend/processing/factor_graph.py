@@ -36,6 +36,19 @@ from da3_slam.config import NoiseConfig
 __all__ = ["NoiseConfig", "OptimizationResult", "PoseGraph"]
 
 
+def _isotropic_noise(sigma: float, huber_k: float | None):
+    """15-dim isotropic noise model, optionally Huber-robustified.
+
+    With a Huber kernel an outlier measurement is down-weighted instead of
+    warping the whole map; huber_k=None keeps plain Gaussian noise.
+    """
+    noise = noiseModel.Diagonal.Sigmas(np.full(15, sigma))
+    if huber_k:
+        noise = noiseModel.Robust.Create(
+            noiseModel.mEstimator.Huber.Create(float(huber_k)), noise)
+    return noise
+
+
 # ── result ────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -89,9 +102,16 @@ class PoseGraph:
         self._values = Values()
         self._initialized: set[int] = set()   # seq_idx values currently in graph
 
-        self._prior_noise   = noiseModel.Diagonal.Sigmas(np.full(15, self.noise.prior_sigma))
-        self._between_noise = noiseModel.Diagonal.Sigmas(np.full(15, self.noise.between_sigma))
-        self._loop_noise    = noiseModel.Diagonal.Sigmas(np.full(15, self.noise.loop_sigma))
+        self._prior_noise = _isotropic_noise(self.noise.prior_sigma, None)
+        # Huber on odometry factors acts only where redundancy exists
+        # (overlap>=2 duplicate boundary factors, loop-closure cycles) — a
+        # broken boundary measurement then absorbs its own error instead of
+        # deforming the whole cycle into offset ghost copies.  Huber on loop
+        # factors cushions an aliased closure that survived the gates.
+        self._between_noise = _isotropic_noise(
+            self.noise.between_sigma, self.noise.between_huber_k)
+        self._loop_noise = _isotropic_noise(
+            self.noise.loop_sigma, self.noise.loop_huber_k)
 
     # ── building ──────────────────────────────────────────────────────────────
 
@@ -111,25 +131,25 @@ class PoseGraph:
         self,
         seq_idx_a: int,
         seq_idx_b: int,
-        relative_c2w: np.ndarray,
+        relative_cam_to_world: np.ndarray,
         loop: bool = False,
     ) -> None:
         """
-        Add a between factor encoding: node_a.inverse() ⊗ node_b ≈ relative_c2w.
+        Add a between factor encoding: node_a.inverse() ⊗ node_b ≈ relative_cam_to_world.
 
-        For nodes representing cam-to-world, relative_c2w = w2c_a @ c2w_b.
+        For nodes representing cam-to-world, relative_cam_to_world = w2c_a @ c2w_b.
 
         Args:
             seq_idx_a:    source frame
             seq_idx_b:    target frame
-            relative_c2w: (4, 4) measured relative transform in global scale
+            relative_cam_to_world: (4, 4) measured relative transform in global scale
             loop:         True → use loop closure noise model (looser)
         """
         noise = self._loop_noise if loop else self._between_noise
         self._graph.add(
             BetweenFactorSL4(
                 X(seq_idx_a), X(seq_idx_b),
-                SL4(relative_c2w.astype(np.float64)),
+                SL4(relative_cam_to_world.astype(np.float64)),
                 noise,
             )
         )

@@ -37,9 +37,19 @@ except ImportError:
     HAS_LPIPS = False
 
 
+def _to_lpips_tensor(img: np.ndarray) -> "torch.Tensor":
+    """HxWx3 uint8 → 1x3xHxW float in [-1, 1] (LPIPS input convention)."""
+    return torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+
+
 # ── trajectory ────────────────────────────────────────────────────────────────
 
 def load_tum_trajectory(path: Path, fps: float = 30.0) -> dict[int, np.ndarray]:
+    """Read a TUM trajectory keyed by frame index: round(timestamp * fps).
+
+    Replica timestamps are synthesised as frame_idx / fps, so this recovers
+    the index that matches the frameNNNNNN.jpg / depthNNNNNN.png filenames.
+    """
     poses = {}
     with open(path) as f:
         for line in f:
@@ -80,6 +90,11 @@ def raycast_depth(
 
 
 def depth_metrics(pred: np.ndarray, gt: np.ndarray) -> dict:
+    """Standard monocular depth metrics (AbsRel, RMSE, δ<1.25) over valid pixels.
+
+    The prediction is median-scaled to GT first — monocular scale is
+    arbitrary, so unscaled errors would mostly measure the scale offset.
+    """
     valid = (pred > 0) & (gt > 0) & np.isfinite(pred) & np.isfinite(gt)
     if valid.sum() == 0:
         return {"absrel": None, "rmse": None, "delta1": None}
@@ -94,22 +109,18 @@ def depth_metrics(pred: np.ndarray, gt: np.ndarray) -> dict:
 
 # ── mesh loading ─────────────────────────────────────────────────────────────
 
-def load_mesh_as_o3d_tensor(mesh_path: Path) -> "o3d.t.geometry.TriangleMesh":
-    """Load a mesh via trimesh (handles quads/n-gons) and return Open3D tensor mesh."""
-    tm = trimesh.load(str(mesh_path), force="mesh", process=False)
-    legacy = o3d.geometry.TriangleMesh()
-    legacy.vertices  = o3d.utility.Vector3dVector(np.asarray(tm.vertices, dtype=np.float64))
-    legacy.triangles = o3d.utility.Vector3iVector(np.asarray(tm.faces,    dtype=np.int32))
-    return o3d.t.geometry.TriangleMesh.from_legacy(legacy)
-
-
 def load_mesh_as_o3d_legacy(mesh_path: Path) -> "o3d.geometry.TriangleMesh":
-    """Load a mesh via trimesh and return Open3D legacy TriangleMesh."""
+    """Load a mesh via trimesh (handles quads/n-gons) and return Open3D legacy mesh."""
     tm = trimesh.load(str(mesh_path), force="mesh", process=False)
     legacy = o3d.geometry.TriangleMesh()
     legacy.vertices  = o3d.utility.Vector3dVector(np.asarray(tm.vertices, dtype=np.float64))
     legacy.triangles = o3d.utility.Vector3iVector(np.asarray(tm.faces,    dtype=np.int32))
     return legacy
+
+
+def load_mesh_as_o3d_tensor(mesh_path: Path) -> "o3d.t.geometry.TriangleMesh":
+    """Load a mesh via trimesh and return Open3D tensor mesh (for raycasting)."""
+    return o3d.t.geometry.TriangleMesh.from_legacy(load_mesh_as_o3d_legacy(mesh_path))
 
 
 # ── trajectory alignment (Sim3) ───────────────────────────────────────────────
@@ -148,6 +159,13 @@ def chamfer_metrics(
     n_samples: int = 200_000,
     threshold: float = 0.05,
 ) -> dict:
+    """Point-cloud reconstruction metrics against the GT mesh.
+
+    accuracy = mean recon→GT distance, completeness = mean GT→recon distance,
+    chamfer = their average; precision/recall/F-score count points within
+    `threshold` metres (5 cm — the common indoor-reconstruction cutoff).
+    GT points are sampled uniformly from the mesh surface.
+    """
     mesh = load_mesh_as_o3d_legacy(mesh_path)
     gt_pcd = mesh.sample_points_uniformly(number_of_points=n_samples)
 
@@ -204,10 +222,9 @@ def try_rendering_metrics(
         psnr_vals.append(float("inf") if mse == 0 else float(20 * np.log10(255.0 / np.sqrt(mse))))
         ssim_vals.append(float(structural_similarity(rendered, gt_rgb, channel_axis=2, data_range=255)))
         if HAS_LPIPS:
-            def to_t(img):
-                return torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             with torch.no_grad():
-                lpips_vals.append(float(_lpips_fn(to_t(rendered), to_t(gt_rgb)).item()))
+                lpips_vals.append(float(_lpips_fn(
+                    _to_lpips_tensor(rendered), _to_lpips_tensor(gt_rgb)).item()))
 
     return {
         "psnr":  round(float(np.mean(psnr_vals)),  3) if psnr_vals  else None,
@@ -219,6 +236,12 @@ def try_rendering_metrics(
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    """Score one run's mapping quality; writes <out_dir>/mapping_metrics.json.
+
+    Depth and Chamfer metrics need only raycasting (no EGL); the rendering
+    metrics (PSNR/SSIM/LPIPS) need an OffscreenRenderer and are skipped
+    gracefully when EGL is unavailable.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--out_dir",    required=True)
     parser.add_argument("--scene_dir",  required=True)

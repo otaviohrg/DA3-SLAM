@@ -12,7 +12,7 @@ Threading model (DA3SLAM.run):
 
     _frontend  →(batch_queue)→  _inference  →(submap_queue)→  _processing
                                                   ⇅
-                                  (lc_queue / lc_result_queue)
+                                  (loop_closure_queue / loop_closure_result_queue)
                                                   ⇅
                                           _loop_closure_worker
 
@@ -21,11 +21,15 @@ Threading model (DA3SLAM.run):
 
 Two structural invariants that are easy to break (mirrors VGGT-SLAM):
 
-  1. Anchor-frame submap bridging.  Consecutive submaps share one physical
-     keyframe (last of submap N = first of submap N+1, same seq_idx).  That
-     shared node is the *only* connection between submaps in the pose graph —
-     there is no explicit inter-submap factor.  If the batching in _frontend
-     changes, the 1-frame overlap must be preserved or the graph disconnects.
+  1. Anchor-frame submap bridging.  Consecutive submaps share the last
+     `submap_overlap` physical keyframes of submap N as the first frames of
+     submap N+1 (same seq_idx).  Those shared nodes are the *only* connection
+     between submaps in the pose graph — there is no explicit inter-submap
+     factor.  If the batching in _frontend changes, the overlap must be
+     preserved or the graph disconnects.  With overlap >= 2 the shared frame
+     pair is measured by both DA3 batches: the duplicate between-factor adds
+     boundary redundancy and _check_boundary_consistency flags odometry
+     breaks (a single bad anchor pose can otherwise displace a whole submap).
 
   2. Per-submap metric scale accumulation.  Each DA3 batch has its own
      arbitrary metric scale.  The median depth ratio at the shared anchor
@@ -40,20 +44,24 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from da3_slam.config import SLAMConfig, load_slam_config
-from da3_slam.frontend.keyframe_selector import OnlineKeyframeSelector
+from da3_slam.frontend.keyframe_selector import (
+    OnlineKeyframeSelector,
+    SegmentKeyframeSelector,
+)
 from da3_slam.backend.inference.depth_estimator import DepthEstimator
 from da3_slam.backend.inference.submap import Submap, SubmapBuilder, transform_points
 from da3_slam.backend.processing.factor_graph import PoseGraph, OptimizationResult
 from da3_slam.backend.processing.loop_closure import LoopClosureDetector, LoopClosure
 
-__all__ = ["SLAMConfig", "SLAMResult", "DA3SLAM", "FrameItem"]
+__all__ = ["SLAMConfig", "SLAMResult", "SLAMUpdate", "DA3SLAM", "FrameItem"]
 
 # A streamed input frame: (RGB image HxWx3 uint8, seq_idx, label).
 #   seq_idx must be unique and strictly increasing in arrival order — it keys
@@ -120,8 +128,6 @@ class SLAMResult:
                         When provided these are used instead of seq_idx / fps.
                         Frames with no entry fall back to seq_idx / fps.
         """
-        from scipy.spatial.transform import Rotation
-
         with open(path, "w") as f:
             f.write("# timestamp tx ty tz qx qy qz qw\n")
             for seq_idx, pose in sorted(self.keyframe_poses.items()):
@@ -146,7 +152,7 @@ class SLAMResult:
         all_colors = []
         seen_seq_idx: set[int] = set()
         for submap in self.submaps:
-            if submap.is_lc_submap:
+            if submap.is_loop_closure_submap:
                 continue
             for frame in submap.frames:
                 # The anchor frame appears in two submaps; keep it once.
@@ -155,10 +161,16 @@ class SLAMResult:
                 seen_seq_idx.add(frame.seq_idx)
                 if len(frame.points_cam) == 0:
                     continue
-                global_c2w = self.optimization.pose(frame.seq_idx).astype(np.float64)
-                all_points.append(transform_points(frame.points_cam, global_c2w))
+                global_cam_to_world = self.optimization.pose(frame.seq_idx).astype(np.float64)
+                all_points.append(transform_points(frame.points_cam, global_cam_to_world))
                 all_colors.append(frame.colors)
 
+        if not all_points:
+            raise ValueError(
+                "No point clouds stored — the run was built with "
+                "build_pointclouds=False (lean mode); PLY export needs a run "
+                "with point clouds enabled."
+            )
         all_points = np.concatenate(all_points)  # (N, 3) float32
         all_colors = np.concatenate(all_colors)  # (N, 3) uint8
         n = len(all_points)
@@ -210,6 +222,47 @@ class SLAMResult:
         return best
 
 
+# ── live update ─────────────────────────────────────────────────────────────
+
+@dataclass
+class SLAMUpdate:
+    """Incremental snapshot emitted after each submap is optimised.
+
+    Passed to the optional ``on_update`` callback of :meth:`DA3SLAM.run_stream`
+    so a live viewer can render the trajectory and map as they grow.  The poses
+    are the *current* best global cam-to-world estimates — they may still shift
+    on later optimisation (e.g. when a loop closure is incorporated).
+
+    The callback runs inside the processing thread; keep it cheap (a slow
+    callback backpressures the whole pipeline).  Exceptions raised by the
+    callback are caught and logged, never propagated into the SLAM run.
+    """
+    # Index of the submap that was just optimised.
+    submap_idx: int
+
+    # seq_idx → (4, 4) current global cam-to-world pose for every keyframe.
+    keyframe_poses: dict[int, np.ndarray]
+
+    # (M, 3) float32 world-space points contributed by this submap (anchor
+    # frame excluded for submaps after the first, so points are not duplicated).
+    new_points_world: np.ndarray
+
+    # (M, 3) uint8 colours aligned with new_points_world.
+    new_colors: np.ndarray
+
+    # Running counts (loop-closure re-inference submaps are excluded).
+    n_submaps: int
+    n_loop_closures: int
+
+    # Per-frame camera-space points for the new submap: (seq_idx, points_cam
+    # (M, 3) float32, colors (M, 3) uint8) per contributing frame.  Lets the
+    # viewer cache and *re-project* earlier submaps when a loop closure or
+    # later optimisation shifts their poses (keyframe_poses always carries the
+    # current estimate for every keyframe).
+    frame_points_cam: list[tuple[int, np.ndarray, np.ndarray]] = field(
+        default_factory=list)
+
+
 # ── run context ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -218,48 +271,300 @@ class _RunContext:
     config: SLAMConfig
     batch_queue: queue.Queue       # frontend   → inference  (paths, images, indices)
     submap_queue: queue.Queue      # inference  → processing (Submap)
-    lc_queue: queue.Queue          # processing → lc worker  (submap + dict snapshots)
-    lc_result_queue: queue.Queue   # lc worker  → processing (seq_b, seq_a, relative, closure)
-    lc_done: threading.Event
+    # processing → loop-closure worker (submap + dict snapshots)
+    loop_closure_queue: queue.Queue
+    # loop-closure worker → processing (seq_b, seq_a, relative, closure)
+    loop_closure_result_queue: queue.Queue
+    loop_closure_done: threading.Event
     submaps: list[Submap]
     loop_closures: list[LoopClosure]
     timings: dict[str, float]
-    opt_result: OptimizationResult | None = None
+    optimization_result: OptimizationResult | None = None
+
+    # Optional live-update callback (fired per submap from the processing
+    # thread); None disables incremental emission.
+    on_update: Callable[[SLAMUpdate], None] | None = None
+
+    # Optional loop-closure callback (processing thread): fired twice per
+    # drain that inserted loop factors, with the keyframe poses (seq_idx →
+    # 4x4 cam-to-world), the inserted (query_seq, detected_seq) pairs, and a
+    # phase tag.  phase="pre": factors are in the graph but the optimisation
+    # has not run — the endpoint poses still carry the accumulated drift the
+    # closure is about to correct, so a chord drawn between them visualises
+    # the detected loop.  phase="post": right after that optimisation, same
+    # pairs — showing what the correction did (converged endpoints coincide).
+    # Same error contract as on_update.
+    on_loop_closure: (Callable[[dict[int, np.ndarray],
+                                list[tuple[int, int]], str], None] | None) = None
 
     # First exception raised by any worker thread; checked by the others to
     # shut down early, and re-raised by run().
     backend_error: BaseException | None = None
 
 
-def _drain_lc_results(ctx: _RunContext, pose_graph: PoseGraph) -> None:
-    """Move all completed loop-closure results from lc_result_queue into the graph."""
+def _normalized_rotation(transform: np.ndarray) -> np.ndarray | None:
+    """Det-normalised 3×3 block of a transform (SL(4)-safe rotation
+    approximation), or None if degenerate."""
+    block = transform[:3, :3].astype(np.float64)
+    det = np.linalg.det(block)
+    if not np.isfinite(det) or det <= 0:
+        return None
+    return block / det ** (1.0 / 3.0)
+
+
+def _rotation_angle_deg(transform: np.ndarray) -> float:
+    """Rotation angle (degrees) of a transform's 3×3 block.  NaN if degenerate."""
+    rotation = _normalized_rotation(transform)
+    if rotation is None:
+        return float("nan")
+    cos = (np.trace(rotation) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+
+# ── loop-closure geometric gate + corroboration pool ─────────────────────────
+#
+# A closure whose measurement disagrees wildly with the graph's current
+# prediction is *held*, not dropped: the gate compares against the graph, and
+# after an odometry break (a bad DA3 pose at a submap boundary) the graph
+# itself is wrong by exactly the disagreement the gate measures.  A single
+# aliased match and a single break-healing match look identical — but when
+# two independent held closures imply the *same* correction, the measurements
+# corroborate each other and the group is inserted (this is what merges a
+# duplicated map back together).  Held closures are re-evaluated against the
+# updated graph on every drain; one that stays held (uncorroborated but also
+# uncontradicted) for _HELD_ACCEPT_AFTER_DRAINS drains is accepted on its own
+# — it already passed the descriptor + confidence gates, and the Huber loop
+# noise cushions the graph if it turns out to be aliased after all.  The pool
+# expires the oldest entries when it overflows.
+
+_PENDING_POOL_MAX = 8           # held closures kept for corroboration
+_HELD_ACCEPT_AFTER_DRAINS = 5   # drains (≈ submaps) before a lone held closure is accepted
+_CONSISTENCY_TRANS_TOL = 1.0    # min tolerance between implied corrections (global units)
+_CONSISTENCY_TRANS_FRAC = 0.25  # ...or this fraction of the correction magnitude
+_CONSISTENCY_ROT_TOL_DEG = 30.0
+
+
+@dataclass
+class _HeldLoop:
+    """A gate-failing loop closure awaiting corroboration."""
+    seq_b: int
+    seq_a: int
+    relative_b_to_a: np.ndarray
+    closure: LoopClosure
+    announced: bool = False   # "held" message printed once, not every drain
+    drains_held: int = 0      # consecutive drains spent in the pool
+
+
+def _loop_disagreement(
+    pose_graph: PoseGraph,
+    seq_b: int,
+    seq_a: int,
+    measured: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    """Disagreement between a loop measurement and the graph's prediction.
+
+    Returns (d_world, translation_error, rotation_error_deg): the translation
+    disagreement rotated into world axes — so disagreements of closures at
+    different query frames are comparable — plus its norm and the rotation
+    disagreement angle.
+    """
+    pose_b = pose_graph.get_pose(seq_b)
+    predicted = np.linalg.inv(pose_b) @ pose_graph.get_pose(seq_a)
+    d_local = measured[:3, 3] - predicted[:3, 3]
+    rotation_wb = _normalized_rotation(pose_b)
+    d_world = rotation_wb @ d_local if rotation_wb is not None else d_local
+    rotation_error = _rotation_angle_deg(np.linalg.inv(predicted) @ measured)
+    return d_world, float(np.linalg.norm(d_local)), rotation_error
+
+
+def _corrections_consistent(
+    d1: np.ndarray, t1: float, r1: float,
+    d2: np.ndarray, t2: float, r2: float,
+) -> bool:
+    """True if two held closures imply the same graph correction."""
+    trans_tol = max(_CONSISTENCY_TRANS_TOL, _CONSISTENCY_TRANS_FRAC * max(t1, t2))
+    if float(np.linalg.norm(d1 - d2)) > trans_tol:
+        return False
+    if np.isfinite(r1) and np.isfinite(r2) and abs(r1 - r2) > _CONSISTENCY_ROT_TOL_DEG:
+        return False
+    return True
+
+
+def _insert_loop_factor(
+    ctx: _RunContext,
+    pose_graph: PoseGraph,
+    inserted: list[tuple[int, int]],
+    held: _HeldLoop,
+    tag: str,
+    note: str = "",
+) -> None:
+    """Insert one accepted loop closure into the graph and record it."""
+    ctx.loop_closures.append(held.closure)
+    pose_graph.add_between(held.seq_b, held.seq_a, held.relative_b_to_a, loop=True)
+    inserted.append((held.seq_b, held.seq_a))
+    candidate = held.closure.candidate
+    print(f"{tag} Loop closure {candidate.submap_idx_b}"
+          f"[f{candidate.frame_idx_b}]"
+          f" ↔ {candidate.submap_idx_a}"
+          f"[f{candidate.frame_idx_a}]{note}")
+
+
+def _drain_loop_closure_results(
+    ctx: _RunContext,
+    pose_graph: PoseGraph,
+    pending: list[_HeldLoop],
+) -> list[tuple[int, int]]:
+    """Move completed loop-closure results into the graph.
+
+    Each result passes the geometric gate (measurement vs. current graph
+    prediction; thresholds from LoopClosureConfig, each disableable with
+    None).  Gate failures are held in `pending` and re-evaluated on every
+    drain; a mutually consistent group of held closures is inserted (see the
+    corroboration-pool comment above).
+
+    Returns the (query_seq, detected_seq) pairs of the factors inserted by
+    this drain — the graph has not yet been re-optimised at that point (see
+    _RunContext.on_loop_closure).
+    """
     tag = f"[{threading.current_thread().name}]"
+    inserted: list[tuple[int, int]] = []
+    trusted_items: list[_HeldLoop] = []
     while True:
         try:
-            seq_b, seq_a, relative_b_to_a, closure = ctx.lc_result_queue.get_nowait()
+            seq_b, seq_a, relative_b_to_a, closure, trusted = (
+                ctx.loop_closure_result_queue.get_nowait())
         except queue.Empty:
-            return
-        ctx.loop_closures.append(closure)
-        pose_graph.add_between(seq_b, seq_a, relative_b_to_a, loop=True)
-        print(f"{tag} LC {closure.candidate.submap_idx_b}"
-              f"[f{closure.candidate.frame_idx_b}]"
-              f" ↔ {closure.candidate.submap_idx_a}"
-              f"[f{closure.candidate.frame_idx_a}]")
+            break
+        held = _HeldLoop(seq_b, seq_a, relative_b_to_a, closure)
+        (trusted_items if trusted else pending).append(held)
+    if not pending and not trusted_items:
+        return inserted
+
+    config = ctx.config.loop_closure
+    max_rotation = config.max_rotation_error_deg
+    max_translation = config.max_translation_error
+
+    # Boundary repairs bypass the gate: the matched frames are known-adjacent
+    # (no aliasing risk) and the graph is known-wrong exactly there.
+    for held in trusted_items:
+        _insert_loop_factor(ctx, pose_graph, inserted, held, tag,
+                            note="  (boundary repair)")
+
+    # Evaluate everything (new + previously held) against the current graph.
+    held_evaluated: list[tuple[_HeldLoop, np.ndarray, float, float]] = []
+    for held in pending:
+        try:
+            d_world, translation_error, rotation_error = _loop_disagreement(
+                pose_graph, held.seq_b, held.seq_a, held.relative_b_to_a)
+        except Exception as exc:  # missing node / singular matrix — do not gate
+            print(f"{tag} loop geometry gate skipped ({exc!r})")
+            _insert_loop_factor(ctx, pose_graph, inserted, held, tag)
+            continue
+        rotation_bad = (max_rotation is not None and np.isfinite(rotation_error)
+                        and rotation_error > max_rotation)
+        translation_bad = (max_translation is not None
+                           and translation_error > max_translation)
+        if rotation_bad or translation_bad:
+            held_evaluated.append((held, d_world, translation_error, rotation_error))
+        else:
+            _insert_loop_factor(ctx, pose_graph, inserted, held, tag)
+    pending.clear()
+
+    # Corroboration among the gate failures.
+    accepted: set[int] = set()
+    for i in range(len(held_evaluated)):
+        for j in range(i + 1, len(held_evaluated)):
+            _, d1, t1, r1 = held_evaluated[i]
+            _, d2, t2, r2 = held_evaluated[j]
+            if _corrections_consistent(d1, t1, r1, d2, t2, r2):
+                accepted.update((i, j))
+    for i in sorted(accepted):
+        held, _, translation_error, rotation_error = held_evaluated[i]
+        _insert_loop_factor(
+            ctx, pose_graph, inserted, held, tag,
+            note=f"  (corroborated — graph was off by "
+                 f"{translation_error:.2f} / {rotation_error:.0f}°)")
+
+    for i, (held, _, translation_error, rotation_error) in enumerate(held_evaluated):
+        if i in accepted:
+            continue
+        held.drains_held += 1
+        if held.drains_held >= _HELD_ACCEPT_AFTER_DRAINS:
+            _insert_loop_factor(
+                ctx, pose_graph, inserted, held, tag,
+                note=f"  (accepted after {held.drains_held} submaps "
+                     f"held uncontradicted — graph off by "
+                     f"{translation_error:.2f} / {rotation_error:.0f}°)")
+            continue
+        if not held.announced:
+            held.announced = True
+            print(f"{tag} Loop closure HELD (geometric: trans {translation_error:.2f}, "
+                  f"rot {rotation_error:.0f}° vs graph) — awaiting corroboration")
+        pending.append(held)
+    del pending[:-_PENDING_POOL_MAX]  # cap the pool, dropping the oldest
+    return inserted
 
 
-def _blocking_put(ctx: _RunContext, q: queue.Queue, item) -> bool:
-    """Put item on q, retrying every 0.5 s until space is available.
+def _blocking_put(ctx: _RunContext, target_queue: queue.Queue, item) -> bool:
+    """Put item on target_queue, retrying every 0.5 s until space is available.
 
     Returns False if another thread recorded an error before the item could
     be placed (the pipeline is shutting down).
     """
     while True:
         try:
-            q.put(item, timeout=0.5)
+            target_queue.put(item, timeout=0.5)
             return True
         except queue.Full:
             if ctx.backend_error is not None:
                 return False
+
+
+def _effective_overlap(config: SLAMConfig) -> int:
+    """Anchor overlap clamped to [1, submap_size - 1]."""
+    return max(1, min(int(config.submap_overlap), config.submap_size - 1))
+
+
+# A keyframe batch handed from the frontend to the inference thread:
+# (labels, images, seq_indices), index-aligned.
+_KeyframeBatch = tuple[list[str], list[np.ndarray], list[int]]
+
+
+class _KeyframeBatcher:
+    """Groups keyframes into submap batches with anchor-frame overlap.
+
+    Each emitted batch keeps its last `overlap` keyframes as the start of the
+    next batch — the shared anchors that bridge consecutive submaps in the
+    pose graph (module docstring, invariant 1).
+    """
+
+    def __init__(self, submap_size: int, overlap: int):
+        self._submap_size = submap_size
+        self._overlap = overlap
+        self._labels: list[str] = []
+        self._images: list[np.ndarray] = []
+        self._indices: list[int] = []
+
+    def add(self, label: str, image: np.ndarray, seq_idx: int) -> _KeyframeBatch | None:
+        """Append a keyframe; return a full batch when one is ready."""
+        self._labels.append(label)
+        self._images.append(image)
+        self._indices.append(seq_idx)
+        if len(self._labels) < self._submap_size:
+            return None
+        batch = (list(self._labels), list(self._images), list(self._indices))
+        # Anchor the next submap on the last `overlap` keyframes.
+        del self._labels[:-self._overlap]
+        del self._images[:-self._overlap]
+        del self._indices[:-self._overlap]
+        return batch
+
+    def tail(self) -> _KeyframeBatch | None:
+        """The final partial batch, or None when only the anchor copies of
+        the previous batch remain (they carry nothing new)."""
+        if len(self._labels) <= self._overlap:
+            return None
+        return (list(self._labels), list(self._images), list(self._indices))
 
 
 def _scaled_translation(transform: np.ndarray, scale: float) -> np.ndarray:
@@ -294,6 +599,74 @@ def _adjust_boundary_scale(
     return adjusted
 
 
+# A boundary repair enters the graph as a *trusted* factor (bypasses the
+# geometric gate), so its measurement gets one independent sanity check: the
+# relative rotation of the repair pair composed through each batch's own
+# chain.  The two chains agree on that rotation to within the boundary
+# disagreement (~tens of degrees even at a break); a repair re-inference
+# deviating far beyond that is a garbage wide-baseline estimate (observed:
+# conf ≈ 0.21-0.26 repairs carrying ~120° rotation errors that corrupted the
+# whole downstream map orientation).
+_REPAIR_MAX_ROTATION_DEV_DEG = 45.0
+
+
+def _repair_rotation_deviation(
+    prev_frames: list,
+    frame_idx_a: int,
+    curr_frames: list,
+    frame_idx_b: int,
+    overlap: int,
+    measured_b_to_a: np.ndarray,
+) -> float:
+    """Rotation angle (deg) between a boundary-repair measurement and the
+    same relative pose composed through the two batches' chains via the
+    shared anchor frame (prev.frames[-1] == curr.frames[overlap-1]).
+    Rotation only — the two chains' translation units differ at a break."""
+    expected_b_to_a = (
+        curr_frames[frame_idx_b].extrinsic.astype(np.float64)
+        @ curr_frames[overlap - 1].cam_to_world.astype(np.float64)
+        @ prev_frames[-1].extrinsic.astype(np.float64)
+        @ prev_frames[frame_idx_a].cam_to_world.astype(np.float64)
+    )
+    return _rotation_angle_deg(np.linalg.inv(expected_b_to_a) @ measured_b_to_a)
+
+
+def _boundary_delta_scale(
+    prev_submap: Submap,
+    curr_submap: Submap,
+    overlap: int,
+    config: SLAMConfig,
+    tag: str,
+) -> tuple[float, float]:
+    """(raw, applied) boundary scale ratio under the configured policy.
+
+    boundary_scale_deadband > 0 splits the two regimes DA3 actually exhibits:
+    ratios inside the band are noise around metric consistency and are forced
+    to 1.0 (the sweep-validated behaviour); ratios outside the band are a
+    genuine per-batch metric scale *break* (live D455 runs showed 2-6x
+    translation-unit jumps) and are applied in full — damping is ignored,
+    only the clamp still applies.  With deadband == 0 the legacy
+    damping/clamp behaviour is used unchanged.
+    """
+    deadband = config.boundary_scale_deadband
+    if deadband <= 0 and config.boundary_scale_damping >= 1.0:
+        # Nothing would use the ratio — skip the median depth-ratio estimate.
+        return 1.0, 1.0
+    raw = _estimate_boundary_scale(prev_submap, curr_submap, overlap)
+    if deadband > 0:
+        if not np.isfinite(raw) or raw <= 0:
+            return raw, 1.0
+        if max(raw, 1.0 / raw) - 1.0 <= deadband:
+            return raw, 1.0
+        applied = _adjust_boundary_scale(raw, 0.0, config.boundary_scale_clamp)
+        print(f"{tag} WARNING: metric scale break at boundary "
+              f"{prev_submap.idx}→{curr_submap.idx} (depth ratio {raw:.3f}) — "
+              f"applying full correction {applied:.3f}")
+        return raw, applied
+    return raw, _adjust_boundary_scale(
+        raw, config.boundary_scale_damping, config.boundary_scale_clamp)
+
+
 # ── runner ────────────────────────────────────────────────────────────────────
 
 class DA3SLAM:
@@ -311,36 +684,48 @@ class DA3SLAM:
         # Default to the canonical YAML config.  (Constructing SLAMConfig()
         # directly is not possible — it has required fields.)
         self.config = config or load_slam_config()
-        cfg = self.config
+        config = self.config
 
         self.estimator = DepthEstimator(
-            model_id=cfg.depth_model,
-            process_resolution=cfg.depth_model_resolution,
-            use_ray_pose=cfg.use_ray_pose,
+            model_id=config.depth_model,
+            process_resolution=config.depth_model_resolution,
+            use_ray_pose=config.use_ray_pose,
         )
         self.builder = SubmapBuilder(
             self.estimator,
-            confidence_percentile=cfg.confidence_percentile,
+            confidence_percentile=config.confidence_percentile,
+            build_pointclouds=config.build_pointclouds,
         )
         self.detector = (
-            LoopClosureDetector(cfg.loop_closure, builder=self.builder)
-            if cfg.enable_loop_closure else None
+            LoopClosureDetector(config.loop_closure, builder=self.builder)
+            if config.enable_loop_closure else None
         )
 
         self.semantic_embedder = None
-        if cfg.semantic_model:
+        if config.semantic_model:
             # Imported lazily: requires the optional `transformers` package.
             from da3_slam.backend.inference.semantic_embedder import SemanticEmbedder
-            self.semantic_embedder = SemanticEmbedder(cfg.semantic_model)
+            self.semantic_embedder = SemanticEmbedder(config.semantic_model)
 
-    def run(self, image_paths: list[str]) -> SLAMResult:
+    def run(
+        self,
+        image_paths: list[str],
+        on_update: Callable[[SLAMUpdate], None] | None = None,
+        on_loop_closure: (Callable[[dict[int, np.ndarray],
+                                    list[tuple[int, int]], str], None]
+                          | None) = None,
+    ) -> SLAMResult:
         """Offline entry point: run SLAM over a fixed list of image files.
 
         Thin wrapper over run_stream() — images are read lazily inside the
         frontend thread (preserving I/O / inference overlap) by the disk
-        frame source below.
+        frame source below.  `on_update` / `on_loop_closure` are forwarded to
+        run_stream() so a live viewer can watch offline replays too (see
+        SLAMUpdate and _RunContext.on_loop_closure).
         """
-        return self.run_stream(self._disk_frame_source(image_paths))
+        return self.run_stream(self._disk_frame_source(image_paths),
+                               on_update=on_update,
+                               on_loop_closure=on_loop_closure)
 
     @staticmethod
     def _disk_frame_source(image_paths: list[str]) -> Iterator[FrameItem]:
@@ -351,27 +736,39 @@ class DA3SLAM:
                 raise FileNotFoundError(f"Could not read image: {path}")
             yield cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), i, path
 
-    def run_stream(self, frame_source: Iterable[FrameItem]) -> SLAMResult:
+    def run_stream(
+        self,
+        frame_source: Iterable[FrameItem],
+        on_update: Callable[[SLAMUpdate], None] | None = None,
+        on_loop_closure: (Callable[[dict[int, np.ndarray],
+                                    list[tuple[int, int]], str], None]
+                          | None) = None,
+    ) -> SLAMResult:
         """Streaming entry point: run SLAM over an iterable of input frames.
 
         `frame_source` yields (RGB image, seq_idx, label) tuples in arrival
         order — see FrameItem.  It may block between items (e.g. a live ROS
-        stream); the frontend thread consumes it one frame at a time and the
-        pipeline runs incrementally, so this works for both offline lists and
-        unbounded real-time streams.  The iterator is fully consumed (or an
-        end-of-stream is signalled by it simply terminating).
+        or RealSense stream); the frontend thread consumes it one frame at a
+        time and the pipeline runs incrementally, so this works for both
+        offline lists and unbounded real-time streams.  The iterator is fully
+        consumed (or an end-of-stream is signalled by it simply terminating).
+
+        `on_update`, if given, is called once per submap (from the processing
+        thread) with a SLAMUpdate snapshot of the growing trajectory and map —
+        used to drive a live viewer.  See SLAMUpdate for the threading and
+        error-handling contract.
         """
-        lc_done = threading.Event()
+        loop_closure_done = threading.Event()
         if self.detector is None:
-            lc_done.set()  # no LC thread — event is immediately done
+            loop_closure_done.set()  # no loop-closure thread — event is immediately done
 
         ctx = _RunContext(
             config=self.config,
             batch_queue=queue.Queue(maxsize=2),
             submap_queue=queue.Queue(maxsize=2),
-            lc_queue=queue.Queue(),
-            lc_result_queue=queue.Queue(),
-            lc_done=lc_done,
+            loop_closure_queue=queue.Queue(),
+            loop_closure_result_queue=queue.Queue(),
+            loop_closure_done=loop_closure_done,
             submaps=[],
             loop_closures=[],
             timings={
@@ -381,6 +778,8 @@ class DA3SLAM:
                 "loop_closure": 0.0,
                 "optimization": 0.0,
             },
+            on_update=on_update,
+            on_loop_closure=on_loop_closure,
         )
 
         # Start consumers before producers so they are ready immediately.
@@ -392,15 +791,23 @@ class DA3SLAM:
         ]
         if self.detector is not None:
             threads.append(threading.Thread(target=self._loop_closure_worker,
-                                            args=(ctx,), name="da3-lc", daemon=True))
+                                            args=(ctx,), name="da3-loop-closure", daemon=True))
         threads.append(threading.Thread(target=self._frontend, args=(frame_source, ctx),
                                         name="da3-frontend", daemon=True))
 
         wall_start = time.time()
         for thread in threads:
             thread.start()
-        for thread in threads:
-            thread.join()
+        # Join with periodic wakeups rather than a bare join(): an infinite
+        # join() parks the main thread in an uninterruptible lock acquire, so
+        # signals are never delivered — a Ctrl-C stop hooked to the frame
+        # source (see run_realsense.py) would be ignored.  Waking every 0.2 s
+        # keeps the main thread able to run its signal handler.
+        pending = list(threads)
+        while pending:
+            for thread in pending:
+                thread.join(timeout=0.2)
+            pending = [t for t in pending if t.is_alive()]
         wall_elapsed = time.time() - wall_start
 
         if ctx.backend_error is not None:
@@ -409,9 +816,10 @@ class DA3SLAM:
         self._print_timing_breakdown(ctx.timings, wall_elapsed)
 
         return SLAMResult(
-            keyframe_poses=_build_keyframe_poses(ctx.submaps, ctx.opt_result),
+            keyframe_poses=_build_keyframe_poses(
+                ctx.submaps, ctx.optimization_result.pose),
             submaps=ctx.submaps,
-            optimization=ctx.opt_result,
+            optimization=ctx.optimization_result,
             loop_closures=ctx.loop_closures,
             timings=ctx.timings,
         )
@@ -437,43 +845,47 @@ class DA3SLAM:
         batch shares its last keyframe with the next batch (the anchor frame)
         — see the module docstring.
         """
-        selector = OnlineKeyframeSelector(ctx.config.keyframe)
-        keyframe_paths: list[str] = []
-        keyframe_images: list[np.ndarray] = []
-        keyframe_indices: list[int] = []
+        segment_mode = ctx.config.keyframe.selection_mode == "segment"
+        if segment_mode:
+            selector = SegmentKeyframeSelector(ctx.config.keyframe)
+        else:
+            selector = OnlineKeyframeSelector(ctx.config.keyframe)
+        batcher = _KeyframeBatcher(ctx.config.submap_size,
+                                   _effective_overlap(ctx.config))
+
         try:
             for image, seq_idx, label in frame_source:
                 if ctx.backend_error is not None:
                     break
 
                 t0 = time.time()
-                is_keyframe = selector.step(image)
+                if segment_mode:
+                    new_keyframes = selector.step(image, seq_idx, label)
+                else:
+                    new_keyframes = (
+                        [(label, image, seq_idx)] if selector.step(image) else []
+                    )
                 ctx.timings["keyframe_selection"] += time.time() - t0
 
-                if is_keyframe:
-                    keyframe_paths.append(label)
-                    keyframe_images.append(image)
-                    keyframe_indices.append(seq_idx)
+                for keyframe in new_keyframes:
+                    batch = batcher.add(*keyframe)
+                    if batch is not None:
+                        _blocking_put(ctx, ctx.batch_queue, batch)
 
-                if len(keyframe_paths) >= ctx.config.submap_size:
-                    _blocking_put(ctx, ctx.batch_queue, (
-                        list(keyframe_paths),
-                        list(keyframe_images),
-                        list(keyframe_indices),
-                    ))
-                    # 1-frame overlap: anchor next submap on the last keyframe
-                    keyframe_paths[:] = [keyframe_paths[-1]]
-                    keyframe_images[:] = [keyframe_images[-1]]
-                    keyframe_indices[:] = [keyframe_indices[-1]]
+            # Drain the final partial segment (segment mode only).
+            if segment_mode and ctx.backend_error is None:
+                t0 = time.time()
+                tail_keyframes = selector.flush()
+                ctx.timings["keyframe_selection"] += time.time() - t0
+                for keyframe in tail_keyframes:
+                    batch = batcher.add(*keyframe)
+                    if batch is not None:
+                        _blocking_put(ctx, ctx.batch_queue, batch)
 
-            # Flush the final partial batch (a single leftover frame is only
-            # the anchor copy of the previous batch — nothing new to add).
-            if len(keyframe_paths) >= 2 and ctx.backend_error is None:
-                _blocking_put(ctx, ctx.batch_queue, (
-                    list(keyframe_paths),
-                    list(keyframe_images),
-                    list(keyframe_indices),
-                ))
+            # Flush the final partial batch.
+            tail_batch = batcher.tail()
+            if tail_batch is not None and ctx.backend_error is None:
+                _blocking_put(ctx, ctx.batch_queue, tail_batch)
         except Exception as exc:
             ctx.backend_error = exc
         finally:
@@ -494,8 +906,8 @@ class DA3SLAM:
                 t0 = time.time()
                 submap = self.builder.build(paths, images, indices, submap_idx)
                 if self.semantic_embedder is not None:
-                    semantic_vecs = self.semantic_embedder.encode_frames(submap)
-                    submap.set_all_semantic_vectors(semantic_vecs)
+                    semantic_vectors = self.semantic_embedder.encode_frames(submap)
+                    submap.set_all_semantic_vectors(semantic_vectors)
                 ctx.timings["submap_building"] += time.time() - t0
                 submap_idx += 1
 
@@ -519,14 +931,18 @@ class DA3SLAM:
         results are drained back into the graph between optimisations.
         """
         pose_graph = PoseGraph(ctx.config.noise)
+        overlap = _effective_overlap(ctx.config)
 
         # Running product of inter-submap scale ratios: converts translations
         # from the current submap's metric unit to submap 0's unit.
         accumulated_scale: float = 1.0
-        # Snapshots handed to the LC worker (it runs concurrently and must
+        # Snapshots handed to the loop-closure worker (it runs concurrently and must
         # not observe later mutations).
         submap_scales: dict[int, float] = {}
         submaps_by_idx: dict[int, Submap] = {}
+        # Gate-failing loop closures awaiting corroboration (see the
+        # corroboration-pool comment above _drain_loop_closure_results).
+        pending_loops: list[_HeldLoop] = []
 
         tag = f"[{threading.current_thread().name}]"
         try:
@@ -537,16 +953,21 @@ class DA3SLAM:
 
                 t0 = time.time()
                 prev_submap = ctx.submaps[-1] if ctx.submaps else None
+                boundary_broken = False
                 if prev_submap is None:
                     self._add_first_submap_to_graph(pose_graph, submap)
                 else:
-                    raw_delta_scale = _estimate_boundary_scale(prev_submap, submap)
-                    delta_scale = _adjust_boundary_scale(
-                        raw_delta_scale,
-                        ctx.config.boundary_scale_damping,
-                        ctx.config.boundary_scale_clamp,
-                    )
+                    raw_delta_scale, delta_scale = _boundary_delta_scale(
+                        prev_submap, submap, overlap, ctx.config, tag)
                     accumulated_scale *= delta_scale
+                    # A break was detected either by the scale dead-band
+                    # (delta applied != 1) or by the shared-pair pose check.
+                    boundary_broken = (
+                        ctx.config.boundary_scale_deadband > 0
+                        and delta_scale != 1.0)
+                    if overlap >= 2:
+                        boundary_broken |= _check_boundary_consistency(
+                            prev_submap, submap, overlap, tag)
                     self._add_submap_to_graph(pose_graph, submap, accumulated_scale)
                     print(f"{tag} Submap {submap.idx}: scale={accumulated_scale:.4f} "
                           f"(Δ raw={raw_delta_scale:.4f} applied={delta_scale:.4f})")
@@ -558,17 +979,34 @@ class DA3SLAM:
                 ctx.timings["graph_building"] += time.time() - t0
 
                 if self.detector is not None:
-                    ctx.lc_queue.put((submap, dict(submaps_by_idx), dict(submap_scales)))
+                    # A broken boundary triggers a repair re-inference in the
+                    # worker: a fresh DA3 pass over a frame pair spanning the
+                    # boundary arbitrates the two contradictory measurements.
+                    repair = ((prev_submap.idx, submap.idx)
+                              if boundary_broken and prev_submap is not None else None)
+                    ctx.loop_closure_queue.put(
+                        (submap, dict(submaps_by_idx), dict(submap_scales), repair))
 
-                _drain_lc_results(ctx, pose_graph)
+                inserted_loops = _drain_loop_closure_results(
+                    ctx, pose_graph, pending_loops)
+                if inserted_loops and ctx.on_loop_closure is not None:
+                    self._emit_loop_closure_snapshot(
+                        ctx, pose_graph.get_pose, inserted_loops, phase="pre")
 
                 t0 = time.time()
-                opt = pose_graph.optimize()
+                optimization = pose_graph.optimize()
                 ctx.timings["optimization"] += time.time() - t0
                 print(f"{tag} Submap {submap.idx}: "
                       f"{pose_graph.n_nodes} nodes  "
                       f"{pose_graph.n_factors} factors  "
-                      f"error={opt.final_error:.4f}")
+                      f"error={optimization.final_error:.4f}")
+
+                if inserted_loops and ctx.on_loop_closure is not None:
+                    self._emit_loop_closure_snapshot(
+                        ctx, optimization.pose, inserted_loops, phase="post")
+
+                if ctx.on_update is not None:
+                    self._emit_update(ctx, submap, optimization)
 
             if ctx.backend_error is not None:
                 return
@@ -578,21 +1016,35 @@ class DA3SLAM:
                     "No submaps built — sequence too short or no keyframes detected."
                 )
 
-            # Wait for the LC worker to finish, then incorporate its last results.
+            # Wait for the loop-closure worker to finish, then incorporate its last results.
             if self.detector is not None:
-                ctx.lc_queue.put(None)  # sentinel
-                ctx.lc_done.wait()
-            _drain_lc_results(ctx, pose_graph)
+                ctx.loop_closure_queue.put(None)  # sentinel
+                ctx.loop_closure_done.wait()
+            inserted_loops = _drain_loop_closure_results(
+                ctx, pose_graph, pending_loops)
+            if inserted_loops and ctx.on_loop_closure is not None:
+                self._emit_loop_closure_snapshot(
+                    ctx, pose_graph.get_pose, inserted_loops, phase="pre")
 
             print(f"{tag} Final optimisation "
                   f"({pose_graph.n_nodes} nodes, {pose_graph.n_factors} factors) ...")
             t0 = time.time()
-            ctx.opt_result = pose_graph.optimize(verbose=True)
+            ctx.optimization_result = pose_graph.optimize(verbose=True)
             ctx.timings["optimization"] += time.time() - t0
-            print(f"{tag} Done: error={ctx.opt_result.final_error:.4f}  "
-                  f"iters={ctx.opt_result.iterations}  "
+
+            if inserted_loops and ctx.on_loop_closure is not None:
+                self._emit_loop_closure_snapshot(
+                    ctx, ctx.optimization_result.pose, inserted_loops, phase="post")
+            print(f"{tag} Done: error={ctx.optimization_result.final_error:.4f}  "
+                  f"iters={ctx.optimization_result.iterations}  "
                   f"submaps={len(ctx.submaps)}  "
                   f"loop_closures={len(ctx.loop_closures)}")
+
+            # Final refresh so the live view reflects the globally-optimised
+            # trajectory (incl. the last loop closures), not just the last
+            # incremental step.
+            if ctx.on_update is not None:
+                self._emit_update(ctx, ctx.submaps[-1], ctx.optimization_result)
 
         except Exception as exc:
             ctx.backend_error = exc
@@ -617,14 +1069,14 @@ class DA3SLAM:
         composed with DA3's local anchor-to-frame transform (translation
         rescaled to the global metric unit).
         """
-        anchor_global_c2w = pose_graph.get_pose(submap.frames[0].seq_idx)
-        anchor_local_w2c = submap.frames[0].extrinsic.astype(np.float64)
+        anchor_global_cam_to_world = pose_graph.get_pose(submap.frames[0].seq_idx)
+        anchor_local_world_to_cam = submap.frames[0].extrinsic.astype(np.float64)
         for frame in submap.frames[1:]:
-            local_c2w = frame.cam_to_world.astype(np.float64)
-            relative = anchor_local_w2c @ local_c2w
+            local_cam_to_world = frame.cam_to_world.astype(np.float64)
+            relative = anchor_local_world_to_cam @ local_cam_to_world
             pose_graph.add_frame(
                 frame.seq_idx,
-                anchor_global_c2w @ _scaled_translation(relative, accumulated_scale),
+                anchor_global_cam_to_world @ _scaled_translation(relative, accumulated_scale),
             )
 
     @staticmethod
@@ -633,7 +1085,14 @@ class DA3SLAM:
         submap: Submap,
         accumulated_scale: float,
     ) -> None:
-        """Add a between-factor for each consecutive frame pair in the submap."""
+        """Add a between-factor for each consecutive frame pair in the submap.
+
+        With submap_overlap >= 2, pairs inside the shared anchor block were
+        already measured by the previous submap — the second factor is an
+        *independent* DA3 measurement of the same pair and is added on
+        purpose: the redundancy stops one broken batch from silently
+        displacing everything after the boundary.
+        """
         for previous, current in zip(submap.frames, submap.frames[1:]):
             relative = (
                 previous.extrinsic.astype(np.float64)
@@ -645,92 +1104,242 @@ class DA3SLAM:
                 _scaled_translation(relative, accumulated_scale),
             )
 
+    @staticmethod
+    def _emit_loop_closure_snapshot(
+        ctx: _RunContext,
+        pose_fn: Callable[[int], np.ndarray],
+        pairs: list[tuple[int, int]],
+        phase: str,
+    ) -> None:
+        """Fire on_loop_closure with the keyframe poses read from `pose_fn`
+        (seq_idx → 4x4: PoseGraph.get_pose for the live graph values
+        pre-optimisation, or OptimizationResult.pose post)."""
+        poses = _build_keyframe_poses(ctx.submaps, pose_fn)
+        try:
+            ctx.on_loop_closure(poses, pairs, phase)
+        except Exception as exc:  # snapshot consumer must never kill the run
+            print(f"[{threading.current_thread().name}] "
+                  f"on_loop_closure callback error (ignored): {exc!r}")
+
+    @staticmethod
+    def _emit_update(ctx: _RunContext, submap: Submap, optimization: OptimizationResult) -> None:
+        """Build a SLAMUpdate for the just-optimised submap and fire on_update.
+
+        Points are projected with the *current* optimised poses.  The shared
+        anchor frames are skipped for every submap after the first so the
+        live cloud does not double-log them.  A failing viewer callback is
+        logged and swallowed — it must never take down the SLAM run.
+        """
+        poses = _build_keyframe_poses(ctx.submaps, optimization.pose)
+
+        overlap = _effective_overlap(ctx.config)
+        frames = submap.frames if submap.idx == 0 else submap.frames[overlap:]
+        frame_points_cam = []
+        points_list, colors_list = [], []
+        for frame in frames:
+            if len(frame.points_cam) == 0:
+                continue
+            frame_points_cam.append((frame.seq_idx, frame.points_cam, frame.colors))
+            global_cam_to_world = optimization.pose(frame.seq_idx).astype(np.float64)
+            points_list.append(transform_points(frame.points_cam, global_cam_to_world))
+            colors_list.append(frame.colors)
+        new_points = (np.concatenate(points_list) if points_list
+                      else np.empty((0, 3), dtype=np.float32))
+        new_colors = (np.concatenate(colors_list) if colors_list
+                      else np.empty((0, 3), dtype=np.uint8))
+
+        update = SLAMUpdate(
+            submap_idx=submap.idx,
+            keyframe_poses=poses,
+            new_points_world=new_points,
+            new_colors=new_colors,
+            n_submaps=len([s for s in ctx.submaps if not s.is_loop_closure_submap]),
+            n_loop_closures=len(ctx.loop_closures),
+            frame_points_cam=frame_points_cam,
+        )
+        try:
+            ctx.on_update(update)
+        except Exception as exc:  # viewer must never kill the pipeline
+            print(f"[{threading.current_thread().name}] "
+                  f"on_update callback error (ignored): {exc!r}")
+
     # ── loop closure thread ───────────────────────────────────────────────────
 
     def _loop_closure_worker(self, ctx: _RunContext) -> None:
         """Detects and verifies loop closures; posts scaled factors for _processing.
 
-        Receives (submap, submaps_by_idx, submap_scales) snapshots so it can
-        run concurrently with graph building.
+        Receives (submap, submaps_by_idx, submap_scales, repair) snapshots so
+        it can run concurrently with graph building.  `repair` names a broken
+        boundary (prev_idx, curr_idx): a fresh DA3 pass over a frame pair
+        spanning it produces a third, independent measurement that arbitrates
+        the two contradictory boundary factors — including rotation, so the
+        segments cannot settle at different angles.  Repair closures are
+        posted `trusted` (the frames are known-adjacent, aliasing is not a
+        concern) and bypass the geometric gate — in exchange they must pass
+        the batch-chain rotation sanity check (_repair_rotation_deviation)
+        on top of the confidence gate.
         """
+        overlap = _effective_overlap(ctx.config)
         try:
             while True:
-                item = ctx.lc_queue.get()
+                item = ctx.loop_closure_queue.get()
                 if item is None or ctx.backend_error is not None:
                     break
-                submap, submaps_by_idx, submap_scales = item
+                submap, submaps_by_idx, submap_scales, repair = item
 
                 t0 = time.time()
-                closures = self.detector.process(submap)
+                verified = [(closure, False) for closure in self.detector.process(submap)]
+                if repair is not None:
+                    prev_idx, curr_idx = repair
+                    prev_frames = submaps_by_idx[prev_idx].frames
+                    curr_frames = submaps_by_idx[curr_idx].frames
+                    # One frame off the shared anchor block on each side:
+                    # independent of both disputed measurements, with as much
+                    # visual overlap as possible (wide-baseline re-inference
+                    # is what produces garbage repairs).
+                    frame_idx_a = max(len(prev_frames) - overlap - 2, 0)
+                    frame_idx_b = min(overlap + 1, len(curr_frames) - 1)
+                    closure = self.detector.verify_boundary(
+                        prev_idx, frame_idx_a, curr_idx, frame_idx_b)
+                    reject_reason = "low re-inference confidence"
+                    if closure is not None:
+                        deviation = _repair_rotation_deviation(
+                            prev_frames, frame_idx_a, curr_frames, frame_idx_b,
+                            overlap, closure.relative_b_to_a)
+                        if (np.isfinite(deviation)
+                                and deviation > _REPAIR_MAX_ROTATION_DEV_DEG):
+                            reject_reason = (
+                                f"rotation {deviation:.0f}° off both batch "
+                                f"chains (> {_REPAIR_MAX_ROTATION_DEV_DEG:g}°)")
+                            closure = None
+                    if closure is not None:
+                        verified.append((closure, True))
+                    else:
+                        print(f"[{threading.current_thread().name}] boundary "
+                              f"repair {prev_idx}→{curr_idx} rejected "
+                              f"({reject_reason})")
                 ctx.timings["loop_closure"] += time.time() - t0
 
-                for closure in closures:
+                for closure, trusted in verified:
                     candidate = closure.candidate
                     frame_b = (submaps_by_idx[candidate.submap_idx_b]
                                .frames[candidate.frame_idx_b])
                     frame_a = (submaps_by_idx[candidate.submap_idx_a]
                                .frames[candidate.frame_idx_a])
 
-                    # The LC re-inference has its own arbitrary metric scale.
+                    # The loop-closure re-inference has its own arbitrary metric scale.
                     # Convert its translation to the global unit in two steps:
-                    # LC unit → query submap unit (depth ratio at the shared
+                    # re-inference unit → query submap unit (depth ratio at the shared
                     # query frame), then → global unit (the query submap's
                     # accumulated scale).
-                    lc_to_query_scale = _estimate_depth_scale(
+                    reinference_to_query_scale = _estimate_depth_scale(
                         frame_b.depth,
-                        closure.lc_submap.frames[0].depth,
+                        closure.reinference_submap
+                        .frames[closure.query_frame_pos].depth,
                     )
                     global_scale = (
-                        lc_to_query_scale * submap_scales[candidate.submap_idx_b]
+                        reinference_to_query_scale * submap_scales[candidate.submap_idx_b]
                     )
                     relative_b_to_a = _scaled_translation(
                         closure.relative_b_to_a, global_scale
                     )
 
-                    ctx.lc_result_queue.put(
-                        (frame_b.seq_idx, frame_a.seq_idx, relative_b_to_a, closure)
+                    ctx.loop_closure_result_queue.put(
+                        (frame_b.seq_idx, frame_a.seq_idx, relative_b_to_a,
+                         closure, trusted)
                     )
 
         except Exception as exc:
             ctx.backend_error = exc
         finally:
-            ctx.lc_done.set()
+            ctx.loop_closure_done.set()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _build_keyframe_poses(
     submaps: list[Submap],
-    opt: OptimizationResult,
+    pose_fn: Callable[[int], np.ndarray],
 ) -> dict[int, np.ndarray]:
     """
-    Return the per-frame cam-to-world poses from the GTSAM optimisation result.
+    Return the per-frame cam-to-world poses read from `pose_fn` (seq_idx → 4x4,
+    e.g. OptimizationResult.pose or PoseGraph.get_pose).
 
     The anchor frame (shared between consecutive submaps) is included once —
-    the first submap that contributed it wins.  LC submaps are skipped.
+    the first submap that contributed it wins.  Loop-closure submaps are skipped.
     """
     poses: dict[int, np.ndarray] = {}
     for submap in submaps:
-        if submap.is_lc_submap:
+        if submap.is_loop_closure_submap:
             continue
         for frame in submap.frames:
             if frame.seq_idx not in poses:
-                poses[frame.seq_idx] = opt.pose(frame.seq_idx).astype(np.float32)
+                poses[frame.seq_idx] = pose_fn(frame.seq_idx).astype(np.float32)
     return poses
 
 
-def _estimate_boundary_scale(prev_submap: Submap, curr_submap: Submap) -> float:
+def _estimate_boundary_scale(
+    prev_submap: Submap,
+    curr_submap: Submap,
+    overlap: int = 1,
+) -> float:
     """
     Estimate the metric scale of curr_submap relative to prev_submap.
 
-    The anchor frame (last of prev, first of curr) observed the same scene in
-    both DA3 batches.  The median depth ratio gives the scale factor needed to
-    bring curr_submap's translations into the same metric unit as prev_submap.
+    The first shared anchor frame (prev.frames[-overlap] == curr.frames[0])
+    observed the same scene in both DA3 batches.  The median depth ratio gives
+    the scale factor needed to bring curr_submap's translations into the same
+    metric unit as prev_submap.
     """
     return _estimate_depth_scale(
-        prev_submap.frames[-1].depth,
+        prev_submap.frames[-overlap].depth,
         curr_submap.frames[0].depth,
     )
+
+
+def _check_boundary_consistency(
+    prev_submap: Submap,
+    curr_submap: Submap,
+    overlap: int,
+    tag: str,
+) -> bool:
+    """Flag a broken submap boundary (needs submap_overlap >= 2).
+
+    The first shared frame pair is measured by *both* DA3 batches: prev's
+    frames[-overlap:-overlap+2] and curr's frames[0:2] are the same physical
+    frames.  A large disagreement between the two relative-pose measurements
+    means one batch's odometry is wrong at the boundary — the classic cause
+    of the trajectory suddenly jumping and the map rebuilding elsewhere.
+    The duplicate between-factor added by _add_consecutive_frame_factors
+    makes the graph split the difference instead of silently trusting the
+    broken measurement; returning True additionally triggers a boundary
+    repair re-inference (see _loop_closure_worker), which arbitrates the
+    disagreement with a third independent measurement.
+    """
+    frame_pa = prev_submap.frames[-overlap]
+    frame_pb = prev_submap.frames[-overlap + 1]
+    frame_ca, frame_cb = curr_submap.frames[0], curr_submap.frames[1]
+    if (frame_pa.seq_idx, frame_pb.seq_idx) != (frame_ca.seq_idx, frame_cb.seq_idx):
+        return False  # short tail batch — pairing assumption does not hold
+    relative_prev = (frame_pa.extrinsic.astype(np.float64)
+                     @ frame_pb.cam_to_world.astype(np.float64))
+    relative_curr = (frame_ca.extrinsic.astype(np.float64)
+                     @ frame_cb.cam_to_world.astype(np.float64))
+    rotation_diff = _rotation_angle_deg(np.linalg.inv(relative_prev) @ relative_curr)
+    norm_prev = float(np.linalg.norm(relative_prev[:3, 3]))
+    norm_curr = float(np.linalg.norm(relative_curr[:3, 3]))
+    if norm_prev > 1e-9:
+        norm_ratio = norm_curr / norm_prev
+    else:
+        norm_ratio = float("inf") if norm_curr > 1e-9 else 1.0
+    broken = ((np.isfinite(rotation_diff) and rotation_diff > 15.0)
+              or norm_ratio < 0.5 or norm_ratio > 2.0)
+    if broken:
+        print(f"{tag} WARNING: boundary {prev_submap.idx}→{curr_submap.idx} "
+              f"inconsistent — the two batches disagree on the shared frame "
+              f"pair (rotation {rotation_diff:.1f}°, translation-norm ratio "
+              f"{norm_ratio:.2f}); possible odometry break here")
+    return broken
 
 
 def _estimate_depth_scale(depth_ref: np.ndarray, depth_new: np.ndarray) -> float:

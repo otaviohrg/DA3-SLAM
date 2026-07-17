@@ -36,6 +36,8 @@ def load_kitti(path: str) -> np.ndarray:
 
 
 def main():
+    """Load a trajectory file and save 3D, top-down (XZ) and per-axis PNGs
+    next to it."""
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--tum",   help="TUM format trajectory file")

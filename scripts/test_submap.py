@@ -53,7 +53,7 @@ def main():
     check("colors dtype uint8", submap.colors.dtype == np.uint8)
     check(f"extrinsics shape ({N}, 4, 4)", submap.extrinsics.shape == (N, 4, 4))
     check(f"positions_world shape ({N}, 3)", submap.positions_world.shape == (N, 3))
-    check("conf_threshold recorded", submap.conf_threshold is not None)
+    check("confidence_threshold recorded", submap.confidence_threshold is not None)
     check("image_paths recorded", submap.image_paths == paths)
 
     total_pts = len(submap.points_world)

@@ -1,0 +1,4 @@
+# Optional dependencies for the live RealSense demo (scripts/run_realsense.py).
+# Installed into the image by setup.sh; not needed for offline SLAM/benchmarks.
+pyrealsense2      # Intel RealSense SDK (colour stream capture)
+rerun-sdk>=0.20   # live trajectory/map viewer (gRPC connect era)

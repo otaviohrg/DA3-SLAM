@@ -103,48 +103,29 @@ class Frame:
         """(3,) camera centre in local world coordinates."""
         return self.cam_to_world[:3, 3]
 
-    def get_dense_pointcloud_cam(self, conf_threshold: float | None = None) -> np.ndarray:
-        """
-        Reconstruct a dense (H, W, 3) point cloud in camera space from the
-        stored depth map.  Pixels that fail the optional threshold or have
-        invalid depth are set to NaN so the spatial layout is preserved.
-        """
-        K = self.intrinsic
-        H, W = self.depth.shape
-        u, v = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
-
-        mask = np.isfinite(self.depth) & (self.depth > 0.0)
-        if conf_threshold is not None:
-            mask &= (self.confidence >= conf_threshold)
-
-        z = np.where(mask, self.depth, np.nan)
-        x = (u - K[0, 2]) * z / K[0, 0]
-        y = (v - K[1, 2]) * z / K[1, 1]
-        return np.stack([x, y, z], axis=-1).astype(np.float32)
-
 
 @dataclass
 class Submap:
     """Local map built from a batch of keyframes."""
 
     # Position of this submap in the global sequence.  Negative indices mark
-    # 2-frame loop-closure submaps created by re-inference (see loop_closure.py).
+    # loop-closure submaps created by re-inference (see loop_closure.py).
     idx: int
 
     # Ordered list of frames in this submap
     frames: list[Frame] = field(default_factory=list)
 
-    # True for 2-frame loop-closure submaps built from DA3 re-inference.
-    # LC submaps are excluded from trajectory export and from loop-closure
-    # candidate search.
-    is_lc_submap: bool = False
+    # True for loop-closure submaps built from DA3 re-inference (matched
+    # frame pair + optional context neighbours).  Loop-closure submaps are
+    # excluded from trajectory export and from loop-closure candidate search.
+    is_loop_closure_submap: bool = False
 
     # Original keyframe file paths (provenance / debugging; empty for
-    # LC submaps, whose frames come from in-memory images)
+    # loop-closure submaps, whose frames come from in-memory images)
     image_paths: list[str] = field(default_factory=list)
 
     # Global confidence threshold used at build time (absolute value in [0, 1])
-    conf_threshold: float | None = None
+    confidence_threshold: float | None = None
 
     @property
     def n_frames(self) -> int:
@@ -172,34 +153,13 @@ class Submap:
 
     def set_all_retrieval_vectors(self, vectors: Sequence[np.ndarray]) -> None:
         """Attach per-frame DINO-SALAD retrieval descriptors."""
-        for frame, vec in zip(self.frames, vectors):
-            frame.retrieval_vector = vec
+        for frame, vector in zip(self.frames, vectors):
+            frame.retrieval_vector = vector
 
     def set_all_semantic_vectors(self, vectors: Sequence[np.ndarray]) -> None:
         """Attach per-frame CLIP semantic embeddings."""
-        for frame, vec in zip(self.frames, vectors):
-            frame.semantic_vector = vec
-
-    def get_points_in_world_frame(self, opt_result) -> np.ndarray:
-        """
-        All points in the *global* world frame, using per-frame optimised poses.
-
-        Each frame's camera-space points are projected via the frame's
-        optimised cam-to-world pose from the given OptimizationResult.
-
-        Returns (N_total, 3) float32.
-        """
-        all_pts = [
-            transform_points(
-                frame.points_cam,
-                opt_result.pose(frame.seq_idx).astype(np.float64),
-            )
-            for frame in self.frames
-            if len(frame.points_cam) > 0
-        ]
-        if not all_pts:
-            return np.empty((0, 3), dtype=np.float32)
-        return np.concatenate(all_pts, axis=0)
+        for frame, vector in zip(self.frames, vectors):
+            frame.semantic_vector = vector
 
 
 # ── builder ───────────────────────────────────────────────────────────────────
@@ -211,9 +171,27 @@ class SubmapBuilder:
         self,
         estimator: DepthEstimator,
         confidence_percentile: float = 40.0,
+        build_pointclouds: bool = True,
     ):
+        """
+        Args:
+            estimator:             DA3 wrapper used for inference
+            confidence_percentile: global percentile for point filtering
+            build_pointclouds:     False = lean mode for runs where nothing
+                                   consumes point clouds (no map.ply, no live
+                                   viewer — e.g. benchmark sweeps): skips point
+                                   extraction and stores empty points/colors/
+                                   confidence/mask on every Frame.  Keeps
+                                   image (loop-closure re-inference +
+                                   descriptors), depth (scale estimation) and
+                                   the camera matrices.
+                                   Cuts per-frame memory ~3x, which matters
+                                   because every keyframe of every submap stays
+                                   resident for the whole run.
+        """
         self.estimator = estimator
         self.confidence_percentile = confidence_percentile
+        self.build_pointclouds = build_pointclouds
 
     def build(
         self,
@@ -246,16 +224,16 @@ class SubmapBuilder:
         """
         Build a Submap from an already-computed DepthPrediction.
 
-        Also used by LoopClosureDetector to build 2-frame LC submaps from DA3
-        re-inference without re-running the model.
+        Also used by LoopClosureDetector to build loop-closure submaps
+        from DA3 re-inference without re-running the model.
 
         Args:
             prediction:  normalised DA3 outputs for the batch
             submap_idx:  position of this submap in the global sequence
-                         (negative for LC submaps)
+                         (negative for loop-closure submaps)
             seq_indices: per-frame indices into the original sequence;
-                         defaults to 0..N-1 (used for LC submaps, whose
-                         frames don't correspond to sequence positions)
+                         defaults to 0..N-1 (used for loop-closure submaps,
+                         whose frames don't correspond to sequence positions)
         """
         if seq_indices is None:
             seq_indices = range(prediction.n_frames)
@@ -263,22 +241,36 @@ class SubmapBuilder:
         # One global threshold across the whole batch: consistently
         # low-confidence frames contribute fewer points than high-confidence
         # ones (a per-frame threshold would always keep the same fraction).
-        conf_threshold = prediction.confidence_threshold(self.confidence_percentile)
-        submap = Submap(idx=submap_idx, conf_threshold=conf_threshold)
+        confidence_threshold = prediction.confidence_threshold(self.confidence_percentile)
+        submap = Submap(idx=submap_idx, confidence_threshold=confidence_threshold)
+
+        empty_points = np.empty((0, 3), dtype=np.float32)
+        empty_colors = np.empty((0, 3), dtype=np.uint8)
+        empty_mask = np.empty((0, 0), dtype=bool)
+        empty_confidence = np.empty((0, 0), dtype=np.float32)
 
         for i, seq_idx in enumerate(seq_indices):
-            points_cam, mask = prediction.to_pointcloud(i, conf_threshold)
-            cam_to_world = np.linalg.inv(prediction.extrinsics[i])
+            if self.build_pointclouds:
+                points_cam, mask = prediction.to_pointcloud(i, confidence_threshold)
+                points_world = transform_points(
+                    points_cam, np.linalg.inv(prediction.extrinsics[i]))
+                colors = prediction.processed_images[i][mask].astype(np.uint8)
+                confidence = prediction.confidence[i]
+            else:
+                # Lean mode: nothing downstream consumes points/colors/
+                # confidence — store empties (see __init__ docstring).
+                points_cam = points_world = empty_points
+                colors, mask, confidence = empty_colors, empty_mask, empty_confidence
             submap.frames.append(Frame(
                 seq_idx=seq_idx,
                 image=prediction.processed_images[i],
                 points_cam=points_cam,
-                points_world=transform_points(points_cam, cam_to_world),
-                colors=prediction.processed_images[i][mask].astype(np.uint8),
+                points_world=points_world,
+                colors=colors,
                 extrinsic=prediction.extrinsics[i],
                 intrinsic=prediction.intrinsics[i],
                 depth=prediction.depth[i],
-                confidence=prediction.confidence[i],
+                confidence=confidence,
                 confidence_mask=mask,
             ))
 

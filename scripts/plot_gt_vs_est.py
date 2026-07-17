@@ -6,11 +6,11 @@ Associates the estimate to GT by timestamp, applies Sim(3) Umeyama alignment
   • top-down view in the two axes with the largest GT spread (GT vs aligned est)
   • per-axis position vs time
 
-Defaults target a run dir written by run_slam_ros.py / run_slam.py, which holds
+Defaults target a run dir written by run_slam.py, which holds
 both trajectory_tum.txt and ground_truth_tum.txt.
 
     # plot a run directory (auto-finds both files)
-    python scripts/plot_gt_vs_est.py --run_dir outputs/ros_run
+    python scripts/plot_gt_vs_est.py --run_dir outputs/run1
 
     # explicit files, no scale correction (SE3 alignment only)
     python scripts/plot_gt_vs_est.py --est traj.txt --gt gt.txt --no-correct_scale
@@ -72,6 +72,8 @@ def resolve_paths(args: argparse.Namespace) -> tuple[str, str]:
 
 
 def main() -> None:
+    """Associate estimate ↔ GT by timestamp (evo), align, plot the two-panel
+    chart, and print the APE RMSE + Sim3 scale."""
     args = parse_args()
     est_path, gt_path = resolve_paths(args)
 

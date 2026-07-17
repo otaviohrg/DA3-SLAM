@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -38,7 +39,6 @@ def list_images(image_dir: str, limit: int | None = None) -> list[str]:
 
 def load_rgb_images(paths: list[str]) -> list[np.ndarray]:
     """Load images as HxWx3 uint8 RGB arrays."""
-    import cv2
     images = []
     for p in paths:
         bgr = cv2.imread(p)

@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libegl1 \
+    libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
@@ -26,7 +27,7 @@ ENV UV_SYSTEM_PYTHON=1
 
 WORKDIR /app
 
-COPY requirements.txt setup.sh pyproject.toml ./
+COPY requirements.txt requirements-realsense.txt setup.sh pyproject.toml ./
 COPY da3_slam/ da3_slam/
 
 RUN chmod +x setup.sh && ./setup.sh

@@ -17,6 +17,7 @@ import torch
 
 from depth_anything_3.api import DepthAnything3
 
+
 @dataclass
 class DepthPrediction:
     """Normalised outputs from a single DA3 inference call."""
@@ -105,7 +106,6 @@ class DepthEstimator:
         device: torch.device | None = None,
         use_ray_pose: bool = False,
     ):
-
         self.process_resolution = process_resolution
         self.use_ray_pose = use_ray_pose
         self.device = device or torch.device(
@@ -130,7 +130,8 @@ class DepthEstimator:
         Returns:
             DepthPrediction with normalised outputs
         """
-        raw = self.model.inference(images, process_res=self.process_resolution, use_ray_pose=self.use_ray_pose)
+        raw = self.model.inference(images, process_res=self.process_resolution,
+                                   use_ray_pose=self.use_ray_pose)
 
         depth = raw.depth.astype(np.float32)           # (N, H, W)
         confidence = _normalize_confidence(raw.conf.astype(np.float32))  # (N, H, W) → [0,1]

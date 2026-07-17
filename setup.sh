@@ -5,6 +5,13 @@ set -e  # Exit immediately if a command exits with a non-zero status
 echo "Installing base requirements..."
 uv pip install -r requirements.txt
 
+# 1b. Optional live-demo requirements (RealSense + Rerun). Present in the Docker
+# image; skipped gracefully if the file was not copied in (e.g. local runs).
+if [ -f requirements-realsense.txt ]; then
+    echo "Installing RealSense demo requirements..."
+    uv pip install -r requirements-realsense.txt
+fi
+
 mkdir -p /opt/third_party
 
 # 3. Clone and install Depth Anything 3

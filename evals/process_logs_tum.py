@@ -1,56 +1,73 @@
+"""Summarise a TUM eval-harness log CSV (per-run / per-dataset RMSE + wall time).
+
+Reads the CSV written by evals/eval_tum.sh (columns: Run, Dataset, RMSE and
+optionally WallTime) and prints per-run, per-dataset and overall averages.
+
+Usage:
+    python evals/process_logs_tum.py --submap_size 20 --model nested-giant
+    python evals/process_logs_tum.py --log_path logs/tum_results_w20_nested-giant.txt
+"""
+
 import argparse
-import pandas as pd
 from pathlib import Path
 
-parser = argparse.ArgumentParser(description="Process TUM results")
-parser.add_argument("--submap_size", type=str, default="20", help="submap size used during eval")
-parser.add_argument("--model", type=str, default="nested-giant",
-                    help="model short name used during eval (nested-giant, giant, large, base, small)")
-parser.add_argument("--log_path", type=str, default=None, help="explicit path to log file (overrides --submap_size / --model)")
-args = parser.parse_args()
+import pandas as pd
 
-if args.log_path:
-    log_path = Path(args.log_path)
-else:
-    log_path = Path.cwd() / f"logs/tum_results_w{args.submap_size}_{args.model}.txt"
 
-df = pd.read_csv(log_path)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Process TUM results")
+    parser.add_argument("--submap_size", type=str, default="20",
+                        help="submap size used during eval")
+    parser.add_argument("--model", type=str, default="nested-giant",
+                        help="model short name used during eval "
+                             "(nested-giant, giant, large, base, small)")
+    parser.add_argument("--log_path", type=str, default=None,
+                        help="explicit path to log file "
+                             "(overrides --submap_size / --model)")
+    return parser.parse_args()
 
-df = df[df["Dataset"] != "Average"]
-df["Run"] = df["Run"].astype(int)
 
-print("=== Per-Experiment RMSE APE (Run x Dataset) ===")
-for run in sorted(df["Run"].unique()):
-    print(f"\n--- Run {run} ---")
-    run_df = df[df["Run"] == run]
-    for _, row in run_df.iterrows():
-        print(f"{row['Dataset']}: {row['RMSE']:.4f}")
+def print_group_means(df: pd.DataFrame, column: str, group: str,
+                      title: str, fmt: str, key_prefix: str = "",
+                      suffix: str = "") -> None:
+    print(f"\n=== {title} ===")
+    for key, value in df.groupby(group)[column].mean().items():
+        print(f"{key_prefix}{key}: {value:{fmt}}{suffix}")
 
-print("\n=== Per-Run Average RMSE APE ===")
-per_run_avg = df.groupby("Run")["RMSE"].mean()
-for run, val in per_run_avg.items():
-    print(f"Run {run}: {val:.4f}")
 
-print("\n=== Per-Dataset Average RMSE APE ===")
-per_dataset_avg = df.groupby("Dataset")["RMSE"].mean()
-for dataset, val in per_dataset_avg.items():
-    print(f"{dataset}: {val:.4f}")
+def main() -> None:
+    args = parse_args()
 
-overall_avg = df["RMSE"].mean()
-print("\n=== Overall Average RMSE APE Across All Runs ===")
-print(f"Overall Average RMSE: {overall_avg:.4f}")
+    if args.log_path:
+        log_path = Path(args.log_path)
+    else:
+        log_path = Path.cwd() / f"logs/tum_results_w{args.submap_size}_{args.model}.txt"
 
-if "WallTime" in df.columns:
-    print("\n=== Per-Dataset Average Wall Time ===")
-    per_dataset_time = df.groupby("Dataset")["WallTime"].mean()
-    for dataset, val in per_dataset_time.items():
-        print(f"{dataset}: {val:.1f}s")
+    df = pd.read_csv(log_path)
+    df = df[df["Dataset"] != "Average"]
+    df["Run"] = df["Run"].astype(int)
 
-    print("\n=== Per-Run Average Wall Time ===")
-    per_run_time = df.groupby("Run")["WallTime"].mean()
-    for run, val in per_run_time.items():
-        print(f"Run {run}: {val:.1f}s")
+    print("=== Per-Experiment RMSE APE (Run x Dataset) ===")
+    for run in sorted(df["Run"].unique()):
+        print(f"\n--- Run {run} ---")
+        for _, row in df[df["Run"] == run].iterrows():
+            print(f"{row['Dataset']}: {row['RMSE']:.4f}")
 
-    overall_avg_time = df["WallTime"].mean()
-    print("\n=== Overall Average Wall Time Across All Runs ===")
-    print(f"Overall Average Wall Time: {overall_avg_time:.1f}s")
+    print_group_means(df, "RMSE", "Run", "Per-Run Average RMSE APE", ".4f",
+                      key_prefix="Run ")
+    print_group_means(df, "RMSE", "Dataset", "Per-Dataset Average RMSE APE", ".4f")
+    print("\n=== Overall Average RMSE APE Across All Runs ===")
+    print(f"Overall Average RMSE: {df['RMSE'].mean():.4f}")
+
+    if "WallTime" in df.columns:
+        print_group_means(df, "WallTime", "Dataset",
+                          "Per-Dataset Average Wall Time", ".1f", suffix="s")
+        print_group_means(df, "WallTime", "Run",
+                          "Per-Run Average Wall Time", ".1f",
+                          key_prefix="Run ", suffix="s")
+        print("\n=== Overall Average Wall Time Across All Runs ===")
+        print(f"Overall Average Wall Time: {df['WallTime'].mean():.1f}s")
+
+
+if __name__ == "__main__":
+    main()

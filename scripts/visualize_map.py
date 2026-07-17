@@ -78,6 +78,7 @@ def load_ply(path: str) -> tuple[np.ndarray, np.ndarray]:
 
 
 def subsample(points: np.ndarray, colors: np.ndarray, n: int):
+    """Randomly keep at most n points (colors stay aligned)."""
     if len(points) <= n:
         return points, colors
     idx = np.random.choice(len(points), n, replace=False)
@@ -90,6 +91,8 @@ def render_views(
     out_dir: Path,
     n_points: int,
 ) -> None:
+    """Save four 3D scatter views (perspective/top/front/side) of a subsampled
+    cloud, plus a full-resolution 2-D top-down log-density histogram."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -141,6 +144,7 @@ def render_views(
 
 
 def main():
+    """Load map.ply, print its spatial extent, and render views next to it."""
     parser = argparse.ArgumentParser()
     parser.add_argument("ply", help="Path to map.ply")
     parser.add_argument(

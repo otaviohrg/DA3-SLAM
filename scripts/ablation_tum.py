@@ -38,10 +38,11 @@ from __future__ import annotations
 
 import argparse
 import json
-
+import traceback
 from pathlib import Path
 from typing import Any
 
+from da3_slam.config import load_slam_config
 from tum_eval_common import SharedSLAM, evaluate_sequence, average_metrics
 
 # ── sweep specification ───────────────────────────────────────────────────────
@@ -110,8 +111,6 @@ def generate_configs() -> list[dict[str, Any]]:
 
 def build_config(params: dict[str, Any]):
     """Construct a SLAMConfig from an ablation params dict."""
-    from da3_slam.config import load_slam_config
-
     config = load_slam_config(
         submap_size=params["submap_size"],
         confidence_percentile=params["confidence_percentile"],
@@ -147,7 +146,6 @@ def run_config(
                 shared_slam.run, seq_dir, out_root / cfg_name / seq_dir.name, max_frames
             )
         except Exception as exc:
-            import traceback
             print(f"  [ERROR] {seq_dir.name}: {exc}")
             traceback.print_exc()
             continue
@@ -166,15 +164,31 @@ def run_config(
     }
 
 # ── table printing ────────────────────────────────────────────────────────────
+#
+# These are also used by show_ablation.py to render a saved
+# ablation_results.json without re-running any experiments.
 
-def print_table(results: list[dict], baseline_params: dict) -> None:
-    """Print ranked ablation table sorted by avg ATE SE3 (ascending)."""
+def _params_cells(params: dict) -> str:
+    """The four fixed parameter columns shared by both ranked tables."""
+    return (f"{params['submap_size']:>4}  "
+            f"{params['min_disparity_fraction']:>5.2f}  "
+            f"{params['confidence_percentile']:>5.1f}  "
+            f"{params['lc_distance_threshold']:>6.2f}")
+
+
+def print_table(
+    results: list[dict],
+    baseline_params: dict,
+    sort_key: str = "ate_se3_rmse",
+    sort_label: str = "avg ATE RMSE (SE3 alignment)",
+) -> None:
+    """Print the ranked ablation accuracy table (ascending by `sort_key`)."""
     completed = [r for r in results if r.get("avg")]
     if not completed:
         print("No completed configs to report.")
         return
 
-    completed.sort(key=lambda r: r["avg"]["ate_se3_rmse"])
+    completed.sort(key=lambda r: r["avg"].get(sort_key, float("inf")))
 
     label_col = max(len(r["label"]) for r in completed) + 2
 
@@ -188,21 +202,17 @@ def print_table(results: list[dict], baseline_params: dict) -> None:
     sep = "═" * (len(header) + 2)
 
     print(f"\n{sep}")
-    print("  ABLATION STUDY  —  ranked by avg ATE RMSE (SE3 alignment)")
+    print(f"  ABLATION STUDY  —  ranked by {sort_label}")
     print(sep)
     print("  " + header)
     print("  " + "─" * len(header))
 
     for r in completed:
-        p = r["params"]
         avg = r["avg"]
-        marker = " *" if p == baseline_params else "  "
+        marker = " *" if r["params"] == baseline_params else "  "
         print(
             f"{marker}{r['label']:<{label_col}}  "
-            f"{p['submap_size']:>4}  "
-            f"{p['min_disparity_fraction']:>5.2f}  "
-            f"{p['confidence_percentile']:>5.1f}  "
-            f"{p['lc_distance_threshold']:>6.2f}  "
+            f"{_params_cells(r['params'])}  "
             f"{avg['ate_se3_rmse']:>9.4f}  "
             f"{avg['ate_sim3_rmse']:>9.4f}  "
             f"{avg['rpe_trans_rmse']:>10.4f}  "
@@ -214,9 +224,11 @@ def print_table(results: list[dict], baseline_params: dict) -> None:
 
     print("  " + "─" * len(header))
     best = completed[0]
-    print(f"  Best: {best['label']}  →  avg ATE {best['avg']['ate_se3_rmse']:.4f} m")
+    print(f"  Best: {best['label']}  →  "
+          f"{sort_label} {best['avg'].get(sort_key, float('nan')):.4f}")
     print("  (* = baseline config)")
     print(sep)
+
 
 def print_timing_table(results: list[dict], baseline_params: dict) -> None:
     """
@@ -249,15 +261,11 @@ def print_timing_table(results: list[dict], baseline_params: dict) -> None:
     print("  " + "─" * len(header))
 
     for r in completed:
-        p = r["params"]
         avg = r["avg"]
-        marker = " *" if p == baseline_params else "  "
+        marker = " *" if r["params"] == baseline_params else "  "
         print(
             f"{marker}{r['label']:<{label_col}}  "
-            f"{p['submap_size']:>4}  "
-            f"{p['min_disparity_fraction']:>5.2f}  "
-            f"{p['confidence_percentile']:>5.1f}  "
-            f"{p['lc_distance_threshold']:>6.2f}  "
+            f"{_params_cells(r['params'])}  "
             f"{avg['wall_seconds']:>9.1f}s  "
             f"{avg['s_per_frame']:>7.3f}s  "
             f"{avg['s_per_kf']:>7.2f}s  "
@@ -270,18 +278,28 @@ def print_timing_table(results: list[dict], baseline_params: dict) -> None:
     print("  (* = baseline config)")
     print(sep)
 
-def print_per_axis_breakdown(results: list[dict], baseline_params: dict) -> None:
-    """For each sweep axis, print a mini-table of that parameter's effect alone."""
+
+def print_per_axis_breakdown(
+    results: list[dict],
+    baseline_params: dict,
+    axes: list[str] | None = None,
+) -> None:
+    """Per sweep axis, print a mini-table of that parameter's effect alone.
+
+    `axes` restricts the output to the named sweep keys (None = all).
+    """
     completed = {tuple(sorted(r["params"].items())): r for r in results if r.get("avg")}
 
     for sweep_key, _, values in SWEEPS:
+        if axes is not None and sweep_key not in axes:
+            continue
         print(f"\n  ── Sweep: {sweep_key} ({'  '.join(str(v) for v in values)}) ──")
         print(f"  {'value':>8}  {'avg ATE':>9}  {'avg Sim3':>9}  "
               f"{'avg KFs':>8}  {'avg LCs':>8}  {'s/frame':>8}")
         print(f"  {'─'*64}")
 
         for val in values:
-            cfg = dict(BASELINE)
+            cfg = dict(baseline_params)
             cfg[sweep_key] = val
             key = tuple(sorted(cfg.items()))
             if key not in completed:
@@ -298,6 +316,7 @@ def print_per_axis_breakdown(results: list[dict], baseline_params: dict) -> None
                 f"{avg['n_loop_closures']:>8.1f}  "
                 f"{s_per_frame:>7.3f}s"
             )
+
 
 def print_all_tables(results: list[dict]) -> None:
     print_table(results, BASELINE)
@@ -324,6 +343,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 def main() -> None:
+    """Run all pending OFAT configs (skipping completed ones with --resume),
+    checkpointing ablation_results.json after each, then print the tables."""
     args = parse_args()
     configs = generate_configs()
 
@@ -363,7 +384,6 @@ def main() -> None:
     print(f"  Output: {out_root}")
     print(f"{'═'*70}")
 
-    from da3_slam.config import load_slam_config
     print("\n  Loading depth model (once for all configs)…")
     shared_slam = SharedSLAM(load_slam_config())
     print("  Model ready.\n")

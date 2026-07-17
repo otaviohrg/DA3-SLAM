@@ -7,11 +7,37 @@ Usage:
 
 import argparse
 
+from da3_slam.config import load_slam_config
+from da3_slam.frontend.keyframe_selector import (
+    KeyframeSelector,
+    OnlineKeyframeSelector,
+    SegmentKeyframeSelector,
+)
 from smoke_test_utils import header, check, list_images, load_rgb_images
 
 
+def run_segment_selector(cfg_seg, images, threshold):
+    """Run SegmentKeyframeSelector over `images` with the given threshold.
+
+    Returns (keyframes, boundaries): the emitted (label, image, seq_idx)
+    tuples and the seq_idx of the last frame of each emitted segment.
+    """
+    cfg_seg.segment_disparity_threshold = threshold
+    selector = SegmentKeyframeSelector(cfg_seg)
+    keyframes, boundaries = [], []
+    for i, image in enumerate(images):
+        emitted = selector.step(image, seq_idx=i, label=f"f{i}")
+        if emitted:
+            keyframes.extend(emitted)
+            boundaries.append(emitted[-1][2])
+    tail = selector.flush()
+    if tail:
+        keyframes.extend(tail)
+        boundaries.append(tail[-1][2])
+    return keyframes, boundaries
+
+
 def parse_args():
-    from da3_slam.config import load_slam_config
     cfg = load_slam_config()
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True)
@@ -27,9 +53,6 @@ def main():
 
     paths = list_images(args.image_dir)
     check(f"Found {len(paths)} images", len(paths) > 0)
-
-    from da3_slam.frontend.keyframe_selector import KeyframeSelector, OnlineKeyframeSelector
-    from da3_slam.config import load_slam_config
 
     cfg = load_slam_config(submap_size=args.max_submap_size).keyframe
     cfg.min_disparity_fraction = args.min_disparity_fraction
@@ -85,14 +108,47 @@ def main():
 
     # ── max_submap_size enforcement ───────────────────────────────────────────
     header("max_submap_size enforcement")
-    from da3_slam.config import load_slam_config as _load
-    cfg_tight = _load(submap_size=3).keyframe
+    cfg_tight = load_slam_config(submap_size=3).keyframe
     cfg_tight.min_disparity_fraction = 999.0
     result_tight = KeyframeSelector(cfg_tight).select(images)
     gaps = [result_tight.indices[i + 1] - result_tight.indices[i]
             for i in range(len(result_tight.indices) - 1)]
     check("all gaps <= max_submap_size=3", all(g <= 3 for g in gaps))
     print(f"  Gaps between keyframes: {gaps}")
+
+    # ── segment-level selector ────────────────────────────────────────────────
+    header("SegmentKeyframeSelector (segment-level density control)")
+    seg_len = 8
+    cfg_seg = load_slam_config().keyframe
+    cfg_seg.selection_mode = "segment"
+    cfg_seg.segment_length = seg_len
+    cfg_seg.segment_strides = (2, 4)
+
+    # Very high threshold → never dense → sparse stride (b=4) on full segments.
+    kfs_sparse, bounds_sparse = run_segment_selector(cfg_seg, images, threshold=1e12)
+    # Very low threshold → always dense → dense stride (a=2) on full segments.
+    kfs_dense, _ = run_segment_selector(cfg_seg, images, threshold=-1.0)
+
+    sparse_idx = [seq for _, _, seq in kfs_sparse]
+    dense_idx = [seq for _, _, seq in kfs_dense]
+
+    check("segment keyframe indices are sorted & unique",
+          sparse_idx == sorted(set(sparse_idx)))
+    check("segment indices within bounds",
+          all(0 <= s < len(images) for s in sparse_idx))
+    n_full = len(images) // seg_len
+    if n_full >= 1:
+        # Last frame of each full segment must be selected (anchor/bridge).
+        last_frames = [(k + 1) * seg_len - 1 for k in range(n_full)]
+        check("last frame of each full segment is a keyframe",
+              all(lf in sparse_idx for lf in last_frames))
+        check("full-segment boundaries recorded", all(lf in bounds_sparse
+                                                       for lf in last_frames))
+    check("dense stride yields >= as many keyframes as sparse",
+          len(dense_idx) >= len(sparse_idx))
+    print(f"  Frames: {len(images)}  segment_length: {seg_len}")
+    print(f"  Sparse (stride 4) keyframes: {len(sparse_idx)} -> {sparse_idx}")
+    print(f"  Dense  (stride 2) keyframes: {len(dense_idx)} -> {dense_idx}")
 
     header("All checks passed")
 

@@ -25,10 +25,10 @@ from da3_slam.config import load_slam_config, DEFAULT_YAML, SLAMConfig
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def parse_args(cfg: dict) -> argparse.Namespace:
+def parse_args(yaml_config: dict) -> argparse.Namespace:
     """Build argument parser with defaults drawn from the loaded YAML config."""
-    lc = cfg.get("loop_closure", {})
-    kf = cfg.get("keyframe", {})
+    loop_closure_cfg = yaml_config.get("loop_closure", {})
+    keyframe_cfg = yaml_config.get("keyframe", {})
 
     parser = argparse.ArgumentParser(
         description="DA3-SLAM runner",
@@ -46,37 +46,48 @@ def parse_args(cfg: dict) -> argparse.Namespace:
                         help="Cap the number of input frames (for quick tests)")
 
     # ── DA3 model ─────────────────────────────────────────────────────────────
-    parser.add_argument("--depth_model", default=cfg.get("depth_model"),
+    parser.add_argument("--depth_model", default=yaml_config.get("depth_model"),
                         help="DA3 model ID")
     parser.add_argument("--depth_model_resolution", type=int,
-                        default=cfg.get("depth_model_resolution"),
+                        default=yaml_config.get("depth_model_resolution"),
                         help="DA3 processing resolution")
     parser.add_argument("--use_ray_pose", action=argparse.BooleanOptionalAction,
-                        default=bool(cfg.get("use_ray_pose", False)),
+                        default=bool(yaml_config.get("use_ray_pose", False)),
                         help="Use ray-based pose estimation instead of the camera decoder")
 
     # ── submap ────────────────────────────────────────────────────────────────
     parser.add_argument("--submap_size", type=int,
-                        default=cfg.get("submap_size"),
+                        default=yaml_config.get("submap_size"),
                         help="Max keyframes per submap (including anchor overlap)")
     parser.add_argument("--boundary_scale_damping", type=float,
-                        default=cfg.get("boundary_scale_damping"),
+                        default=yaml_config.get("boundary_scale_damping"),
                         help="Damping g for inter-submap scale chaining: each "
                              "boundary depth-ratio is raised to (1-g). "
                              "0 = full chaining, 1 = trust DA3 metric depth")
     parser.add_argument("--boundary_scale_clamp", type=float,
-                        default=cfg.get("boundary_scale_clamp"),
+                        default=yaml_config.get("boundary_scale_clamp"),
                         help="Clamp each boundary scale ratio to [1/c, c] "
                              "(unset = no clamping)")
 
     # ── keyframe selection ────────────────────────────────────────────────────
     parser.add_argument("--min_disparity_fraction", type=float,
-                        default=kf.get("min_disparity_fraction"),
+                        default=keyframe_cfg.get("min_disparity_fraction"),
                         help="Min optical flow as fraction of image width [0,1]")
+    parser.add_argument("--selection_mode", choices=["disparity", "segment"],
+                        default=keyframe_cfg.get("selection_mode", "disparity"),
+                        help="Keyframe policy: 'disparity' (frame-level threshold) "
+                             "or 'segment' (segment-level density control)")
+    parser.add_argument("--segment_length", type=int,
+                        default=keyframe_cfg.get("segment_length"),
+                        help="Segment mode: frames per segment (N_S)")
+    parser.add_argument("--segment_threshold", type=float,
+                        default=keyframe_cfg.get("segment_disparity_threshold"),
+                        help="Segment mode: accumulated flow (px) above which the "
+                             "dense stride is used (tau_seg)")
 
     # ── point cloud ───────────────────────────────────────────────────────────
     parser.add_argument("--confidence_percentile", type=float,
-                        default=cfg.get("confidence_percentile"),
+                        default=yaml_config.get("confidence_percentile"),
                         help="Global confidence percentile threshold (0-100). "
                              "Higher = fewer but cleaner points")
 
@@ -85,13 +96,27 @@ def parse_args(cfg: dict) -> argparse.Namespace:
                         help="Skip saving the dense point cloud (map.ply). "
                              "Use during benchmarking to avoid I/O overhead.")
 
+    # ── live viewer (optional) ────────────────────────────────────────────────
+    parser.add_argument("--viewer", choices=["connect", "serve", "spawn", "none"],
+                        default="none",
+                        help="Live Rerun viewer for the replay: connect to a "
+                             "host viewer / serve a web viewer / spawn a native "
+                             "window / disabled. Requires rerun-sdk; in Docker "
+                             "the container needs host networking to reach the "
+                             "host viewer (use `make run-viz`)")
+    parser.add_argument("--viewer_addr",
+                        default="rerun+http://127.0.0.1:9876/proxy",
+                        help="Address of the host Rerun viewer (mode=connect)")
+    parser.add_argument("--viewer_max_points", type=int, default=60_000,
+                        help="Max points logged per submap (subsampled for speed)")
+
     # ── loop closure ──────────────────────────────────────────────────────────
     parser.add_argument("--no_loop_closure", action="store_true",
-                        default=not lc.get("enable", True),
+                        default=not loop_closure_cfg.get("enable", True),
                         help="Disable loop closure detection")
     # --loop_threshold kept as an alias for backwards compatibility
     parser.add_argument("--loop_distance_threshold", "--loop_threshold", type=float,
-                        default=lc.get("distance_threshold"),
+                        default=loop_closure_cfg.get("distance_threshold"),
                         help="DINO-SALAD descriptor L2 distance threshold for loop "
                              "detection (lower = stricter)")
 
@@ -117,6 +142,11 @@ def build_config(args: argparse.Namespace) -> SLAMConfig:
         config.loop_closure.distance_threshold = args.loop_distance_threshold
     if args.min_disparity_fraction is not None:
         config.keyframe.min_disparity_fraction = args.min_disparity_fraction
+    config.keyframe.selection_mode = args.selection_mode
+    if args.segment_length is not None:
+        config.keyframe.segment_length = args.segment_length
+    if args.segment_threshold is not None:
+        config.keyframe.segment_disparity_threshold = args.segment_threshold
     return config
 
 
@@ -153,11 +183,13 @@ def timestamps_from_filenames(image_paths: list[str]) -> dict[int, float] | None
 
 # ── reporting ──────────────────────────────────────────────────────────────────
 
-def print_summary(result, n_frames: int, t_load: float, t_run: float) -> None:
+def print_summary(result, n_frames: int, model_load_seconds: float, pipeline_seconds: float) -> None:
+    """Print the end-of-run report: counts, trajectory length, and the
+    per-module timing breakdown normalised per frame / per submap."""
     positions = result.trajectory[:, :3, 3]
     path_length = np.linalg.norm(np.diff(positions, axis=0), axis=1).sum()
     n_submaps = max(len(result.submaps), 1)
-    t = result.timings
+    timings = result.timings
 
     print("\n" + "─" * 60)
     print("  SLAM Summary")
@@ -168,49 +200,49 @@ def print_summary(result, n_frames: int, t_load: float, t_run: float) -> None:
     print(f"  Loop closures:       {len(result.loop_closures)}")
     print(f"  Opt. final error:    {result.optimization.final_error:.6f}")
     print(f"  Trajectory length:   {path_length:.3f} m")
-    print(f"  Model load time:     {t_load:.1f}s")
-    print(f"  Pipeline time:       {t_run:.1f}s")
-    print(f"  Total wall time:     {t_load + t_run:.1f}s")
-    print(f"  FPS (pipeline):      {n_frames / t_run:.1f}")
+    print(f"  Model load time:     {model_load_seconds:.1f}s")
+    print(f"  Pipeline time:       {pipeline_seconds:.1f}s")
+    print(f"  Total wall time:     {model_load_seconds + pipeline_seconds:.1f}s")
+    print(f"  FPS (pipeline):      {n_frames / pipeline_seconds:.1f}")
     print()
     print("  Timing breakdown (total | per unit):")
-    print(f"    {'keyframe_selection':<25} {t['keyframe_selection']:6.2f}s  "
-          f"| {t['keyframe_selection'] / n_frames * 1000:.2f} ms/frame")
-    print(f"    {'submap_building':<25} {t['submap_building']:6.2f}s  "
-          f"| {t['submap_building'] / n_submaps:.2f} s/submap")
-    print(f"    {'loop_closure':<25} {t['loop_closure']:6.2f}s  "
-          f"| {t['loop_closure'] / n_submaps:.2f} s/submap")
-    print(f"    {'graph_building':<25} {t['graph_building']:6.2f}s  "
-          f"| {t['graph_building'] / n_submaps * 1000:.1f} ms/submap")
-    print(f"    {'optimization':<25} {t['optimization']:6.2f}s  "
-          f"| {t['optimization'] / n_submaps * 1000:.1f} ms/submap")
+    print(f"    {'keyframe_selection':<25} {timings['keyframe_selection']:6.2f}s  "
+          f"| {timings['keyframe_selection'] / n_frames * 1000:.2f} ms/frame")
+    print(f"    {'submap_building':<25} {timings['submap_building']:6.2f}s  "
+          f"| {timings['submap_building'] / n_submaps:.2f} s/submap")
+    print(f"    {'loop_closure':<25} {timings['loop_closure']:6.2f}s  "
+          f"| {timings['loop_closure'] / n_submaps:.2f} s/submap")
+    print(f"    {'graph_building':<25} {timings['graph_building']:6.2f}s  "
+          f"| {timings['graph_building'] / n_submaps * 1000:.1f} ms/submap")
+    print(f"    {'optimization':<25} {timings['optimization']:6.2f}s  "
+          f"| {timings['optimization'] / n_submaps * 1000:.1f} ms/submap")
 
 
 def save_timings_json(path: Path, result, n_frames: int,
-                      t_load: float, t_run: float) -> None:
+                      model_load_seconds: float, pipeline_seconds: float) -> None:
     """Write timings.json.
 
     The key names are read by the eval harness (evals/eval_tum.sh and
     friends) — do not rename them.
     """
     n_submaps = len(result.submaps)
-    t = result.timings
+    timings = result.timings
     data = {
-        "model_load": round(t_load, 3),
-        "pipeline": round(t_run, 3),
-        "wall_total": round(t_load + t_run, 3),
+        "model_load": round(model_load_seconds, 3),
+        "pipeline": round(pipeline_seconds, 3),
+        "wall_total": round(model_load_seconds + pipeline_seconds, 3),
         "frames": n_frames,
         "keyframes": result.n_keyframes,
         "submaps": n_submaps,
         "loop_closures": len(result.loop_closures),
-        **{k: round(v, 3) for k, v in t.items()},
+        **{k: round(v, 3) for k, v in timings.items()},
         # Derived per-step metrics
-        "fps": round(n_frames / t_run, 2) if t_run > 0 else 0,
-        "kf_sel_ms_per_frame": round(t["keyframe_selection"] / n_frames * 1000, 3) if n_frames > 0 else 0,
-        "submap_s_per_submap": round(t["submap_building"] / n_submaps, 3) if n_submaps > 0 else 0,
-        "lc_s_per_submap": round(t["loop_closure"] / n_submaps, 3) if n_submaps > 0 else 0,
-        "graph_ms_per_submap": round(t["graph_building"] / n_submaps * 1000, 3) if n_submaps > 0 else 0,
-        "opt_ms_per_submap": round(t["optimization"] / n_submaps * 1000, 3) if n_submaps > 0 else 0,
+        "fps": round(n_frames / pipeline_seconds, 2) if pipeline_seconds > 0 else 0,
+        "kf_sel_ms_per_frame": round(timings["keyframe_selection"] / n_frames * 1000, 3) if n_frames > 0 else 0,
+        "submap_s_per_submap": round(timings["submap_building"] / n_submaps, 3) if n_submaps > 0 else 0,
+        "lc_s_per_submap": round(timings["loop_closure"] / n_submaps, 3) if n_submaps > 0 else 0,
+        "graph_ms_per_submap": round(timings["graph_building"] / n_submaps * 1000, 3) if n_submaps > 0 else 0,
+        "opt_ms_per_submap": round(timings["optimization"] / n_submaps * 1000, 3) if n_submaps > 0 else 0,
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -219,13 +251,15 @@ def save_timings_json(path: Path, result, n_frames: int,
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    """Run the full pipeline over an image directory and save all outputs
+    (trajectories, optional map.ply, timings.json) to --out_dir."""
     # Parse --config first so the YAML can seed the remaining CLI defaults.
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", default=str(DEFAULT_YAML))
-    known, _ = pre.parse_known_args()
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=str(DEFAULT_YAML))
+    known, _ = pre_parser.parse_known_args()
     with open(known.config) as f:
-        cfg = yaml.safe_load(f)
-    args = parse_args(cfg)
+        yaml_config = yaml.safe_load(f)
+    args = parse_args(yaml_config)
 
     image_paths = collect_image_paths(args.image_dir, args.max_frames)
     if not image_paths:
@@ -235,18 +269,33 @@ def main():
 
     config = build_config(args)
 
+    # Build the viewer before loading the heavy model so a bad --viewer_addr
+    # fails fast (rerun-sdk imported lazily inside LiveViewer).
+    viewer = None
+    if args.viewer != "none":
+        from live_viewer import LiveViewer
+        viewer = LiveViewer(
+            mode=args.viewer,
+            addr=args.viewer_addr,
+            max_points_per_submap=args.viewer_max_points,
+        )
+
+    # Lean frames (no per-frame point clouds) when nothing consumes them —
+    # cuts resident memory per keyframe ~3x on long runs.
+    config.build_pointclouds = (not args.skip_ply) or (viewer is not None)
+
     # Imported here so `--help` works without the GPU stack installed.
     from da3_slam.slam import DA3SLAM
 
-    t_load = time.time()
+    model_load_seconds = time.time()
     slam = DA3SLAM(config)
-    t_load = time.time() - t_load
+    model_load_seconds = time.time() - model_load_seconds
 
-    t_run = time.time()
-    result = slam.run(image_paths)
-    t_run = time.time() - t_run
+    pipeline_seconds = time.time()
+    result = slam.run(image_paths, on_update=viewer)
+    pipeline_seconds = time.time() - pipeline_seconds
 
-    print_summary(result, len(image_paths), t_load, t_run)
+    print_summary(result, len(image_paths), model_load_seconds, pipeline_seconds)
 
     # ── save outputs ───────────────────────────────────────────────────────────
     out = Path(args.out_dir)
@@ -257,14 +306,14 @@ def main():
                     timestamps=timestamps_from_filenames(image_paths))
     if not args.skip_ply:
         result.save_ply(str(out / "map.ply"))
-    save_timings_json(out / "timings.json", result, len(image_paths), t_load, t_run)
+    save_timings_json(out / "timings.json", result, len(image_paths), model_load_seconds, pipeline_seconds)
 
     print(f"\n  Outputs saved to {out}/")
     print(f"    trajectory_kitti.txt  ({result.n_keyframes} poses)")
     print(f"    trajectory_tum.txt    ({result.n_keyframes} poses)")
     if not args.skip_ply:
-        n_pts = sum(len(sm.points_world) for sm in result.submaps)
-        print(f"    map.ply               ({n_pts:,} points)")
+        n_points = sum(len(sm.points_world) for sm in result.submaps)
+        print(f"    map.ply               ({n_points:,} points)")
 
 
 if __name__ == "__main__":

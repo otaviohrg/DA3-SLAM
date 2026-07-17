@@ -5,7 +5,7 @@ torchvision
 numpy
 scipy
 pyyaml
-gtsam
+gtsam-develop
 pytorch_lightning
 pytorch_metric_learning
 trimesh

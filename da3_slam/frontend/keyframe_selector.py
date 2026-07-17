@@ -10,6 +10,12 @@ frame_overlap.py.
 OnlineKeyframeSelector is the stateful frame-by-frame selector used by the
 pipeline; KeyframeSelector is a thin batch wrapper around it for scripts
 and offline analysis.
+
+SegmentKeyframeSelector is an alternative policy (selected via
+KeyframeSelectorConfig.selection_mode == "segment") that controls keyframe
+*density* over fixed-length temporal segments instead of making per-frame
+decisions, following Choi et al., "Revisiting Keyframe Selection in
+Learning-Based Dense Monocular SLAM" (IEEE Access 2026).
 """
 
 from __future__ import annotations
@@ -48,6 +54,42 @@ class KeyframeSelectorConfig:
     # Higher = faster but coarser motion estimate. 4 is a good default.
     flow_downsample_factor: int = 4
 
+    # ── selection policy ────────────────────────────────────────────────────
+    # "disparity": frame-level threshold (VGGT-SLAM-style; OnlineKeyframeSelector).
+    # "segment":   segment-level density control (SegmentKeyframeSelector),
+    #              following Choi et al., "Revisiting Keyframe Selection in
+    #              Learning-Based Dense Monocular SLAM" (IEEE Access 2026).
+    selection_mode: str = "disparity"
+
+    # Segment mode: number of consecutive frames accumulated into one
+    # non-overlapping temporal segment (N_S in the paper).
+    segment_length: int = 128
+
+    # Segment mode: accumulated mean optical-flow displacement (px) over a
+    # segment above which the denser stride is used (tau_seg in the paper).
+    segment_disparity_threshold: float = 650.0
+
+    # Segment mode: (dense, sparse) sampling strides (a, b in the paper).
+    # stride = a if accumulated disparity > segment_disparity_threshold else b.
+    segment_strides: tuple[int, int] = (8, 16)
+
+    # ── blur gating ─────────────────────────────────────────────────────────
+    # Motion blur poisons everything downstream at once: DA3 poses (submap
+    # boundary breaks), retrieval descriptors, and re-inference confidence.
+    # Fast handheld motion still yields sharp frames at direction reversals
+    # and micro-pauses — prefer those.
+
+    # Segment mode: replace each stride-picked keyframe with the sharpest
+    # frame (variance of Laplacian) within ± this many buffered frames.
+    # 0 = off.  The live demo uses 2.
+    sharpness_window: int = 0
+
+    # Disparity mode: defer promoting a frame to keyframe when its sharpness
+    # is below this fraction of the recent median (the max_submap_size
+    # force-keyframe still applies, so a long blurry stretch cannot stall
+    # the pipeline).  0 = off.
+    min_sharpness_ratio: float = 0.0
+
 
 # ── result type ───────────────────────────────────────────────────────────────
 
@@ -82,6 +124,7 @@ class OnlineKeyframeSelector:
         self._reference_gray: np.ndarray | None = None
         self._reference_points: np.ndarray | None = None
         self._frames_since_keyframe: int = 0
+        self._sharpness_history: list[float] = []
 
     def step(self, image: np.ndarray) -> bool:
         """
@@ -109,23 +152,163 @@ class OnlineKeyframeSelector:
         # Threshold is in downsampled-image pixels (gray is already downsampled,
         # so the fraction-of-width semantics are preserved).
         min_disparity_pixels = config.min_disparity_fraction * gray.shape[1]
-        is_keyframe = (
-            disparity >= min_disparity_pixels
-            or self._frames_since_keyframe >= config.max_submap_size
-        )
+        forced = self._frames_since_keyframe >= config.max_submap_size
+        is_keyframe = disparity >= min_disparity_pixels or forced
+
+        # Blur gate: defer a disparity-triggered keyframe when the frame is
+        # much blurrier than recent frames (motion blur); a later, sharper
+        # frame will trigger instead.  The force-keyframe path is exempt so
+        # a long blurry stretch cannot stall the pipeline.
+        ratio = config.min_sharpness_ratio
+        if ratio > 0:
+            sharpness = _sharpness(gray)
+            self._sharpness_history.append(sharpness)
+            del self._sharpness_history[:-30]
+            if (is_keyframe and not forced
+                    and sharpness < ratio * float(np.median(self._sharpness_history))):
+                return False
+
         if is_keyframe:
             self._set_reference(gray)
         return is_keyframe
-
-    def step_path(self, path: str) -> bool:
-        """Convenience wrapper that loads an image from disk."""
-        return self.step(_load_rgb(path))
 
     def _set_reference(self, gray: np.ndarray) -> None:
         """Make `gray` (already downsampled) the new tracking reference."""
         self._reference_gray = gray
         self._reference_points = _detect_points(gray, self.config)
         self._frames_since_keyframe = 0
+
+
+# ── segment selector ──────────────────────────────────────────────────────────
+
+class SegmentKeyframeSelector:
+    """
+    Segment-level keyframe selector (Choi et al., IEEE Access 2026).
+
+    Instead of deciding frame-by-frame whether a frame is a keyframe, the stream
+    is partitioned into non-overlapping segments of `segment_length` (N_S) frames.
+    Within each segment the accumulated mean optical-flow displacement
+    `D_seg = sum_i d_{i,i+1}` is used as a motion proxy to pick a single regular
+    sampling stride from `segment_strides = (a, b)`:
+
+        stride = a  if D_seg > segment_disparity_threshold  else  b
+
+    Keyframes are then sampled at that fixed stride, always including the last
+    frame of the segment (which acts as the bridge/anchor to the next segment).
+
+    Unlike OnlineKeyframeSelector, `step()` buffers frames and only returns
+    keyframes at a segment boundary; call `flush()` to drain the final partial
+    segment.  Each returned keyframe is a (label, image, seq_idx) tuple.
+    """
+
+    def __init__(self, config: KeyframeSelectorConfig):
+        self.config = config
+        self.last_disparity: float = 0.0
+        self._prev_gray: np.ndarray | None = None
+        self._prev_points: np.ndarray | None = None
+        self._buffer: list[tuple[str, np.ndarray, int]] = []
+        self._disparity_accum: float = 0.0
+
+    def step(self, image: np.ndarray, seq_idx: int, label: str) \
+            -> list[tuple[str, np.ndarray, int]]:
+        """
+        Buffer one incoming frame.
+
+        Returns the keyframes selected for the segment when it just completed,
+        otherwise an empty list.
+        """
+        config = self.config
+
+        # Fixed-stride fast path: when both strides are equal the disparity
+        # accumulator can never change the stride choice, so optical flow is
+        # pure overhead — buffer the frame and emit on the segment boundary.
+        # (Used by the keyframe-density sweeps for deterministic density.)
+        if config.segment_strides[0] == config.segment_strides[1]:
+            self._buffer.append((label, image, seq_idx))
+            if len(self._buffer) >= config.segment_length:
+                return self._emit_segment()
+            return []
+
+        gray = _to_flow_gray(image, config.flow_downsample_factor)
+        is_segment_start = len(self._buffer) == 0
+
+        disparity = 0.0
+        if self._prev_points is not None and len(self._prev_points) > 0:
+            disparity = _compute_disparity(self._prev_gray, gray,
+                                           self._prev_points, config)
+        self.last_disparity = disparity
+        # Accumulate displacement only between frames within the same segment
+        # (the cross-boundary pair does not contribute to D_seg).
+        if not is_segment_start:
+            self._disparity_accum += disparity
+
+        self._buffer.append((label, image, seq_idx))
+        self._prev_gray = gray
+        self._prev_points = _detect_points(gray, config)
+
+        if len(self._buffer) >= config.segment_length:
+            return self._emit_segment()
+        return []
+
+    def flush(self) -> list[tuple[str, np.ndarray, int]]:
+        """Emit keyframes for the final, possibly partial, segment."""
+        if not self._buffer:
+            return []
+        return self._emit_segment()
+
+    def _emit_segment(self) -> list[tuple[str, np.ndarray, int]]:
+        config = self.config
+        dense_stride, sparse_stride = config.segment_strides
+        stride = (dense_stride
+                  if self._disparity_accum > config.segment_disparity_threshold
+                  else sparse_stride)
+        stride = max(1, int(stride))
+
+        length = len(self._buffer)
+        # Regular sampling that always lands on the last frame of the segment,
+        # so consecutive segments stay connected through a shared frame.
+        local_indices = list(range(length - 1, -1, -stride))[::-1]
+
+        # Blur gating: swap each stride-picked frame for the sharpest frame in
+        # its neighbourhood.  Fast motion smears most frames, but sharp ones
+        # survive at direction reversals and micro-pauses — those make far
+        # better DA3 inputs, descriptors and anchors.
+        window = max(0, int(config.sharpness_window))
+        if window > 0:
+            local_indices = self._sharpest_substitutes(local_indices, window)
+
+        selected = [self._buffer[i] for i in local_indices]
+
+        self._buffer = []
+        self._disparity_accum = 0.0
+        return selected
+
+    def _buffered_sharpness(self, index: int, cache: dict[int, float]) -> float:
+        """Sharpness of the buffered frame at `index`, memoised in `cache`
+        (neighbourhoods of consecutive stride picks overlap)."""
+        if index not in cache:
+            gray = _to_flow_gray(self._buffer[index][1],
+                                 self.config.flow_downsample_factor)
+            cache[index] = _sharpness(gray)
+        return cache[index]
+
+    def _sharpest_substitutes(self, local_indices: list[int], window: int) -> list[int]:
+        """Replace each index with the sharpest buffered frame within ±window,
+        keeping the result strictly increasing (no duplicate keyframes)."""
+        cache: dict[int, float] = {}
+        length = len(self._buffer)
+        substituted: list[int] = []
+        previous = -1
+        for index in local_indices:
+            low = max(index - window, previous + 1)
+            high = min(index + window, length - 1)
+            if low > high:
+                continue
+            best = max(range(low, high + 1),
+                       key=lambda i: self._buffered_sharpness(i, cache))
+            substituted.append(best)
+            previous = best
+        return substituted
 
 
 # ── batch selector ────────────────────────────────────────────────────────────
@@ -164,9 +347,9 @@ class KeyframeSelector:
 
 # ── internal helpers ──────────────────────────────────────────────────────────
 
-def _to_flow_gray(img: np.ndarray, downsample_factor: int) -> np.ndarray:
+def _to_flow_gray(image: np.ndarray, downsample_factor: int) -> np.ndarray:
     """Convert to grayscale and downsample for cheaper optical flow."""
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
     if downsample_factor > 1:
         h, w = gray.shape[:2]
         gray = cv2.resize(gray, (w // downsample_factor, h // downsample_factor),
@@ -174,7 +357,14 @@ def _to_flow_gray(img: np.ndarray, downsample_factor: int) -> np.ndarray:
     return gray
 
 
+def _sharpness(gray: np.ndarray) -> float:
+    """Variance of the Laplacian — the standard cheap blur measure (higher =
+    sharper).  Computed on the downsampled flow gray, so it costs ~nothing."""
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
 def _load_rgb(path: str) -> np.ndarray:
+    """Read an image from disk as HxWx3 uint8 RGB."""
     bgr = cv2.imread(path)
     if bgr is None:
         raise FileNotFoundError(f"Could not read image: {path}")
@@ -184,14 +374,16 @@ def _load_rgb(path: str) -> np.ndarray:
 def _detect_points(
     gray: np.ndarray, config: KeyframeSelectorConfig
 ) -> np.ndarray | None:
-    pts = cv2.goodFeaturesToTrack(
+    """Shi-Tomasi corners to track from `gray`; None when the image has none
+    (e.g. textureless frames — the caller then reports zero disparity)."""
+    points = cv2.goodFeaturesToTrack(
         gray,
         maxCorners=config.max_corners,
         qualityLevel=config.quality_level,
         minDistance=config.min_distance,
         blockSize=config.block_size,
     )
-    return pts  # shape (N, 1, 2) or None
+    return points  # shape (N, 1, 2) or None
 
 
 def _compute_disparity(

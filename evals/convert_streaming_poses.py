@@ -13,10 +13,14 @@ the standard TUM format expected by evo_ape:
 import argparse
 import glob
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation
+
+# The TUM trajectory writer lives in scripts/euroc_common.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from euroc_common import write_tum_trajectory  # noqa: E402
 
 
 def main():
@@ -51,27 +55,21 @@ def main():
             "The streaming run may have been incomplete."
         )
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
-
-    with open(args.output_file, "w") as f:
-        f.write("# timestamp tx ty tz qx qy qz qw\n")
-        for img_path, c2w in zip(img_list, poses):
-            try:
-                ts = float(Path(img_path).stem)
-            except ValueError:
-                raise ValueError(
-                    f"Cannot extract timestamp from filename: {img_path}. "
-                    "TUM images must be named by their timestamp."
-                )
-            t = c2w[:3, 3]
-            q = Rotation.from_matrix(c2w[:3, :3]).as_quat()  # (qx, qy, qz, qw)
-            f.write(
-                f"{ts:.6f} "
-                f"{t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "
-                f"{q[0]:.9f} {q[1]:.9f} {q[2]:.9f} {q[3]:.9f}\n"
+    stamped_poses = []
+    for img_path, c2w in zip(img_list, poses):
+        try:
+            ts = float(Path(img_path).stem)
+        except ValueError:
+            raise ValueError(
+                f"Cannot extract timestamp from filename: {img_path}. "
+                "TUM images must be named by their timestamp."
             )
+        stamped_poses.append((ts, c2w))
 
-    print(f"Saved {len(poses)} poses to {args.output_file}")
+    out_path = Path(args.output_file).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    write_tum_trajectory(stamped_poses, out_path)
+    print(f"Saved {len(poses)} poses to {out_path}")
 
 
 if __name__ == "__main__":

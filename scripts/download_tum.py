@@ -106,6 +106,8 @@ def check_sequence(name: str, data_dir: Path) -> bool:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    """Download (or, with --check, verify) the requested sequences and print
+    a ready-to-paste benchmark command for what was downloaded."""
     parser = argparse.ArgumentParser(
         description="Download TUM RGB-D freiburg1 sequences"
     )
@@ -155,7 +157,7 @@ def main():
     if failed:
         print(f"Failed: {', '.join(failed)}")
 
-    print("\\nTo run the benchmark:")
+    print("\nTo run the benchmark:")
     seq_dirs = " \\\n              ".join(
         f"data/tum/rgbd_dataset_freiburg1_{n}" for n, _ in downloaded
     )

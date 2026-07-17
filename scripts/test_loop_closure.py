@@ -82,17 +82,17 @@ def main():
     print(f"  Verified closures: {len(closures)}")
     check("at least one closure found", len(closures) >= 1)
 
-    lc = closures[0]
-    check("matched against submap 0", lc.candidate.submap_idx_a == 0)
+    closure = closures[0]
+    check("matched against submap 0", closure.candidate.submap_idx_a == 0)
     check("distance below threshold",
-          lc.candidate.distance < config.distance_threshold)
-    check("LC submap has 2 frames", lc.lc_submap.n_frames == 2)
-    check("LC submap flagged", lc.lc_submap.is_lc_submap)
-    check("relative_b_to_a shape (4,4)", lc.relative_b_to_a.shape == (4, 4))
+          closure.candidate.distance < config.distance_threshold)
+    check("loop-closure submap has 2 frames", closure.reinference_submap.n_frames == 2)
+    check("loop-closure submap flagged", closure.reinference_submap.is_loop_closure_submap)
+    check("relative_b_to_a shape (4,4)", closure.relative_b_to_a.shape == (4, 4))
     # Same image pair → the relative pose should be near identity
-    identity_err = float(np.linalg.norm(lc.relative_b_to_a - np.eye(4)))
+    identity_err = float(np.linalg.norm(closure.relative_b_to_a - np.eye(4)))
     print(f"  |relative_b_to_a − I| = {identity_err:.4f}  "
-          f"confidence = {lc.lc_confidence:.3f}")
+          f"confidence = {closure.mean_confidence:.3f}")
     check("self-loop transform ≈ identity (err < 0.1)", identity_err < 0.1)
 
     # ── min_submaps_apart enforcement ─────────────────────────────────────────

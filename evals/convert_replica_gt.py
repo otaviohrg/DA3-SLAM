@@ -8,10 +8,14 @@ so evo_ape can associate estimated keyframe poses to the correct GT frames.
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation
+
+# The TUM trajectory writer lives in scripts/euroc_common.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from euroc_common import write_tum_trajectory  # noqa: E402
 
 
 def main():
@@ -33,21 +37,11 @@ def main():
                 raise ValueError(f"Expected 16 floats per line, got {len(vals)}")
             poses.append(np.array(vals).reshape(4, 4))
 
-    Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
-
-    with open(args.output_file, "w") as f:
-        f.write("# timestamp tx ty tz qx qy qz qw\n")
-        for i, c2w in enumerate(poses):
-            t = c2w[:3, 3]
-            q = Rotation.from_matrix(c2w[:3, :3]).as_quat()  # (qx, qy, qz, qw)
-            ts = i / args.fps
-            f.write(
-                f"{ts:.6f} "
-                f"{t[0]:.9f} {t[1]:.9f} {t[2]:.9f} "
-                f"{q[0]:.9f} {q[1]:.9f} {q[2]:.9f} {q[3]:.9f}\n"
-            )
-
-    print(f"Saved {len(poses)} poses to {args.output_file}")
+    out_path = Path(args.output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    write_tum_trajectory([(i / args.fps, c2w) for i, c2w in enumerate(poses)],
+                         out_path)
+    print(f"Saved {len(poses)} poses to {out_path}")
 
 
 if __name__ == "__main__":
