@@ -1,0 +1,77 @@
+# Shared base for every service (build, GPU, caches, source/data mounts).
+x-da3-common: &da3-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: da3-slam:latest
+  # GPU is required (DA3 + DINOv2/SALAD inference); needs the NVIDIA Container Toolkit.
+  gpus: all
+  environment:
+    NVIDIA_VISIBLE_DEVICES: all
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    # Keep model downloads (HF + torch.hub) inside the persisted cache volume.
+    HF_HOME: /cache/huggingface
+    TORCH_HOME: /cache/torch
+    # Live, unbuffered stdout so per-thread progress prints appear immediately
+    # (important for the live demo — block-buffering hides streaming activity).
+    PYTHONUNBUFFERED: "1"
+  working_dir: /app
+  # DA3 uses shared memory for dataloaders; bump above the 64MB default.
+  shm_size: "8gb"
+  volumes:
+    # Live source so scripts/config/da3_slam changes don't need a rebuild.
+    # (The image only COPYs da3_slam/; scripts/ and config/ are mounted here.)
+    - ./da3_slam:/app/da3_slam
+    - ./scripts:/app/scripts
+    - ./config:/app/config
+    - ./evals:/app/evals
+    # Datasets and results.
+    - ./data:/app/data
+    - ./outputs:/app/outputs
+    - ./logs:/app/logs
+    # Persist downloaded model weights across runs.
+    - model-cache:/cache
+
+services:
+  # Offline SLAM / benchmarks (interactive shell by default).
+  da3-slam:
+    <<: *da3-common
+    stdin_open: true
+    tty: true
+    command: ["python3"]
+
+  # Offline replay with a live Rerun viewer (see `make run-viz`): same as
+  # da3-slam but sharing the host network stack so the container reaches a
+  # Rerun viewer running on the host at 127.0.0.1:9876 (start it with
+  # `make viewer`). No USB/privileged needed — this is not the camera demo.
+  viz:
+    <<: *da3-common
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: ["python3"]
+
+  # Live RealSense demo with a Rerun viewer.
+  #   1. On the HOST:  pip install rerun-sdk && rerun     (viewer listens on :9876)
+  #   2. docker compose run --rm realsense \
+  #        python3 scripts/run_realsense.py --selection_mode disparity
+  # The container connects OUT to the host viewer via host.docker.internal.
+  realsense:
+    <<: *da3-common
+    # USB passthrough for the RealSense camera. `privileged` is the robust
+    # option (survives the camera re-enumerating on the bus); the explicit
+    # device mount is belt-and-suspenders.
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    # Share the host network stack so the container reaches a Rerun viewer
+    # running on the host directly at 127.0.0.1:9876 — avoids the
+    # host.docker.internal / docker-gateway reachability issues that silently
+    # drop the gRPC log stream. (Native-Linux Docker only.)
+    network_mode: host
+    stdin_open: true
+    tty: true
+    command: ["python3", "scripts/run_realsense.py", "--selection_mode", "disparity"]
+
+volumes:
+  model-cache:

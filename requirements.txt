@@ -1,6 +1,13 @@
 # Project dependencies
---extra-index-url https://download.pytorch.org/whl/cu124
-torch
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0
+torchvision
 numpy
+scipy
+pyyaml
+gtsam-develop
+pytorch_lightning
+pytorch_metric_learning
+trimesh
 hatchling
 editables

@@ -5,11 +5,30 @@ set -e  # Exit immediately if a command exits with a non-zero status
 echo "Installing base requirements..."
 uv pip install -r requirements.txt
 
-mkdir -p third_party
+# 1b. Optional live-demo requirements (RealSense + Rerun). Present in the Docker
+# image; skipped gracefully if the file was not copied in (e.g. local runs).
+if [ -f requirements-realsense.txt ]; then
+    echo "Installing RealSense demo requirements..."
+    uv pip install -r requirements-realsense.txt
+fi
+
+mkdir -p /opt/third_party
 
 # 3. Clone and install Depth Anything 3
 echo "Cloning and installing Depth Anything 3..."
-cd third_party
+cd /opt/third_party
 git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git
 uv pip install --no-build-isolation -e "./Depth-Anything-3[all]"
-cd ..
+cd -
+
+# 4. Clone and install SALAD
+echo "Cloning and installing Salad..."
+cd /opt/third_party
+git clone https://github.com/Dominic101/salad.git
+uv pip install -e ./salad
+uv pip install pytorch_lightning pytorch_metric_learning
+cd -
+
+# 5. Install da3_slam package
+echo "Installing da3_slam..."
+uv pip install -e /app

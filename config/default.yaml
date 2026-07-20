@@ -1,0 +1,119 @@
+# DA3-SLAM default hyperparameters
+# All values here are the authoritative defaults.
+# Override any key from the CLI: --submap_size 12, --loop_threshold 0.9, etc.
+
+# ── DA3 model ──────────────────────────────────────────────────────────────────
+depth_model: "depth-anything/DA3NESTED-GIANT-LARGE-1.1"
+depth_model_resolution: 504
+use_ray_pose: false  # use ray-based pose estimation instead of camera decoder
+
+# ── semantic embeddings (optional) ─────────────────────────────────────────────
+# Set to a HuggingFace CLIP model ID to enable open-vocabulary scene queries.
+# Requires: pip install transformers
+# Example: "openai/clip-vit-large-patch14"
+semantic_model: null
+
+# ── submap ─────────────────────────────────────────────────────────────────────
+submap_size: 16                # max keyframes per submap (including anchor overlap)
+submap_overlap: 1              # anchor keyframes shared between consecutive submaps.
+                                # 1 = single shared node (VGGT-SLAM style).  >= 2
+                                # measures the shared frame pair in both DA3 batches:
+                                # redundant boundary between-factor + consistency
+                                # check, so one bad anchor pose cannot silently
+                                # displace a whole submap (the live demo uses 2).
+
+# ── inter-submap scale chaining ────────────────────────────────────────────────
+# Each DA3 batch has its own metric scale; consecutive submaps are chained by
+# the median depth ratio at the shared anchor frame.  Ratio noise compounds
+# multiplicatively over boundaries (= scale drift on long sequences).  DA3
+# depth is nominally metric, so the true ratio should be near 1.0:
+boundary_scale_damping: 1.0    # g in [0,1]: each ratio is raised to (1-g).
+                                # 0 = full chaining; 1 = ignore ratios and trust
+                                # DA3's metric consistency (default — validated
+                                # by the UAS + TUM scale sweeps: -29% Sim3 ATE
+                                # on tunnels for a few mm on TUM, and better
+                                # SE3 ATE everywhere).
+boundary_scale_clamp: null     # c > 1 clamps each applied ratio to [1/c, c],
+                                # guarding against one bad boundary estimate.
+                                # null = off.
+boundary_scale_deadband: 0.0   # d > 0: ratios with max(r,1/r)-1 <= d are forced
+                                # to 1.0 (metric-consistent regime, as validated
+                                # by the sweeps), but ratios outside the band are
+                                # applied in FULL, ignoring damping — a genuine
+                                # per-batch metric scale break (live D455 runs
+                                # showed 2-6x jumps; the trajectory stretches and
+                                # the map rebuilds elsewhere).  The live demo
+                                # uses 0.25.  0 = off (damping behaviour only).
+
+# ── keyframe selection (Lucas-Kanade optical flow) ─────────────────────────────
+keyframe:
+  min_disparity_fraction: 0.10  # min mean flow as fraction of image width
+  max_submap_size: 20           # kept in sync with top-level submap_size
+  max_corners: 500              # goodFeaturesToTrack: number of corners
+  quality_level: 0.01           # goodFeaturesToTrack: minimum quality
+  min_distance: 8.0             # goodFeaturesToTrack: minimum corner distance (px)
+  block_size: 7                 # goodFeaturesToTrack: neighbourhood size for covariance matrix
+  flow_window_size: [21, 21]    # calcOpticalFlowPyrLK: window size
+  flow_pyramid_levels: 3        # calcOpticalFlowPyrLK: pyramid levels
+  flow_stop_criteria: [3, 30, 0.01]  # calcOpticalFlowPyrLK: [type(EPS|COUNT=3), maxCount, epsilon]
+  flow_downsample_factor: 1     # downsample before flow; reduces cost ~factor^2 with negligible accuracy loss
+
+  # Selection policy: "disparity" (frame-level threshold, VGGT-SLAM-style) or
+  # "segment" (segment-level density control, Choi et al. IEEE Access 2026).
+  selection_mode: segment
+  segment_length: 128                # N_S: frames per non-overlapping segment
+  segment_disparity_threshold: 650.0 # tau_seg: accumulated flow (px) -> dense stride
+  segment_strides: [8, 16]           # (a, b): dense stride if D_seg > tau_seg, else sparse
+
+  # Blur gating (motion blur poisons DA3 poses, descriptors and re-inference
+  # at once; fast motion still yields sharp frames at direction reversals):
+  sharpness_window: 0        # segment mode: swap each stride-picked keyframe for
+                             # the sharpest frame within ±window (Laplacian
+                             # variance).  0 = off.  The live demo uses 2.
+  min_sharpness_ratio: 0.0   # disparity mode: defer a keyframe whose sharpness is
+                             # below this fraction of the recent median (the
+                             # max_submap_size force still applies).  0 = off.
+                             # The live demo uses 0.5.
+
+# ── point cloud filtering ──────────────────────────────────────────────────────
+confidence_percentile: 65.0    # global confidence percentile threshold (0-100)
+                                # higher = fewer but cleaner points
+
+# ── pose graph noise ───────────────────────────────────────────────────────────
+# SL(4) noise is 15-dimensional (isotropic scalar applied to all 15 dims).
+# Mirrors VGGT-SLAM's noise configuration exactly.
+noise:
+  prior_sigma: 1.0e-6   # very tight anchor on the first keyframe
+  between_sigma: 0.05   # inner-submap consecutive-frame between factors
+  loop_sigma: 0.05      # loop closure between factors
+  loop_huber_k: 1.345   # Huber M-estimator k on loop factors: a wrong closure
+                        # (perceptual aliasing) is down-weighted instead of
+                        # warping the map.  null = plain Gaussian.
+  between_huber_k: null # Huber k on odometry between factors.  Only acts where
+                        # the graph has redundancy (overlap>=2 boundary pairs,
+                        # loop-closure cycles): a broken boundary measurement
+                        # then absorbs its own error instead of deforming the
+                        # whole cycle (side-by-side ghost copies of revisited
+                        # geometry).  The live demo uses 1.345.  null = off.
+
+# ── loop closure ───────────────────────────────────────────────────────────────
+loop_closure:
+  enable: true
+  distance_threshold: 0.45     # DINO-SALAD L2 distance to flag a frame-level candidate
+                                # (benchmark-tuned; the live RealSense demo overrides
+                                # to 0.55 — see run_realsense.py)
+  min_submaps_apart: 1          # minimum index gap to consider a loop
+  max_loop_closures: 1          # top-K candidates kept per submap (priority queue)
+  min_confidence_ratio: 0.3     # minimum mean DA3 confidence (over the two matched
+                                # frames) to accept a closure
+  context_frames: 1             # temporal neighbours per matched frame included in
+                                # the verification re-inference (0 = pair only);
+                                # multi-view support conditions both the relative
+                                # pose and the confidence gate
+  max_rotation_error_deg: 90.0  # geometric gate: reject closures whose measured
+                                # relative pose disagrees with the graph prediction
+                                # by more than this rotation (null = off)
+  max_translation_error: null   # same gate on translation discrepancy (global
+                                # metric units, ~m).  Keep well above worst
+                                # plausible drift; the RealSense demo uses 3.0.
+                                # null = off.
