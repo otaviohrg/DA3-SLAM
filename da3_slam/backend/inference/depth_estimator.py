@@ -10,6 +10,8 @@ a consistent, pipeline-friendly format:
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -117,6 +119,27 @@ class DepthEstimator:
         self.model.eval()
         print("[DepthEstimator] Ready.")
 
+        # Backbone (DA3 forward) instrumentation — the isolated cost of the
+        # model, split out from the surrounding preprocessing / point-cloud
+        # work that the pipeline's `submap_building` timer also covers.
+        # Accumulated across every infer() call: the main-path submap builds
+        # and the loop-closure re-inferences share this one estimator, so both
+        # threads update these under a lock.  reset_stats() zeros them at the
+        # start of each run (the model is reused across runs by SharedSLAM).
+        self._stats_lock = threading.Lock()
+        self.backbone_seconds: float = 0.0
+        self.n_infer_calls: int = 0
+        self.peak_memory_bytes: int = 0
+
+    def reset_stats(self) -> None:
+        """Zero the backbone timing / peak-memory accumulators.  Call once at
+        the start of a run — the heavy model persists across runs, but its
+        per-run cost does not."""
+        with self._stats_lock:
+            self.backbone_seconds = 0.0
+            self.n_infer_calls = 0
+            self.peak_memory_bytes = 0
+
     @torch.no_grad()
     def infer(self, images: list[str | np.ndarray]) -> DepthPrediction:
         """
@@ -130,8 +153,27 @@ class DepthEstimator:
         Returns:
             DepthPrediction with normalised outputs
         """
+        # Time and peak-memory the backbone forward in isolation.  synchronize()
+        # brackets the async GPU work so the wall-clock is the true forward
+        # time, not the kernel-launch return; peak memory is reset per call and
+        # kept as the max across calls (memory is a high-water mark, not a sum).
+        on_cuda = self.device.type == "cuda"
+        if on_cuda:
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+        t0 = time.perf_counter()
         raw = self.model.inference(images, process_res=self.process_resolution,
                                    use_ray_pose=self.use_ray_pose)
+        if on_cuda:
+            torch.cuda.synchronize(self.device)
+        elapsed = time.perf_counter() - t0
+
+        peak = int(torch.cuda.max_memory_allocated(self.device)) if on_cuda else 0
+        with self._stats_lock:
+            self.backbone_seconds += elapsed
+            self.n_infer_calls += 1
+            self.peak_memory_bytes = max(self.peak_memory_bytes, peak)
 
         depth = raw.depth.astype(np.float32)           # (N, H, W)
         confidence = _normalize_confidence(raw.conf.astype(np.float32))  # (N, H, W) → [0,1]

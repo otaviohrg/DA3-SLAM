@@ -54,7 +54,10 @@ from scipy.spatial.transform import Rotation
 from da3_slam.config import SLAMConfig, load_slam_config
 from da3_slam.frontend.keyframe_selector import (
     OnlineKeyframeSelector,
+    ReplayKeyframeSelector,
     SegmentKeyframeSelector,
+    load_keyframe_list,
+    save_keyframe_list,
 )
 from da3_slam.backend.inference.depth_estimator import DepthEstimator
 from da3_slam.backend.inference.submap import Submap, SubmapBuilder, transform_points
@@ -89,6 +92,14 @@ class SLAMResult:
 
     # Wall-clock timing breakdown
     timings: dict[str, float]
+
+    # Backbone (DA3 forward) instrumentation for the whole run, read from the
+    # DepthEstimator: cumulative forward wall-clock (s), number of forward
+    # calls, and the peak GPU memory of a single forward (bytes).  Backbone-
+    # only latency + peak memory are two of the sweep's headline axes.
+    backbone_seconds: float = 0.0
+    backbone_calls: int = 0
+    peak_gpu_mem_bytes: int = 0
 
     @property
     def n_keyframes(self) -> int:
@@ -758,6 +769,10 @@ class DA3SLAM:
         used to drive a live viewer.  See SLAMUpdate for the threading and
         error-handling contract.
         """
+        # Zero the backbone timing / peak-memory counters for this run (the
+        # model — and thus the estimator — is reused across runs).
+        self.estimator.reset_stats()
+
         loop_closure_done = threading.Event()
         if self.detector is None:
             loop_closure_done.set()  # no loop-closure thread — event is immediately done
@@ -813,7 +828,12 @@ class DA3SLAM:
         if ctx.backend_error is not None:
             raise ctx.backend_error
 
-        self._print_timing_breakdown(ctx.timings, wall_elapsed)
+        self._print_timing_breakdown(
+            ctx.timings, wall_elapsed,
+            backbone_seconds=self.estimator.backbone_seconds,
+            backbone_calls=self.estimator.n_infer_calls,
+            peak_gpu_mem_bytes=self.estimator.peak_memory_bytes,
+        )
 
         return SLAMResult(
             keyframe_poses=_build_keyframe_poses(
@@ -822,10 +842,19 @@ class DA3SLAM:
             optimization=ctx.optimization_result,
             loop_closures=ctx.loop_closures,
             timings=ctx.timings,
+            backbone_seconds=self.estimator.backbone_seconds,
+            backbone_calls=self.estimator.n_infer_calls,
+            peak_gpu_mem_bytes=self.estimator.peak_memory_bytes,
         )
 
     @staticmethod
-    def _print_timing_breakdown(timings: dict[str, float], wall_elapsed: float) -> None:
+    def _print_timing_breakdown(
+        timings: dict[str, float],
+        wall_elapsed: float,
+        backbone_seconds: float = 0.0,
+        backbone_calls: int = 0,
+        peak_gpu_mem_bytes: int = 0,
+    ) -> None:
         col = max(len(k) for k in timings)
         tag = f"[{threading.current_thread().name}]"
         print(f"{tag} Timing breakdown (per-module compute time, threads overlap):")
@@ -834,6 +863,11 @@ class DA3SLAM:
         print(f"  {'':-<{col + 9}}")
         print(f"  {'compute total':<{col}}  {sum(timings.values()):6.1f}s")
         print(f"  {'wall-clock':<{col}}  {wall_elapsed:6.1f}s")
+        # Backbone-only figures: the isolated DA3 forward cost (a subset of
+        # submap_building / loop_closure) plus the peak GPU memory of one call.
+        print(f"  {'backbone fwd':<{col}}  {backbone_seconds:6.1f}s "
+              f"({backbone_calls} calls, "
+              f"peak {peak_gpu_mem_bytes / 1e6:.0f} MB)")
 
     # ── frontend thread ───────────────────────────────────────────────────────
 
@@ -845,13 +879,35 @@ class DA3SLAM:
         batch shares its last keyframe with the next batch (the anchor frame)
         — see the module docstring.
         """
-        segment_mode = ctx.config.keyframe.selection_mode == "segment"
-        if segment_mode:
+        # Replay mode (frozen keyframes) bypasses optical-flow selection and
+        # emits exactly the recorded seq_idxs, so two configs are compared on
+        # byte-identical frames.  It shares segment mode's list-returning
+        # step()/flush() interface, so both take the `list_mode` path.
+        if ctx.config.keyframes_from:
+            selector = ReplayKeyframeSelector(
+                load_keyframe_list(ctx.config.keyframes_from))
+            list_mode = True
+        elif ctx.config.keyframe.selection_mode == "segment":
             selector = SegmentKeyframeSelector(ctx.config.keyframe)
+            list_mode = True
         else:
             selector = OnlineKeyframeSelector(ctx.config.keyframe)
+            list_mode = False
         batcher = _KeyframeBatcher(ctx.config.submap_size,
                                    _effective_overlap(ctx.config))
+
+        # (seq_idx, label) of every selected keyframe, accumulated only when
+        # --dump_keyframes is set (frozen-keyframe capture).
+        keyframe_log: list[tuple[int, str]] | None = (
+            [] if ctx.config.dump_keyframes else None)
+
+        def emit(new_keyframes: list[tuple[str, np.ndarray, int]]) -> None:
+            for label, image, seq_idx in new_keyframes:
+                if keyframe_log is not None:
+                    keyframe_log.append((seq_idx, label))
+                batch = batcher.add(label, image, seq_idx)
+                if batch is not None:
+                    _blocking_put(ctx, ctx.batch_queue, batch)
 
         try:
             for image, seq_idx, label in frame_source:
@@ -859,33 +915,31 @@ class DA3SLAM:
                     break
 
                 t0 = time.time()
-                if segment_mode:
+                if list_mode:
                     new_keyframes = selector.step(image, seq_idx, label)
                 else:
                     new_keyframes = (
                         [(label, image, seq_idx)] if selector.step(image) else []
                     )
                 ctx.timings["keyframe_selection"] += time.time() - t0
+                emit(new_keyframes)
 
-                for keyframe in new_keyframes:
-                    batch = batcher.add(*keyframe)
-                    if batch is not None:
-                        _blocking_put(ctx, ctx.batch_queue, batch)
-
-            # Drain the final partial segment (segment mode only).
-            if segment_mode and ctx.backend_error is None:
+            # Drain the final partial segment (list-mode selectors only).
+            if list_mode and ctx.backend_error is None:
                 t0 = time.time()
                 tail_keyframes = selector.flush()
                 ctx.timings["keyframe_selection"] += time.time() - t0
-                for keyframe in tail_keyframes:
-                    batch = batcher.add(*keyframe)
-                    if batch is not None:
-                        _blocking_put(ctx, ctx.batch_queue, batch)
+                emit(tail_keyframes)
 
             # Flush the final partial batch.
             tail_batch = batcher.tail()
             if tail_batch is not None and ctx.backend_error is None:
                 _blocking_put(ctx, ctx.batch_queue, tail_batch)
+
+            # Persist the selected keyframe list once the stream is fully
+            # consumed (skip on error — the list would be truncated).
+            if keyframe_log is not None and ctx.backend_error is None:
+                save_keyframe_list(ctx.config.dump_keyframes, keyframe_log)
         except Exception as exc:
             ctx.backend_error = exc
         finally:

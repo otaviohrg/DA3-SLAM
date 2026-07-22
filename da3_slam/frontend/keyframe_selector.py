@@ -20,7 +20,9 @@ Learning-Based Dense Monocular SLAM" (IEEE Access 2026).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -309,6 +311,65 @@ class SegmentKeyframeSelector:
             substituted.append(best)
             previous = best
         return substituted
+
+
+# ── replay selector (frozen keyframes) ────────────────────────────────────────
+
+class ReplayKeyframeSelector:
+    """Deterministic replay of a pre-recorded keyframe list.
+
+    Emits a frame as a keyframe iff its seq_idx is in the frozen list,
+    bypassing optical-flow selection entirely.  Two runs replaying the same
+    list therefore see byte-identical keyframes, so any difference in the
+    result comes from the network config, not from selection drift — the
+    controlled-comparison foundation for the resolution / model-size sweeps.
+
+    Shares the list-returning ``step()`` / ``flush()`` interface with
+    SegmentKeyframeSelector so the frontend treats them uniformly.
+    """
+
+    def __init__(self, seq_indices: Iterable[int]):
+        self._wanted: set[int] = {int(i) for i in seq_indices}
+        self.last_disparity: float = 0.0
+
+    def step(self, image: np.ndarray, seq_idx: int, label: str) \
+            -> list[tuple[str, np.ndarray, int]]:
+        if seq_idx in self._wanted:
+            return [(label, image, seq_idx)]
+        return []
+
+    def flush(self) -> list[tuple[str, np.ndarray, int]]:
+        return []
+
+
+def save_keyframe_list(
+    path: str | Path, keyframes: Iterable[tuple[int, str]]
+) -> None:
+    """Write a frozen keyframe list (one ``seq_idx<TAB>label`` line per
+    keyframe).  The label is provenance only — replay keys on seq_idx."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("# DA3-SLAM frozen keyframe list — one selected keyframe per line.\n")
+        f.write("# seq_idx<TAB>label  (replay keys on seq_idx; label is provenance)\n")
+        for seq_idx, label in keyframes:
+            f.write(f"{int(seq_idx)}\t{label}\n")
+
+
+def load_keyframe_list(path: str | Path) -> list[int]:
+    """Read the seq_idxs from a file written by save_keyframe_list.
+
+    Tolerates blank lines and ``#`` comments; each remaining line's first
+    whitespace-separated token is the seq_idx.
+    """
+    seq_indices: list[int] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            seq_indices.append(int(line.split()[0]))
+    return seq_indices
 
 
 # ── batch selector ────────────────────────────────────────────────────────────

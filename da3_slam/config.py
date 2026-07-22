@@ -170,6 +170,14 @@ class SLAMConfig:
     # every Frame, cutting resident memory per keyframe ~3x.
     build_pointclouds: bool = True
 
+    # Frozen-keyframe harness (runtime flags, not read from YAML; set by the
+    # CLI in run_slam.py / da3_runner.py).  keyframes_from replays exactly the
+    # recorded keyframe seq_idxs, bypassing optical-flow selection so two
+    # configs are compared on byte-identical frames; dump_keyframes writes the
+    # selected list after the run.  See da3_slam.frontend.keyframe_selector.
+    keyframes_from: str | None = None
+    dump_keyframes: str | None = None
+
 
 def load_slam_config(
     yaml_path: str | Path = DEFAULT_YAML,

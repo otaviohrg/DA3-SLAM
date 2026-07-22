@@ -45,6 +45,15 @@ def parse_args(yaml_config: dict) -> argparse.Namespace:
     parser.add_argument("--max_frames", type=int, default=None,
                         help="Cap the number of input frames (for quick tests)")
 
+    # ── frozen-keyframe harness (Step 0a) ─────────────────────────────────────
+    parser.add_argument("--dump_keyframes", default=None,
+                        help="Write the selected keyframe seq_idx list here "
+                             "after the run (frozen-keyframe capture)")
+    parser.add_argument("--keyframes_from", default=None,
+                        help="Replay exactly this keyframe list, bypassing "
+                             "optical-flow selection (byte-identical frames "
+                             "across configs)")
+
     # ── DA3 model ─────────────────────────────────────────────────────────────
     parser.add_argument("--depth_model", default=yaml_config.get("depth_model"),
                         help="DA3 model ID")
@@ -147,6 +156,8 @@ def build_config(args: argparse.Namespace) -> SLAMConfig:
         config.keyframe.segment_length = args.segment_length
     if args.segment_threshold is not None:
         config.keyframe.segment_disparity_threshold = args.segment_threshold
+    config.keyframes_from = args.keyframes_from
+    config.dump_keyframes = args.dump_keyframes
     return config
 
 

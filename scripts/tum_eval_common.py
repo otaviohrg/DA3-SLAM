@@ -54,6 +54,50 @@ class SharedSLAM:
         from da3_slam.slam import DA3SLAM
         self._slam = DA3SLAM(base_config)
 
+    @property
+    def config(self):
+        """The live SLAMConfig (resolved backbone/resolution, mutable)."""
+        return self._slam.config
+
+    def set_keyframe_io(self, keyframes_from=None, dump_keyframes=None) -> None:
+        """Point the next run's frozen-keyframe replay/dump at these paths.
+
+        Set per sequence by the benchmark loop so each sequence gets its own
+        keyframe list (the model, and hence this config, is reused across
+        sequences).  None disables the corresponding side.
+        """
+        self._slam.config.keyframes_from = keyframes_from
+        self._slam.config.dump_keyframes = dump_keyframes
+
+    def set_resolution(self, resolution: int) -> None:
+        """Change the DA3 processing resolution without reloading the model.
+
+        Resolution is just the ``process_res`` argument to DA3's forward, held
+        on the DepthEstimator — which ``reconfigure`` does NOT rebuild — so a
+        resolution sweep reuses one loaded model across all resolutions of a
+        given size.  (Model *size* is a different checkpoint and still needs a
+        fresh SharedSLAM.)
+        """
+        self._slam.estimator.process_resolution = int(resolution)
+        self._slam.config.depth_model_resolution = int(resolution)
+
+    def set_build_pointclouds(self, flag: bool) -> None:
+        """Enable/disable per-frame point clouds (needed for the map-detail
+        proxy).  Rebuilds the SubmapBuilder, which fixes the flag at
+        construction; the loaded model is untouched."""
+        from da3_slam.backend.inference.submap import SubmapBuilder
+        self._slam.config.build_pointclouds = bool(flag)
+        self._slam.builder = SubmapBuilder(
+            self._slam.estimator,
+            confidence_percentile=self._slam.config.confidence_percentile,
+            build_pointclouds=bool(flag))
+        # The detector shares the builder; point it at the new one rather than
+        # rebuilding (a rebuild would reload DINO-SALAD via torch.hub).
+        if self._slam.detector is not None:
+            self._slam.detector.builder = self._slam.builder
+        elif self._slam.config.enable_loop_closure:
+            self._slam.detector = self._make_detector()
+
     def reconfigure(self, config) -> None:
         """Swap in a new config without reloading the depth model."""
         from da3_slam.backend.inference.submap import SubmapBuilder
@@ -67,13 +111,21 @@ class SharedSLAM:
         self._slam.detector = self._make_detector()
 
     def run(self, image_paths: list[str], on_update=None, on_loop_closure=None):
-        """Run SLAM, resetting the loop-closure detector between sequences
-        so descriptors from a previous sequence don't produce cross-sequence
-        loop closures with stale indices.  `on_update` / `on_loop_closure`
-        are forwarded to DA3SLAM.run (per-submap live-viewer hook and
-        pre-optimisation loop-closure hook; see SLAMUpdate and
-        _RunContext.on_loop_closure)."""
-        self._slam.detector = self._make_detector()
+        """Run SLAM, clearing the loop-closure detector's per-sequence state
+        between sequences so descriptors from a previous sequence don't produce
+        cross-sequence loop closures with stale indices.  `on_update` /
+        `on_loop_closure` are forwarded to DA3SLAM.run (per-submap live-viewer
+        hook and pre-optimisation loop-closure hook; see SLAMUpdate and
+        _RunContext.on_loop_closure).
+
+        The detector is *reset*, not rebuilt: rebuilding reloads DINO-SALAD,
+        which re-validates DINOv2 against GitHub via torch.hub and can kill a
+        long sweep on a transient 504.  It is built once, on first use.
+        """
+        if self._slam.detector is not None:
+            self._slam.detector.reset()
+        elif self._slam.config.enable_loop_closure:
+            self._slam.detector = self._make_detector()
         return self._slam.run(image_paths, on_update=on_update,
                               on_loop_closure=on_loop_closure)
 

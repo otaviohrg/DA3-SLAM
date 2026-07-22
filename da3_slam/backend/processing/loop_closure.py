@@ -178,6 +178,20 @@ class LoopClosureDetector:
 
         self._model = self._load_salad_model()
 
+    def reset(self) -> None:
+        """Clear all per-sequence state — seen submaps, the per-frame
+        descriptor index, and the loop-closure submap counter — while keeping
+        the loaded DINO-SALAD model.
+
+        Lets one detector be reused across sequences (e.g. SharedSLAM in the
+        benchmark/sweep drivers) instead of being rebuilt: rebuilding reloads
+        DINO-SALAD, which re-validates DINOv2 against GitHub through torch.hub
+        and can fail mid-run on a transient network error.
+        """
+        self._submaps.clear()
+        self._frame_descriptors.clear()
+        self._next_loop_closure_idx = -1
+
     def _load_salad_model(self) -> torch.nn.Module:
         """Load DINO-SALAD, downloading the checkpoint on first use."""
         print("[LoopClosure] Loading DINO-SALAD...")
