@@ -447,13 +447,62 @@ def _detect_points(
     return points  # shape (N, 1, 2) or None
 
 
-def _compute_disparity(
+def keyframe_flow(
+    image_a: np.ndarray,
+    image_b: np.ndarray,
+    config: KeyframeSelectorConfig,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optical flow between two full-resolution RGB frames.
+
+    Wraps the gate's own machinery (same corners, same LK settings, same
+    downsampled flow resolution) so the motion signal recorded for the
+    redundancy study is the one the pipeline reasons with — but computed for an
+    arbitrary *pair*, which the gate cannot provide: segment mode's
+    equal-stride fast path skips optical flow entirely, and replay mode
+    computes none at all.
+
+    Returns:
+        points:        (M, 2) float32 — corner positions in `image_a`, in
+                       flow-resolution pixels (see `flow_downsample_factor`)
+        displacements: (M, 2) float32 — displacement of each corner into `image_b`
+        mean:          float — mean displacement magnitude in px (0.0 when
+                       nothing could be tracked)
+    """
+    gray_a = _to_flow_gray(image_a, config.flow_downsample_factor)
+    gray_b = _to_flow_gray(image_b, config.flow_downsample_factor)
+    points = _detect_points(gray_a, config)
+    if points is None or len(points) == 0:
+        empty = np.zeros((0, 2), dtype=np.float32)
+        return empty, empty, 0.0
+
+    points, displacements = compute_disparity_field(gray_a, gray_b, points, config)
+    mean = (float(np.linalg.norm(displacements, axis=-1).mean())
+            if len(displacements) else 0.0)
+    return points, displacements, mean
+
+
+def compute_disparity_field(
     reference_gray: np.ndarray,
     current_gray: np.ndarray,
     reference_points: np.ndarray,
     config: KeyframeSelectorConfig,
-) -> float:
-    """Track reference_points into current_gray; return mean displacement (px)."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Track reference_points into current_gray and return the displacement field.
+
+    The gate itself only needs the mean, but WHERE things moved is the signal
+    motion-guided token reuse (Branch C) is built on, so it is exposed here for
+    the redundancy study (`scripts/dump_tokens.py`) rather than thrown away.
+
+    Returns:
+        points:        (M, 2) float32 — tracked corner positions in the
+                       reference (flow-resolution) image
+        displacements: (M, 2) float32 — per-corner displacement in pixels
+        Both are empty when nothing could be tracked.
+    """
+    empty = np.zeros((0, 2), dtype=np.float32)
+
     tracked_points, status, _ = cv2.calcOpticalFlowPyrLK(
         reference_gray,
         current_gray,
@@ -465,13 +514,28 @@ def _compute_disparity(
     )
 
     if tracked_points is None or status is None:
-        return 0.0
+        return empty, empty
 
     good = status.ravel().astype(bool)
     if good.sum() == 0:
-        return 0.0
+        return empty, empty
 
-    displacement = np.linalg.norm(
-        tracked_points[good] - reference_points[good], axis=-1
-    )  # (M,)
-    return float(displacement.mean())
+    points = reference_points[good].reshape(-1, 2).astype(np.float32)
+    displacements = (
+        tracked_points[good].reshape(-1, 2).astype(np.float32) - points
+    )
+    return points, displacements
+
+
+def _compute_disparity(
+    reference_gray: np.ndarray,
+    current_gray: np.ndarray,
+    reference_points: np.ndarray,
+    config: KeyframeSelectorConfig,
+) -> float:
+    """Track reference_points into current_gray; return mean displacement (px)."""
+    _, displacements = compute_disparity_field(
+        reference_gray, current_gray, reference_points, config)
+    if len(displacements) == 0:
+        return 0.0
+    return float(np.linalg.norm(displacements, axis=-1).mean())

@@ -19,6 +19,8 @@ import torch
 
 from depth_anything_3.api import DepthAnything3
 
+from da3_slam.backend.inference.token_tap import EncoderTokenTap
+
 
 @dataclass
 class DepthPrediction:
@@ -38,6 +40,12 @@ class DepthPrediction:
 
     # (N, H, W, 3) uint8 — images at DA3's processed resolution
     processed_images: np.ndarray
+
+    # Per-frame encoder tokens (N tensors of shape (n_tokens, dim)), present
+    # only when infer(capture_tokens=True) asked for them — the Branch C
+    # temporal-redundancy study.  Left off the normal path so nothing else
+    # pays for it.
+    tokens: list[torch.Tensor] | None = None
 
     @property
     def n_frames(self) -> int:
@@ -131,6 +139,10 @@ class DepthEstimator:
         self.n_infer_calls: int = 0
         self.peak_memory_bytes: int = 0
 
+        # Encoder-token tap (Branch C); created on first use so the normal
+        # pipeline never registers the hooks.
+        self._token_tap: EncoderTokenTap | None = None
+
     def reset_stats(self) -> None:
         """Zero the backbone timing / peak-memory accumulators.  Call once at
         the start of a run — the heavy model persists across runs, but its
@@ -140,8 +152,26 @@ class DepthEstimator:
             self.n_infer_calls = 0
             self.peak_memory_bytes = 0
 
+    def token_tap(self) -> EncoderTokenTap:
+        """
+        The attached encoder-token tap (created and attached on first call).
+
+        Only diagnostic code (Branch C) needs this; the hooks are inert for any
+        thread that has not armed them, so leaving them attached is harmless.
+        """
+        if self._token_tap is None:
+            self._token_tap = EncoderTokenTap(self.model).attach()
+            print(f"[DepthEstimator] token tap — {self._token_tap.info.describe()}")
+        return self._token_tap
+
     @torch.no_grad()
-    def infer(self, images: list[str | np.ndarray]) -> DepthPrediction:
+    def infer(
+        self,
+        images: list[str | np.ndarray],
+        *,
+        capture_tokens: bool = False,
+        inject_tokens: dict[int, torch.Tensor] | None = None,
+    ) -> DepthPrediction:
         """
         Run DA3 on a batch of images.
 
@@ -149,10 +179,17 @@ class DepthEstimator:
             images: list of file paths (recommended) or HxWx3 uint8 numpy arrays.
                     Note: numpy array inputs may trigger CUDA nvrtc JIT compilation
                     on small batches; prefer file paths in the pipeline.
+            capture_tokens: also return each frame's encoder tokens (Branch C).
+            inject_tokens:  {frame index in this batch: (n_tokens, dim) tensor} —
+                    reuse those tokens instead of encoding the frame.  The frame
+                    must be the same image the tokens were captured from; the
+                    encoder prefix is frame-independent, so this is exact.
 
         Returns:
             DepthPrediction with normalised outputs
         """
+        tapped = capture_tokens or inject_tokens is not None
+
         # Time and peak-memory the backbone forward in isolation.  synchronize()
         # brackets the async GPU work so the wall-clock is the true forward
         # time, not the kernel-launch return; peak memory is reset per call and
@@ -163,8 +200,16 @@ class DepthEstimator:
             torch.cuda.reset_peak_memory_stats(self.device)
 
         t0 = time.perf_counter()
-        raw = self.model.inference(images, process_res=self.process_resolution,
-                                   use_ray_pose=self.use_ray_pose)
+        if tapped:
+            tap = self.token_tap()
+            with tap.armed(capture=capture_tokens, inject=inject_tokens):
+                raw = self.model.inference(images, process_res=self.process_resolution,
+                                           use_ray_pose=self.use_ray_pose)
+                captured = tap.captured
+        else:
+            captured = None
+            raw = self.model.inference(images, process_res=self.process_resolution,
+                                       use_ray_pose=self.use_ray_pose)
         if on_cuda:
             torch.cuda.synchronize(self.device)
         elapsed = time.perf_counter() - t0
@@ -186,6 +231,7 @@ class DepthEstimator:
             extrinsics=extrinsics,
             intrinsics=intrinsics,
             processed_images=raw.processed_images,
+            tokens=captured,
         )
 
 
