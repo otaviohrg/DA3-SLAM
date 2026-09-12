@@ -290,6 +290,19 @@ def _run_one(model, seq_dir: Path, args: Namespace, repeat: int,
     return row
 
 
+def gt_path_length(gt_poses: list) -> float:
+    """Total distance travelled along a list of 4x4 ground-truth poses (m).
+
+    Summed over the *matched* GT poses — the ones ATE is actually computed
+    over — so `ate / path_length` is a like-for-like ratio.
+    """
+    import numpy as np
+    positions = np.asarray([np.asarray(T)[:3, 3] for T in gt_poses], dtype=float)
+    if len(positions) < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
+
+
 def _score(est_ts_to_pose: dict, gt_all: list, seq_name: str,
            timings: dict, counts: dict, dataset: str = "tum",
            max_diff: float = 0.02) -> dict | None:
@@ -309,6 +322,9 @@ def _score(est_ts_to_pose: dict, gt_all: list, seq_name: str,
     drop = ("per_frame_errors", "align_T", "per_frame_trans", "per_frame_rot")
     return {
         "system": "DA3-SLAM", "dataset": dataset, "sequence": seq_name,
+        # Ground-truth path length over the poses actually evaluated, so ATE can
+        # be reported as a fraction of distance travelled (km-scale datasets).
+        "gt_path_length_m": gt_path_length(gt_m),
         "n_frames": timings.get("n_frames"),
         "n_keyframes": counts.get("n_keyframes"),
         "n_submaps": counts.get("n_submaps"),

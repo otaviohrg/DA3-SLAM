@@ -81,6 +81,20 @@ class SharedSLAM:
         self._slam.estimator.process_resolution = int(resolution)
         self._slam.config.depth_model_resolution = int(resolution)
 
+    def set_token_merging(self, config) -> None:
+        """Turn cross-view token merging on/off (or reconfigure) between runs.
+
+        Like set_resolution, this touches only the DepthEstimator, which
+        ``reconfigure`` does NOT rebuild — so a merged-vs-unmerged sweep reuses
+        one loaded model.  Passing a config with ``enable=False`` (or None)
+        detaches the wrapper completely, so the "off" arm of the A/B is
+        bit-identical to an untouched backbone.
+        """
+        from da3_slam.config import TokenMergingConfig
+        config = config if config is not None else TokenMergingConfig()
+        self._slam.config.token_merging = config
+        self._slam.estimator.set_token_merging(config)
+
     def set_build_pointclouds(self, flag: bool) -> None:
         """Enable/disable per-frame point clouds (needed for the map-detail
         proxy).  Rebuilds the SubmapBuilder, which fixes the flag at

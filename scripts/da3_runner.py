@@ -36,7 +36,12 @@ from pathlib import Path
 import numpy as np
 
 import benchmark_common as bc
-from da3_slam.config import DEFAULT_YAML, load_slam_config
+from da3_slam.config import (
+    DEFAULT_YAML,
+    add_token_merging_cli,
+    apply_token_merging_cli,
+    load_slam_config,
+)
 from trajectory_snapshots import TrajectorySnapshotter
 from tum_eval_common import SharedSLAM
 
@@ -147,6 +152,16 @@ def add_da3_cli(parser) -> None:
                              "max(r,1/r)-1 <= d are forced to 1.0, ratios "
                              "outside are applied in full (0 = off)")
 
+    parser.add_argument("--backbone_dtype", choices=["fp32", "bf16"], default=None,
+                        help="ViT backbone weight precision (default: YAML). "
+                             "bf16 cuts peak GPU memory ~40%%")
+    parser.add_argument("--submap_skip_strides", type=int, nargs="*", default=None,
+                        help="Extra within-submap between-factors linking frames "
+                             "k apart (e.g. 2 4 8); [] = consecutive only")
+
+    # cross-view token merging (the merged-vs-unmerged A/B)
+    add_token_merging_cli(parser)
+
     # model
     parser.add_argument("--depth_model", default=None)
     parser.add_argument("--depth_model_resolution", type=int, default=None)
@@ -199,6 +214,7 @@ def build_config(args: Namespace):
         confidence_percentile=args.confidence_percentile,
         depth_model=resolve_model_alias(args.depth_model),
         depth_model_resolution=args.depth_model_resolution,
+        backbone_dtype=args.backbone_dtype,
         boundary_scale_damping=args.boundary_scale_damping,
         boundary_scale_clamp=args.boundary_scale_clamp,
         boundary_scale_deadband=args.boundary_scale_deadband,
@@ -239,6 +255,9 @@ def build_config(args: Namespace):
         config.keyframe.sharpness_window = args.sharpness_window
     if args.min_sharpness_ratio is not None:
         config.keyframe.min_sharpness_ratio = args.min_sharpness_ratio
+    if getattr(args, "submap_skip_strides", None) is not None:
+        config.submap_skip_strides = tuple(args.submap_skip_strides)
+    apply_token_merging_cli(config, args)
     return config
 
 
@@ -387,6 +406,7 @@ def run_benchmark(
     title: str,
     headline: str = "sim3",
     item_label: str = "Sequence",
+    name_fn=None,
 ) -> None:
     """Shared main() loop for the benchmark_*.py drivers.
 
@@ -394,13 +414,21 @@ def run_benchmark(
     model)` for each entry of `seq_paths` (a failing sequence is reported and
     skipped, never fatal), then prints the cross-sequence summary and writes
     <out_dir>/<dataset>_summary.json.
+
+    `name_fn(seq_dir) -> str` names the per-sequence output directory; it
+    defaults to the directory's own name.  Datasets whose leaf directories are
+    NOT unique must override it — 7-Scenes has a `seq-01` under every scene, so
+    all seven would otherwise write into the same output directory and
+    overwrite one another.
     """
     model = load_da3_model(args)
+    name_fn = name_fn or (lambda p: p.name)
     all_metrics = []
     for seq_path in seq_paths:
         seq_dir = Path(seq_path)
-        out_dir = Path(args.out_dir) / seq_dir.name
-        print(f"\n{'═'*60}\n  {item_label + ':':<9} {seq_dir.name}\n"
+        seq_label = name_fn(seq_dir)
+        out_dir = Path(args.out_dir) / seq_label
+        print(f"\n{'═'*60}\n  {item_label + ':':<9} {seq_label}\n"
               f"  Input:    {seq_dir}\n  Output:   {out_dir}\n{'═'*60}")
         # Frozen-keyframe replay/dump is per sequence (the model is reused);
         # '{seq}' in the path is substituted with the sequence name.  getattr:
@@ -409,8 +437,8 @@ def run_benchmark(
         dump_keyframes = getattr(args, "dump_keyframes", None)
         if keyframes_from or dump_keyframes:
             model.set_keyframe_io(
-                keyframes_from=_seq_path(keyframes_from, seq_dir.name),
-                dump_keyframes=_seq_path(dump_keyframes, seq_dir.name))
+                keyframes_from=_seq_path(keyframes_from, seq_label),
+                dump_keyframes=_seq_path(dump_keyframes, seq_label))
         try:
             metrics = benchmark_sequence(seq_dir, out_dir, args, model)
             if metrics is not None:
@@ -420,7 +448,7 @@ def run_benchmark(
                     append_row(args.results_row,
                                build_row(model.config, args, metrics))
         except Exception as exc:
-            print(f"\n  [ERROR] {seq_dir.name}: {exc}")
+            print(f"\n  [ERROR] {seq_label}: {exc}")
             traceback.print_exc()
 
     if len(all_metrics) > 1:

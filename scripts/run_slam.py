@@ -20,7 +20,13 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from da3_slam.config import load_slam_config, DEFAULT_YAML, SLAMConfig
+from da3_slam.config import (
+    DEFAULT_YAML,
+    SLAMConfig,
+    add_token_merging_cli,
+    apply_token_merging_cli,
+    load_slam_config,
+)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -60,14 +66,29 @@ def parse_args(yaml_config: dict) -> argparse.Namespace:
     parser.add_argument("--depth_model_resolution", type=int,
                         default=yaml_config.get("depth_model_resolution"),
                         help="DA3 processing resolution")
+    parser.add_argument("--backbone_dtype", choices=["fp32", "bf16"],
+                        default=yaml_config.get("backbone_dtype", "fp32"),
+                        help="ViT backbone weight precision; bf16 cuts peak GPU "
+                             "memory ~40%% (see da3_slam.backend.inference.precision)")
     parser.add_argument("--use_ray_pose", action=argparse.BooleanOptionalAction,
                         default=bool(yaml_config.get("use_ray_pose", False)),
                         help="Use ray-based pose estimation instead of the camera decoder")
 
     # ── submap ────────────────────────────────────────────────────────────────
+    parser.add_argument("--submap_overlap", type=int,
+                        default=yaml_config.get("submap_overlap", 1),
+                        help="Anchor keyframes shared between consecutive "
+                             "submaps.  >=2 measures the shared frame pair in "
+                             "both DA3 batches, enabling the boundary "
+                             "consistency check (see scripts/diagnose_boundaries.py)")
     parser.add_argument("--submap_size", type=int,
                         default=yaml_config.get("submap_size"),
                         help="Max keyframes per submap (including anchor overlap)")
+    parser.add_argument("--submap_skip_strides", type=int, nargs="*", default=None,
+                        help="Extra within-submap between-factors linking frames "
+                             "k apart (e.g. 2 4 8).  DA3 measures these directly "
+                             "rather than by composition, and they make the graph "
+                             "over-determined.  Empty = consecutive only")
     parser.add_argument("--boundary_scale_damping", type=float,
                         default=yaml_config.get("boundary_scale_damping"),
                         help="Damping g for inter-submap scale chaining: each "
@@ -129,7 +150,24 @@ def parse_args(yaml_config: dict) -> argparse.Namespace:
                         help="DINO-SALAD descriptor L2 distance threshold for loop "
                              "detection (lower = stricter)")
 
+    add_token_merging_cli(parser, yaml_config)
+
     return parser.parse_args()
+
+
+def _resolve_alias(name: str | None) -> str | None:
+    """Map a short model alias (nested-giant, giant, …) to its HuggingFace ID.
+
+    The benchmark drivers go through da3_runner.resolve_model_alias; run_slam
+    took the raw string, so `--depth_model nested-giant` used to fail with a
+    404 against a repo literally named "nested-giant".
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from da3_runner import resolve_model_alias
+        return resolve_model_alias(name)
+    except Exception:
+        return name
 
 
 def build_config(args: argparse.Namespace) -> SLAMConfig:
@@ -138,8 +176,10 @@ def build_config(args: argparse.Namespace) -> SLAMConfig:
     config = load_slam_config(
         args.config,
         submap_size=args.submap_size,
+        submap_overlap=args.submap_overlap,
         confidence_percentile=args.confidence_percentile,
-        depth_model=args.depth_model,
+        depth_model=_resolve_alias(args.depth_model),
+        backbone_dtype=args.backbone_dtype,
         depth_model_resolution=args.depth_model_resolution,
         use_ray_pose=args.use_ray_pose,
         boundary_scale_damping=args.boundary_scale_damping,
@@ -158,6 +198,9 @@ def build_config(args: argparse.Namespace) -> SLAMConfig:
         config.keyframe.segment_disparity_threshold = args.segment_threshold
     config.keyframes_from = args.keyframes_from
     config.dump_keyframes = args.dump_keyframes
+    if args.submap_skip_strides is not None:
+        config.submap_skip_strides = tuple(args.submap_skip_strides)
+    apply_token_merging_cli(config, args)
     return config
 
 

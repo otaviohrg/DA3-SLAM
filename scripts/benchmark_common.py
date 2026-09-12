@@ -317,6 +317,53 @@ def load_replica_images(
     return image_paths, timestamps
 
 
+def load_7scenes_sequence(
+    seq_dir: Path, max_frames: int | None = None, fps: float = 30.0,
+) -> tuple[list[str], list[float], list[tuple[float, np.ndarray]]]:
+    """Load one Microsoft 7-Scenes sequence: RGB frames + camera ground truth.
+
+    Layout is <scene>/seq-XX/frame-NNNNNN.{color.png,depth.png,pose.txt}, where
+    each pose.txt is a 4x4 CAMERA-TO-WORLD matrix in plain text — the same
+    convention TUM ground truth uses, so no frame conversion is needed.
+
+    7-Scenes ships no timestamps (Kinect at 30 Hz), so they are synthesised as
+    frame_idx / fps exactly as for Replica; pair this with a half-frame
+    association tolerance.
+
+    Some frames carry a non-finite pose (the tracker lost the frame during
+    capture).  Those are dropped from the GROUND TRUTH but the image is still
+    returned: the SLAM system should process the full sequence, it simply
+    cannot be scored at those frames.
+
+    Returns (image_paths, timestamps, gt) with gt as [(timestamp, 4x4)].
+    """
+    rgb_files = sorted(seq_dir.glob("frame-*.color.png"))
+    if not rgb_files:
+        raise FileNotFoundError(f"No frame-*.color.png found in {seq_dir}")
+    if max_frames:
+        rgb_files = rgb_files[:max_frames]
+
+    image_paths, timestamps, gt = [], [], []
+    n_bad = 0
+    for i, rgb in enumerate(rgb_files):
+        ts = i / fps
+        image_paths.append(str(rgb))
+        timestamps.append(ts)
+        pose_file = rgb.with_name(rgb.name.replace(".color.png", ".pose.txt"))
+        if not pose_file.exists():
+            n_bad += 1
+            continue
+        T = np.loadtxt(pose_file)
+        if T.shape != (4, 4) or not np.all(np.isfinite(T)):
+            n_bad += 1
+            continue
+        gt.append((ts, T))
+    if n_bad:
+        print(f"  [7scenes] {n_bad} frame(s) without a usable pose — excluded "
+              f"from GT, still fed to SLAM")
+    return image_paths, timestamps, gt
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Association
 # ══════════════════════════════════════════════════════════════════════════════

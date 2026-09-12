@@ -48,16 +48,43 @@ def build_row(config, args, metrics: dict) -> dict[str, Any]:
     ate_sim3 = metrics.get("ate_sim3", {})
     ate_se3 = metrics.get("ate_se3", {})
     rpe = metrics.get("rpe_delta1", {})
+
+    # Cross-view token merging (off unless the merging sweep turned it on).
+    merging = getattr(config, "token_merging", None)
+    merge_on = bool(merging is not None and merging.enable)
+
+    # At km scale a metre of ATE means something very different on a 200 m
+    # sequence than on a 2 km one, so UAS is reported as % of the ground-truth
+    # path length actually evaluated (the matched GT poses).  Kept as a field
+    # rather than a separate metric so every row carries both.
+    path_len = metrics.get("gt_path_length_m")
+
+    def _pct(value):
+        if value is None or not path_len:
+            return None
+        return 100.0 * value / path_len
+
     return {
         "system": metrics.get("system"),
         "dataset": metrics.get("dataset"),
         "sequence": metrics.get("sequence"),
+        "status": metrics.get("status", "ok"),
         # config identity
         "backbone_size": config.depth_model,
         "resolution": config.depth_model_resolution,
+        "backbone_dtype": getattr(config, "backbone_dtype", "fp32"),
         "repeat": getattr(args, "repeat", 0),
         "submap_size": config.submap_size,
         "loop_closure": config.enable_loop_closure,
+        # cross-view token merging
+        "merging": merge_on,
+        "merge_start": merging.start if merge_on else None,
+        "merge_ratio": merging.merge_ratio if merge_on else None,
+        "merge_min_frames": merging.min_frames if merge_on else None,
+        # realised (measured, not requested) merge behaviour
+        "merge_token_ratio": metrics.get("merge_token_ratio"),
+        "merge_calls": metrics.get("merge_calls"),
+        "merge_calls_passthrough": metrics.get("merge_calls_passthrough"),
         # one-shot compute proxy (config-level; see token_proxy)
         "tokens_per_frame": token_proxy(config.depth_model_resolution),
         # accuracy (Sim3 is the monocular headline)
@@ -65,6 +92,10 @@ def build_row(config, args, metrics: dict) -> dict[str, Any]:
         "ate_se3_rmse": ate_se3.get("rmse"),
         "rpe_trans_rmse": rpe.get("trans_rmse"),
         "rpe_rot_rmse_deg": rpe.get("rot_rmse_deg"),
+        # scale-normalised accuracy (the honest metric at km scale — UAS)
+        "gt_path_length_m": path_len,
+        "ate_sim3_pct": _pct(ate_sim3.get("rmse")),
+        "ate_se3_pct": _pct(ate_se3.get("rmse")),
         # counts
         "n_frames": metrics.get("n_frames"),
         "n_keyframes": metrics.get("n_keyframes"),

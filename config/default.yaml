@@ -2,10 +2,58 @@
 # All values here are the authoritative defaults.
 # Override any key from the CLI: --submap_size 12, --loop_threshold 0.9, etc.
 
+# ══════════════════════════════════════════════════════════════════════════════
+# THESE DEFAULTS ARE TUNED FOR INDOOR HANDHELD RGB (TUM / Replica / 7-Scenes).
+#
+# Measured on TUM fr1 (9 seq) and Replica (8 scenes), 3 repeats (run-to-run
+# spread < 1e-5, i.e. the pipeline is deterministic there):
+#     TUM      Sim3 ATE 0.0389 -> 0.0295   (8/9 vs VGGT-SLAM 2.0's 0.0383)
+#     Replica  Sim3 ATE 0.0561 -> 0.0080   (8/8 vs VGGT-SLAM 2.0's 0.0304)
+#
+# DO NOT USE THESE ON AERIAL / KM-SCALE FOOTAGE.  Two of them diverge there:
+# `boundary_scale_damping: 0.0` collapses scale on UAS (+29..58% ATE, scale
+# down to 0.097) and `loop_closure.distance_threshold: 0.80` drives the SL(4)
+# graph off the rigid manifold on all four UAS sequences (trajectory export
+# fails with a non-positive determinant).  For that domain use the previous
+# defaults: damping 1.0 and distance_threshold 0.45.  See the notes on each key.
+# ══════════════════════════════════════════════════════════════════════════════
+
 # ── DA3 model ──────────────────────────────────────────────────────────────────
+# nested-giant (anyview GIANT + DA3METRIC-LARGE): the small->giant ladder measured
+# ~3x worse on TUM, and it is the only family with cross-view attention.
 depth_model: "depth-anything/DA3NESTED-GIANT-LARGE-1.1"
 depth_model_resolution: 504
 use_ray_pose: false  # use ray-based pose estimation instead of camera decoder
+
+# ViT backbone weight precision: "fp32" or "bf16".
+# The backbones already run under autocast bf16, so their fp32 master copies are
+# storage the forward never benefits from: bf16 cuts peak GPU memory ~40%
+# (11.8 -> 7.1 GB at submap 16) and roughly doubles the reachable submap size.
+# Validated on UAS (54.39 vs 55.01 m, 7774 vs 12544 MB) and used for every
+# benchmark number quoted above.
+backbone_dtype: bf16
+
+# ── cross-view token merging (FastVGGT port — EXPERIMENTAL, off by default) ────
+# Training-free acceleration of the backbone's global (cross-view) attention:
+# most tokens are merged into a smaller destination set before attention and
+# scattered back afterwards.  See da3_slam/backend/inference/token_merge.py and
+# plan_fastvggt-token-merging.txt.
+#
+# `enable: false` is the baseline every merged run must be compared against —
+# with it off, the backbone runs exactly as upstream DA3 does.
+token_merging:
+  enable: false
+  start: 0            # first merging block, as a POSITION among the global
+                      # blocks (0 = all).  giant has 14, large has 8, so only
+                      # the relative position transfers across model sizes.
+  merge_ratio: 0.9    # fraction of tokens absorbed into the destination set
+  sx: 2               # destination stride over the patch grid (x)
+  sy: 2               # destination stride over the patch grid (y)
+  protect: true       # hold a uniform stride of tokens out of the merge
+  protect_ratio: 0.1
+  seed: 33            # destination-choice seed (fixed = reproducible config)
+  min_frames: 8       # never merge smaller batches — keeps the loop-closure
+                      # worker's re-inference on the exact path
 
 # ── semantic embeddings (optional) ─────────────────────────────────────────────
 # Set to a HuggingFace CLIP model ID to enable open-vocabulary scene queries.
@@ -14,7 +62,21 @@ use_ray_pose: false  # use ray-based pose estimation instead of camera decoder
 semantic_model: null
 
 # ── submap ─────────────────────────────────────────────────────────────────────
-submap_size: 16                # max keyframes per submap (including anchor overlap)
+submap_size: 32                # max keyframes per submap (including anchor overlap).
+                                # Swept {8,16,32,64} on TUM fr1 at the shipped
+                                # config with keyframes frozen per sequence:
+                                # mean Sim3 ATE 0.0324 / 0.0295 / 0.0267 / 0.0270.
+                                # 32 wins 6/9 vs 16 (-9.6%) for +526 MB peak and
+                                # no speed cost; 64 ties on the mean but degrades
+                                # room and teddy.  NOTE the old "bigger submaps
+                                # are worse" result was measured with
+                                # boundary_scale_damping 1.0, where the scale
+                                # chain was inert and boundary COUNT barely
+                                # mattered.  With chaining on, submap size sets
+                                # the number of boundaries, so the ordering
+                                # reversed.  Watch: loop closures fall 3.8 -> 1.7
+                                # per sequence from 16 to 32 (fewer submaps, so
+                                # fewer eligible retrieval pairs).
 submap_overlap: 1              # anchor keyframes shared between consecutive submaps.
                                 # 1 = single shared node (VGGT-SLAM style).  >= 2
                                 # measures the shared frame pair in both DA3 batches:
@@ -22,17 +84,37 @@ submap_overlap: 1              # anchor keyframes shared between consecutive sub
                                 # check, so one bad anchor pose cannot silently
                                 # displace a whole submap (the live demo uses 2).
 
+# Extra within-submap between-factors linking frames k apart (e.g. [2, 4, 8]).
+# DA3 estimates each batch jointly, so a stride-k relative pose is ONE direct
+# measurement, not k composed ones — free information the consecutive-only
+# chain discards.  It also makes the graph over-determined; a consecutive-only
+# chain has exactly as many factors as nodes, so the noise model cannot affect
+# it.  [] = consecutive links only (previous behaviour).
+# Pose-graph parameterisation: "sl4" (15 DOF projective, as VGGT-SLAM) or
+# "sim3" (7 DOF rigid + uniform scale).  Inert in a chain-only graph, which is
+# exactly determined; only matters where loop closures / overlap>=2 add
+# redundancy.
+pose_parameterisation: sl4
+
+submap_skip_strides: []
+
 # ── inter-submap scale chaining ────────────────────────────────────────────────
 # Each DA3 batch has its own metric scale; consecutive submaps are chained by
 # the median depth ratio at the shared anchor frame.  Ratio noise compounds
 # multiplicatively over boundaries (= scale drift on long sequences).  DA3
 # depth is nominally metric, so the true ratio should be near 1.0:
-boundary_scale_damping: 1.0    # g in [0,1]: each ratio is raised to (1-g).
-                                # 0 = full chaining; 1 = ignore ratios and trust
-                                # DA3's metric consistency (default — validated
-                                # by the UAS + TUM scale sweeps: -29% Sim3 ATE
-                                # on tunnels for a few mm on TUM, and better
-                                # SE3 ATE everywhere).
+boundary_scale_damping: 0.0    # g in [0,1]: each ratio is raised to (1-g).
+                                # 0 = full chaining (INDOOR DEFAULT); 1 = ignore
+                                # ratios and trust DA3's metric consistency.
+                                # DOMAIN-DEPENDENT, measured: chaining is worth
+                                # -24% Sim3 ATE on TUM and -86% on Replica, but
+                                # +29..58% on UAS, where it drives scale to
+                                # 0.097-0.381.  Use 1.0 for aerial/km-scale.
+                                # (The earlier 1.0 default came from a sweep
+                                # that ran with 0-1 loop closures per sequence;
+                                # chained drift is unconstrained without graph
+                                # cycles, so that result does not transfer to
+                                # the tuned system, which closes 3-6 loops.)
 boundary_scale_clamp: null     # c > 1 clamps each applied ratio to [1/c, c],
                                 # guarding against one bad boundary estimate.
                                 # null = off.
@@ -99,13 +181,30 @@ noise:
 # ── loop closure ───────────────────────────────────────────────────────────────
 loop_closure:
   enable: true
-  distance_threshold: 0.45     # DINO-SALAD L2 distance to flag a frame-level candidate
-                                # (benchmark-tuned; the live RealSense demo overrides
-                                # to 0.55 — see run_realsense.py)
+  distance_threshold: 0.80     # DINO-SALAD L2 distance to flag a frame-level candidate.
+                                # 0.45 finds almost nothing indoors (it sits at the
+                                # 6th percentile of observed distances); 0.80 tripled
+                                # closures and cut TUM ATE ~30%.  The live RealSense
+                                # demo overrides to 0.55 — see run_realsense.py.
+                                # AERIAL: use 0.45.  On UAS, 0.80 admits aliased
+                                # matches (tunnels/fog/ice are self-similar) and the
+                                # SL(4) graph leaves the rigid manifold — 15 of 38
+                                # candidates accepted and the run diverges.
   min_submaps_apart: 1          # minimum index gap to consider a loop
   max_loop_closures: 1          # top-K candidates kept per submap (priority queue)
-  min_confidence_ratio: 0.3     # minimum mean DA3 confidence (over the two matched
-                                # frames) to accept a closure
+  min_confidence_ratio: 0.05    # minimum mean DA3 confidence (over the two matched
+                                # frames) to accept a closure.  NOTE the quantity is
+                                # min-max normalised PER FRAME, so it is not
+                                # comparable across scenes: a healthy match scores
+                                # ~0.6 on fr1/desk but ~0.066 on fr1/plant, whose
+                                # low-parallax orbit (0.048) conditions the wide-
+                                # baseline re-inference poorly.  The old 0.3 rejected
+                                # all 3 of plant's candidates; 0.05 admits them and
+                                # cuts its ATE 46%.  A gate on a scale-stable
+                                # quantity would be the principled fix.
+  roma_gate: false        # dense-matching verification (RoMa v2).  With it on,
+  roma_min_overlap: 0.30  # set distance_threshold loose — retrieval becomes a
+                          # recall knob and precision comes from correspondence.
   context_frames: 1             # temporal neighbours per matched frame included in
                                 # the verification re-inference (0 = pair only);
                                 # multi-view support conditions both the relative

@@ -206,10 +206,47 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# ── datasets, run artifacts and vendored third-party checkouts ─────────────────
+# outputs/ alone is ~71 GB across ~245k files (map.ply up to 1.7 GB), so these
+# must never enter git history — GitHub blocks single files over 100 MB.
 data/
 outputs/
 logs/
 plots/
 salad/
 Depth-Anything-3/
-recording.rrd
+third_party/
+checkpoints/
+_seqcache/
+
+# Benchmark/report products (results.json, *_summary.json, sweep rows, figures)
+*.json
+*.jsonl
+*.csv
+
+# Images and rendered figures
+*.png
+*.jpg
+*.jpeg
+
+# Point clouds, meshes and reconstruction output
+*.ply
+*.obj
+*.pcd
+
+# Model weights and caches
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.pkl
+
+# Recordings and dataset archives
+*.rrd
+*.bag
+*.mcap
+*.zip
+*.tgz
+*.tar.gz

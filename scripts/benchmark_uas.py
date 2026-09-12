@@ -44,6 +44,19 @@ DATASET = "uas"
 HEADLINE = "sim3"
 
 
+def _cache_dir(seq_name: str, out_dir: Path, args, kind: str) -> Path:
+    """Cache dir for `kind` (frames|undistorted): shared --frames_dir ROOT/<seq>/<kind>
+    when given, else out_dir/<kind>.
+
+    Mirrors VGGT-SLAM's helper of the same name, so a single extracted-frame
+    cache serves both systems.  Bag extraction is ~20 GB and idempotent, and a
+    cross-system comparison should be reading byte-identical frames anyway.
+    """
+    if args.frames_dir:
+        return Path(args.frames_dir) / seq_name / kind
+    return out_dir / kind
+
+
 def benchmark_sequence(seq_dir: Path, out_dir: Path, args, model) -> dict | None:
     """Run DA3-SLAM on one UAS sequence and score it via the shared standard.
 
@@ -73,7 +86,8 @@ def benchmark_sequence(seq_dir: Path, out_dir: Path, args, model) -> dict | None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     image_paths, timestamps = uas.extract_bag_frames(
-        bag, topic, out_dir / "frames", max_frames=args.max_frames)
+        bag, topic, _cache_dir(seq_name, out_dir, args, "frames"),
+        max_frames=args.max_frames)
     if not image_paths:
         print(f"  [SKIP] {seq_name}: no frames extracted")
         return None
@@ -82,7 +96,8 @@ def benchmark_sequence(seq_dir: Path, out_dir: Path, args, model) -> dict | None
 
     if args.undistort:
         image_paths = uas.undistort_frames(
-            image_paths, calibration, out_dir / "undistorted")
+            image_paths, calibration,
+            _cache_dir(seq_name, out_dir, args, "undistorted"))
 
     gt_all = bc.load_groundtruth(gt_txt)
     est_ts_to_pose, timings, counts = run_da3(
@@ -108,6 +123,12 @@ def parse_args() -> argparse.Namespace:
                         help="Calibration YAML override (else inferred per sequence)")
     parser.add_argument("--calib_dir", type=Path, default=None,
                         help="Dataset calibration/ folder (else auto-discovered)")
+    parser.add_argument("--frames_dir", default=None,
+                        help="Shared extracted-frame cache ROOT; frames are "
+                             "read from ROOT/<seq>/frames and undistorted into "
+                             "ROOT/<seq>/undistorted.  Same flag and layout as "
+                             "VGGT-SLAM's, so both systems consume identical "
+                             "frames instead of re-extracting ~20 GB of bags")
     parser.add_argument("--no_undistort", dest="undistort", action="store_false",
                         help="Skip fisheye undistortion")
     parser.add_argument("--max_diff", type=float, default=0.02,

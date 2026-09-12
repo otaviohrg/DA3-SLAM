@@ -701,6 +701,8 @@ class DA3SLAM:
             model_id=config.depth_model,
             process_resolution=config.depth_model_resolution,
             use_ray_pose=config.use_ray_pose,
+            token_merging=config.token_merging,
+            backbone_dtype=config.backbone_dtype,
         )
         self.builder = SubmapBuilder(
             self.estimator,
@@ -984,7 +986,8 @@ class DA3SLAM:
         Loop closure detection is dispatched to _loop_closure_worker; its
         results are drained back into the graph between optimisations.
         """
-        pose_graph = PoseGraph(ctx.config.noise)
+        pose_graph = PoseGraph(ctx.config.noise,
+                               ctx.config.pose_parameterisation)
         overlap = _effective_overlap(ctx.config)
 
         # Running product of inter-submap scale ratios: converts translations
@@ -1025,7 +1028,9 @@ class DA3SLAM:
                     self._add_submap_to_graph(pose_graph, submap, accumulated_scale)
                     print(f"{tag} Submap {submap.idx}: scale={accumulated_scale:.4f} "
                           f"(Δ raw={raw_delta_scale:.4f} applied={delta_scale:.4f})")
-                self._add_consecutive_frame_factors(pose_graph, submap, accumulated_scale)
+                self._add_consecutive_frame_factors(
+                    pose_graph, submap, accumulated_scale,
+                    tuple(ctx.config.submap_skip_strides))
 
                 ctx.submaps.append(submap)
                 submap_scales[submap.idx] = accumulated_scale
@@ -1138,6 +1143,7 @@ class DA3SLAM:
         pose_graph: PoseGraph,
         submap: Submap,
         accumulated_scale: float,
+        skip_strides: tuple[int, ...] = (),
     ) -> None:
         """Add a between-factor for each consecutive frame pair in the submap.
 
@@ -1146,17 +1152,35 @@ class DA3SLAM:
         *independent* DA3 measurement of the same pair and is added on
         purpose: the redundancy stops one broken batch from silently
         displacing everything after the boundary.
+        `skip_strides` additionally links frames that are k apart *within the
+        same batch* (k = 2, 4, 8, ...).  This is not extra computation: DA3
+        estimates every frame of a batch JOINTLY, so the relative pose between
+        frame i and frame i+k is a single direct measurement — not the
+        composition of k consecutive ones.  Adding it is free information that
+        the consecutive-only chain throws away.
+
+        Why it matters: measured per-keyframe error has a floor that does not
+        shrink with baseline (RPE/step triples from 0.089 to 0.312 as keyframe
+        spacing shrinks 9x), so a chain of k short steps accumulates ~sqrt(k)
+        floors where one stride-k measurement carries just one.  It also makes
+        the graph OVER-determined — a consecutive-only chain has exactly
+        n_nodes factors for n_nodes nodes, so it is exactly determined and the
+        noise model cannot influence the solution at all.  Redundancy is what
+        lets the optimiser average the floor down.
         """
-        for previous, current in zip(submap.frames, submap.frames[1:]):
-            relative = (
-                previous.extrinsic.astype(np.float64)
-                @ current.cam_to_world.astype(np.float64)
-            )
-            pose_graph.add_between(
-                previous.seq_idx,
-                current.seq_idx,
-                _scaled_translation(relative, accumulated_scale),
-            )
+        strides = (1, *sorted({int(k) for k in (skip_strides or ()) if int(k) > 1}))
+        frames = submap.frames
+        for stride in strides:
+            for previous, current in zip(frames, frames[stride:]):
+                relative = (
+                    previous.extrinsic.astype(np.float64)
+                    @ current.cam_to_world.astype(np.float64)
+                )
+                pose_graph.add_between(
+                    previous.seq_idx,
+                    current.seq_idx,
+                    _scaled_translation(relative, accumulated_scale),
+                )
 
     @staticmethod
     def _emit_loop_closure_snapshot(
@@ -1388,6 +1412,14 @@ def _check_boundary_consistency(
         norm_ratio = float("inf") if norm_curr > 1e-9 else 1.0
     broken = ((np.isfinite(rotation_diff) and rotation_diff > 15.0)
               or norm_ratio < 0.5 or norm_ratio > 2.0)
+    # Always emit the measurement, not only the failures.  "How often is a
+    # boundary broken" and "how large is the typical disagreement" are
+    # different questions, and only the second one distinguishes a genuinely
+    # mis-aligned boundary from an intact one that simply costs a little.
+    # Only reachable with submap_overlap >= 2, so normal runs print nothing.
+    print(f"{tag} [boundary] {prev_submap.idx}->{curr_submap.idx} "
+          f"rot_deg={rotation_diff:.4f} norm_ratio={norm_ratio:.4f} "
+          f"broken={int(broken)}")
     if broken:
         print(f"{tag} WARNING: boundary {prev_submap.idx}→{curr_submap.idx} "
               f"inconsistent — the two batches disagree on the shared frame "
