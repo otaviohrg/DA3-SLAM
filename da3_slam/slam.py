@@ -54,7 +54,10 @@ from scipy.spatial.transform import Rotation
 from da3_slam.config import SLAMConfig, load_slam_config
 from da3_slam.frontend.keyframe_selector import (
     OnlineKeyframeSelector,
+    ReplayKeyframeSelector,
     SegmentKeyframeSelector,
+    load_keyframe_list,
+    save_keyframe_list,
 )
 from da3_slam.backend.inference.depth_estimator import DepthEstimator
 from da3_slam.backend.inference.submap import Submap, SubmapBuilder, transform_points
@@ -89,6 +92,14 @@ class SLAMResult:
 
     # Wall-clock timing breakdown
     timings: dict[str, float]
+
+    # Backbone (DA3 forward) instrumentation for the whole run, read from the
+    # DepthEstimator: cumulative forward wall-clock (s), number of forward
+    # calls, and the peak GPU memory of a single forward (bytes).  Backbone-
+    # only latency + peak memory are two of the sweep's headline axes.
+    backbone_seconds: float = 0.0
+    backbone_calls: int = 0
+    peak_gpu_mem_bytes: int = 0
 
     @property
     def n_keyframes(self) -> int:
@@ -690,6 +701,8 @@ class DA3SLAM:
             model_id=config.depth_model,
             process_resolution=config.depth_model_resolution,
             use_ray_pose=config.use_ray_pose,
+            token_merging=config.token_merging,
+            backbone_dtype=config.backbone_dtype,
         )
         self.builder = SubmapBuilder(
             self.estimator,
@@ -758,6 +771,10 @@ class DA3SLAM:
         used to drive a live viewer.  See SLAMUpdate for the threading and
         error-handling contract.
         """
+        # Zero the backbone timing / peak-memory counters for this run (the
+        # model — and thus the estimator — is reused across runs).
+        self.estimator.reset_stats()
+
         loop_closure_done = threading.Event()
         if self.detector is None:
             loop_closure_done.set()  # no loop-closure thread — event is immediately done
@@ -813,7 +830,12 @@ class DA3SLAM:
         if ctx.backend_error is not None:
             raise ctx.backend_error
 
-        self._print_timing_breakdown(ctx.timings, wall_elapsed)
+        self._print_timing_breakdown(
+            ctx.timings, wall_elapsed,
+            backbone_seconds=self.estimator.backbone_seconds,
+            backbone_calls=self.estimator.n_infer_calls,
+            peak_gpu_mem_bytes=self.estimator.peak_memory_bytes,
+        )
 
         return SLAMResult(
             keyframe_poses=_build_keyframe_poses(
@@ -822,10 +844,19 @@ class DA3SLAM:
             optimization=ctx.optimization_result,
             loop_closures=ctx.loop_closures,
             timings=ctx.timings,
+            backbone_seconds=self.estimator.backbone_seconds,
+            backbone_calls=self.estimator.n_infer_calls,
+            peak_gpu_mem_bytes=self.estimator.peak_memory_bytes,
         )
 
     @staticmethod
-    def _print_timing_breakdown(timings: dict[str, float], wall_elapsed: float) -> None:
+    def _print_timing_breakdown(
+        timings: dict[str, float],
+        wall_elapsed: float,
+        backbone_seconds: float = 0.0,
+        backbone_calls: int = 0,
+        peak_gpu_mem_bytes: int = 0,
+    ) -> None:
         col = max(len(k) for k in timings)
         tag = f"[{threading.current_thread().name}]"
         print(f"{tag} Timing breakdown (per-module compute time, threads overlap):")
@@ -834,6 +865,11 @@ class DA3SLAM:
         print(f"  {'':-<{col + 9}}")
         print(f"  {'compute total':<{col}}  {sum(timings.values()):6.1f}s")
         print(f"  {'wall-clock':<{col}}  {wall_elapsed:6.1f}s")
+        # Backbone-only figures: the isolated DA3 forward cost (a subset of
+        # submap_building / loop_closure) plus the peak GPU memory of one call.
+        print(f"  {'backbone fwd':<{col}}  {backbone_seconds:6.1f}s "
+              f"({backbone_calls} calls, "
+              f"peak {peak_gpu_mem_bytes / 1e6:.0f} MB)")
 
     # ── frontend thread ───────────────────────────────────────────────────────
 
@@ -845,13 +881,35 @@ class DA3SLAM:
         batch shares its last keyframe with the next batch (the anchor frame)
         — see the module docstring.
         """
-        segment_mode = ctx.config.keyframe.selection_mode == "segment"
-        if segment_mode:
+        # Replay mode (frozen keyframes) bypasses optical-flow selection and
+        # emits exactly the recorded seq_idxs, so two configs are compared on
+        # byte-identical frames.  It shares segment mode's list-returning
+        # step()/flush() interface, so both take the `list_mode` path.
+        if ctx.config.keyframes_from:
+            selector = ReplayKeyframeSelector(
+                load_keyframe_list(ctx.config.keyframes_from))
+            list_mode = True
+        elif ctx.config.keyframe.selection_mode == "segment":
             selector = SegmentKeyframeSelector(ctx.config.keyframe)
+            list_mode = True
         else:
             selector = OnlineKeyframeSelector(ctx.config.keyframe)
+            list_mode = False
         batcher = _KeyframeBatcher(ctx.config.submap_size,
                                    _effective_overlap(ctx.config))
+
+        # (seq_idx, label) of every selected keyframe, accumulated only when
+        # --dump_keyframes is set (frozen-keyframe capture).
+        keyframe_log: list[tuple[int, str]] | None = (
+            [] if ctx.config.dump_keyframes else None)
+
+        def emit(new_keyframes: list[tuple[str, np.ndarray, int]]) -> None:
+            for label, image, seq_idx in new_keyframes:
+                if keyframe_log is not None:
+                    keyframe_log.append((seq_idx, label))
+                batch = batcher.add(label, image, seq_idx)
+                if batch is not None:
+                    _blocking_put(ctx, ctx.batch_queue, batch)
 
         try:
             for image, seq_idx, label in frame_source:
@@ -859,33 +917,31 @@ class DA3SLAM:
                     break
 
                 t0 = time.time()
-                if segment_mode:
+                if list_mode:
                     new_keyframes = selector.step(image, seq_idx, label)
                 else:
                     new_keyframes = (
                         [(label, image, seq_idx)] if selector.step(image) else []
                     )
                 ctx.timings["keyframe_selection"] += time.time() - t0
+                emit(new_keyframes)
 
-                for keyframe in new_keyframes:
-                    batch = batcher.add(*keyframe)
-                    if batch is not None:
-                        _blocking_put(ctx, ctx.batch_queue, batch)
-
-            # Drain the final partial segment (segment mode only).
-            if segment_mode and ctx.backend_error is None:
+            # Drain the final partial segment (list-mode selectors only).
+            if list_mode and ctx.backend_error is None:
                 t0 = time.time()
                 tail_keyframes = selector.flush()
                 ctx.timings["keyframe_selection"] += time.time() - t0
-                for keyframe in tail_keyframes:
-                    batch = batcher.add(*keyframe)
-                    if batch is not None:
-                        _blocking_put(ctx, ctx.batch_queue, batch)
+                emit(tail_keyframes)
 
             # Flush the final partial batch.
             tail_batch = batcher.tail()
             if tail_batch is not None and ctx.backend_error is None:
                 _blocking_put(ctx, ctx.batch_queue, tail_batch)
+
+            # Persist the selected keyframe list once the stream is fully
+            # consumed (skip on error — the list would be truncated).
+            if keyframe_log is not None and ctx.backend_error is None:
+                save_keyframe_list(ctx.config.dump_keyframes, keyframe_log)
         except Exception as exc:
             ctx.backend_error = exc
         finally:
@@ -930,7 +986,8 @@ class DA3SLAM:
         Loop closure detection is dispatched to _loop_closure_worker; its
         results are drained back into the graph between optimisations.
         """
-        pose_graph = PoseGraph(ctx.config.noise)
+        pose_graph = PoseGraph(ctx.config.noise,
+                               ctx.config.pose_parameterisation)
         overlap = _effective_overlap(ctx.config)
 
         # Running product of inter-submap scale ratios: converts translations
@@ -971,7 +1028,9 @@ class DA3SLAM:
                     self._add_submap_to_graph(pose_graph, submap, accumulated_scale)
                     print(f"{tag} Submap {submap.idx}: scale={accumulated_scale:.4f} "
                           f"(Δ raw={raw_delta_scale:.4f} applied={delta_scale:.4f})")
-                self._add_consecutive_frame_factors(pose_graph, submap, accumulated_scale)
+                self._add_consecutive_frame_factors(
+                    pose_graph, submap, accumulated_scale,
+                    tuple(ctx.config.submap_skip_strides))
 
                 ctx.submaps.append(submap)
                 submap_scales[submap.idx] = accumulated_scale
@@ -1084,6 +1143,7 @@ class DA3SLAM:
         pose_graph: PoseGraph,
         submap: Submap,
         accumulated_scale: float,
+        skip_strides: tuple[int, ...] = (),
     ) -> None:
         """Add a between-factor for each consecutive frame pair in the submap.
 
@@ -1092,17 +1152,35 @@ class DA3SLAM:
         *independent* DA3 measurement of the same pair and is added on
         purpose: the redundancy stops one broken batch from silently
         displacing everything after the boundary.
+        `skip_strides` additionally links frames that are k apart *within the
+        same batch* (k = 2, 4, 8, ...).  This is not extra computation: DA3
+        estimates every frame of a batch JOINTLY, so the relative pose between
+        frame i and frame i+k is a single direct measurement — not the
+        composition of k consecutive ones.  Adding it is free information that
+        the consecutive-only chain throws away.
+
+        Why it matters: measured per-keyframe error has a floor that does not
+        shrink with baseline (RPE/step triples from 0.089 to 0.312 as keyframe
+        spacing shrinks 9x), so a chain of k short steps accumulates ~sqrt(k)
+        floors where one stride-k measurement carries just one.  It also makes
+        the graph OVER-determined — a consecutive-only chain has exactly
+        n_nodes factors for n_nodes nodes, so it is exactly determined and the
+        noise model cannot influence the solution at all.  Redundancy is what
+        lets the optimiser average the floor down.
         """
-        for previous, current in zip(submap.frames, submap.frames[1:]):
-            relative = (
-                previous.extrinsic.astype(np.float64)
-                @ current.cam_to_world.astype(np.float64)
-            )
-            pose_graph.add_between(
-                previous.seq_idx,
-                current.seq_idx,
-                _scaled_translation(relative, accumulated_scale),
-            )
+        strides = (1, *sorted({int(k) for k in (skip_strides or ()) if int(k) > 1}))
+        frames = submap.frames
+        for stride in strides:
+            for previous, current in zip(frames, frames[stride:]):
+                relative = (
+                    previous.extrinsic.astype(np.float64)
+                    @ current.cam_to_world.astype(np.float64)
+                )
+                pose_graph.add_between(
+                    previous.seq_idx,
+                    current.seq_idx,
+                    _scaled_translation(relative, accumulated_scale),
+                )
 
     @staticmethod
     def _emit_loop_closure_snapshot(
@@ -1334,6 +1412,14 @@ def _check_boundary_consistency(
         norm_ratio = float("inf") if norm_curr > 1e-9 else 1.0
     broken = ((np.isfinite(rotation_diff) and rotation_diff > 15.0)
               or norm_ratio < 0.5 or norm_ratio > 2.0)
+    # Always emit the measurement, not only the failures.  "How often is a
+    # boundary broken" and "how large is the typical disagreement" are
+    # different questions, and only the second one distinguishes a genuinely
+    # mis-aligned boundary from an intact one that simply costs a little.
+    # Only reachable with submap_overlap >= 2, so normal runs print nothing.
+    print(f"{tag} [boundary] {prev_submap.idx}->{curr_submap.idx} "
+          f"rot_deg={rotation_diff:.4f} norm_ratio={norm_ratio:.4f} "
+          f"broken={int(broken)}")
     if broken:
         print(f"{tag} WARNING: boundary {prev_submap.idx}→{curr_submap.idx} "
               f"inconsistent — the two batches disagree on the shared frame "

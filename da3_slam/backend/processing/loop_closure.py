@@ -177,6 +177,61 @@ class LoopClosureDetector:
         self._next_loop_closure_idx = -1
 
         self._model = self._load_salad_model()
+        # RoMa is loaded on first use so a run with the gate off never pays
+        # for it (1 GB checkpoint + a DINOv3 backbone).
+        self._roma = None
+
+    def reset(self) -> None:
+        """Clear all per-sequence state — seen submaps, the per-frame
+        descriptor index, and the loop-closure submap counter — while keeping
+        the loaded DINO-SALAD model.
+
+        Lets one detector be reused across sequences (e.g. SharedSLAM in the
+        benchmark/sweep drivers) instead of being rebuilt: rebuilding reloads
+        DINO-SALAD, which re-validates DINOv2 against GitHub through torch.hub
+        and can fail mid-run on a transient network error.
+        """
+        self._submaps.clear()
+        self._frame_descriptors.clear()
+        self._next_loop_closure_idx = -1
+
+    def _roma_overlap(self, image_b: np.ndarray, image_a: np.ndarray) -> float | None:
+        """RoMa v2 mean predicted overlap between two frames, or None on failure.
+
+        This is spatial verification the global descriptor cannot provide: it
+        measures how much of the two views actually correspond, rather than how
+        close their whole-image embeddings are.  A failure returns None and the
+        candidate is passed through to the normal gates rather than dropped, so
+        a broken matcher cannot silently suppress every closure.
+        """
+        try:
+            if self._roma is None:
+                from romav2 import RoMaV2
+                print("[LoopClosure] Loading RoMa v2 for dense verification...")
+                self._roma = RoMaV2()
+            import tempfile, cv2, os
+            paths = []
+            for img in (image_b, image_a):
+                fd, path = tempfile.mkstemp(suffix=".png")
+                os.close(fd)
+                cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                paths.append(path)
+            try:
+                preds = self._roma.match(paths[0], paths[1])
+                _, overlaps, _, _ = self._roma.sample(preds, 5000)
+                ov = overlaps.detach().cpu().numpy() if hasattr(overlaps, "detach") \
+                    else np.asarray(overlaps)
+                return float(np.mean(ov))
+            finally:
+                for path in paths:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        except Exception as exc:
+            print(f"[LoopClosure] dense gate unavailable ({exc}); "
+                  f"candidate passed to the standard gates")
+            return None
 
     def _load_salad_model(self) -> torch.nn.Module:
         """Load DINO-SALAD, downloading the checkpoint on first use."""
@@ -361,6 +416,20 @@ class LoopClosureDetector:
         """
         submap_a = self._submaps[candidate.submap_idx_a]  # detected
         submap_b = self._submaps[candidate.submap_idx_b]  # query
+
+        # Dense-matching gate runs BEFORE the DA3 re-inference: rejecting here
+        # saves the more expensive multi-view forward on a bad candidate.
+        if self.config.roma_gate:
+            overlap = self._roma_overlap(
+                submap_b.frames[candidate.frame_idx_b].image,
+                submap_a.frames[candidate.frame_idx_a].image)
+            if overlap is not None and overlap < self.config.roma_min_overlap:
+                print(f"[LoopClosure] {candidate.submap_idx_a}"
+                      f"[f{candidate.frame_idx_a}]"
+                      f"↔{candidate.submap_idx_b}[f{candidate.frame_idx_b}] "
+                      f"rejected by dense gate (overlap {overlap:.3f} < "
+                      f"{self.config.roma_min_overlap:.3f})")
+                return None
 
         tag = (
             f"[LoopClosure] "

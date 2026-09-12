@@ -102,6 +102,17 @@ ablation-tum: ## Run the TUM ablation study
 kf-grid: ## Keyframe-stride × submap-size grid study (set SEQ_DIR=...)
 	$(RUN) python3 scripts/kf_submap_grid.py $(seq_flag) $(ARGS)
 
+# Compute sweep (plan Step 0): size × resolution × repeat grid on frozen
+# keyframes. Override the grid via ARGS, e.g.
+#   make sweep SEQ_DIR="data/tum/rgbd_dataset_freiburg1_desk data/tum/rgbd_dataset_freiburg1_xyz" \
+#        ARGS="--sizes small large nested-giant --resolutions 336 392 448 504 --repeats 3"
+# Quick smoke test: ARGS="--resolutions 504 --repeats 1 --max_frames 120".
+SWEEP_OUT ?= outputs/sweep
+
+.PHONY: sweep
+sweep: ## Size×resolution compute sweep on frozen keyframes (set SEQ_DIR=...; SWEEP_OUT, ARGS overridable)
+	$(RUN) python3 scripts/sweep_compute.py $(seq_flag) --out_dir $(SWEEP_OUT) $(ARGS)
+
 ## -- Charts & tables --------------------------------------------------------
 
 .PHONY: show-ablation
@@ -119,6 +130,11 @@ plot-trajectory: ## Trajectory PNGs from a run's trajectory_tum.txt (set OUT_DIR
 .PHONY: plot-map
 plot-map: ## Multi-view PNG renders of a run's map.ply (set OUT_DIR=...)
 	$(RUN) python3 scripts/visualize_map.py $(OUT_DIR)/map.ply $(ARGS)
+
+ROWS ?= $(SWEEP_OUT)/sweep_rows.jsonl
+.PHONY: plot-sweep
+plot-sweep: ## Aggregate + plot a compute sweep (table + sweep_agg.csv + frontier.png; set SWEEP_OUT=, ROWS=)
+	$(RUN) python3 scripts/plot_sweep.py --rows $(ROWS) --out_dir $(SWEEP_OUT) $(ARGS)
 
 ## -- Smoke tests ----------------------------------------------------------
 
