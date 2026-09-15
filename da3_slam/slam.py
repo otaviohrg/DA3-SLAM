@@ -172,8 +172,8 @@ class SLAMResult:
                 seen_seq_idx.add(frame.seq_idx)
                 if len(frame.points_cam) == 0:
                     continue
-                global_cam_to_world = self.optimization.pose(frame.seq_idx).astype(np.float64)
-                all_points.append(transform_points(frame.points_cam, global_cam_to_world))
+                points_to_world = self.optimization.point_transform(frame.seq_idx)
+                all_points.append(transform_points(frame.points_cam, points_to_world))
                 all_colors.append(frame.colors)
 
         if not all_points:
@@ -272,6 +272,10 @@ class SLAMUpdate:
     # current estimate for every keyframe).
     frame_points_cam: list[tuple[int, np.ndarray, np.ndarray]] = field(
         default_factory=list)
+
+    # seq_idx → similarity scale (Sim(3); 1.0 under SL(4)).  keyframe_poses are
+    # rigid, so re-projecting points must scale them: world = s·R·p + t.
+    keyframe_scales: dict[int, float] = field(default_factory=dict)
 
 
 # ── run context ───────────────────────────────────────────────────────────────
@@ -549,20 +553,123 @@ class _KeyframeBatcher:
     pose graph (module docstring, invariant 1).
     """
 
-    def __init__(self, submap_size: int, overlap: int):
+    def __init__(self, submap_size: int, overlap: int,
+                 warmup_size: int = 0, warmup_submaps: int = 0,
+                 flow_budget: float = 0.0, keyframe_config=None):
+        """Batch keyframes into submaps, optionally with a WARMUP RAMP.
+
+        With warmup_size == 0 the behaviour is what it has always been: every
+        submap holds `submap_size` keyframes.
+
+        With a warmup, the first `warmup_submaps` submaps hold `warmup_size`
+        keyframes and the rest hold `submap_size`.  This exists because a SHORT
+        sequence at a large submap_size can yield a single submap, which
+        silently disables the whole SLAM layer: no boundary to chain, a one-node
+        SL(4) graph with nothing to optimise, and loop closure structurally
+        impossible (min_submaps_apart >= 1 cannot be met).  Measured on
+        7-Scenes/stairs (500 frames -> 32 keyframes -> 1 submap at size 32):
+        ATE 0.1149 with scale 1.140, versus 0.0305 and scale 1.009 at size 16,
+        where the same sequence yields 3 submaps — a 3.8x difference produced
+        entirely by whether the pose graph exists.
+
+        The ramp is CAUSAL: it depends only on how many submaps have already
+        been emitted, never on the total sequence length, so it works online
+        where the length is unknown.  Submaps of differing sizes need no special
+        handling downstream — graph nodes are submaps and factors are relative
+        poses at shared anchors, so a [16, 16, 32, 32, ...] sequence is a
+        perfectly ordinary graph and no re-inference is required.
+
+        Trade-off to be aware of: DA3's cross-view attention has less context in
+        a smaller batch, so warmup submaps have somewhat weaker internal
+        geometry (at size 8 stairs scored 0.0997, worse than size 16's 0.0305),
+        and they sit at the START of the trajectory where errors propagate
+        furthest.  Keep warmup_size at the smallest value that still gives good
+        geometry rather than the smallest that gives many submaps.
+        """
         self._submap_size = submap_size
         self._overlap = overlap
+        # FLOW BUDGET: close a submap once the view has moved far enough,
+        # instead of only after a fixed KEYFRAME COUNT.
+        #
+        # A submap is one DA3 batch, and DA3 estimates its geometry jointly by
+        # attending BETWEEN views -- which requires the views to still see
+        # overlapping scene.  Counting keyframes does not measure that.  In
+        # segment mode keyframes are picked at a fixed FRAME stride, so a fixed
+        # count spans whatever distance the camera happened to travel:
+        # measured, 2.8 m per submap on TUM fr1/teddy and 3.3 m on Replica
+        # room2, against 51 m on UAS fyllingsdalen and 65 m on UAS hornbill.
+        # At 65 m in a tunnel the first and last frames of a batch share no
+        # visible surface, so cross-view attention has nothing to attend to --
+        # and those two sequences are exactly the ones that regressed 2.2-2.4x
+        # when submap_size went 16 -> 32, while campus_fog (8 m/submap) barely
+        # moved.
+        #
+        # Accumulated optical flow is a scale-free proxy for view change: it
+        # needs no metric estimate and no intrinsics, so ONE budget serves
+        # indoor and aerial alike.  submap_size remains as a hard cap.
+        # 0 disables it and the behaviour is exactly as before.
+        self._flow_budget = float(flow_budget or 0.0)
+        self._kf_config = keyframe_config
+        self._flow_accum = 0.0
+        self._last_image = None
+        self._warmup_size = int(warmup_size)
+        self._warmup_submaps = int(warmup_submaps)
+        self._emitted = 0
         self._labels: list[str] = []
         self._images: list[np.ndarray] = []
         self._indices: list[int] = []
 
+    def _target_size(self) -> int:
+        """Keyframes for the submap currently being filled.
+
+        GEOMETRIC RAMP: start at `warmup_size` and DOUBLE every
+        `warmup_submaps` submaps, capped at `submap_size`.  With
+        warmup_size=16, warmup_submaps=2 and submap_size=32 that is
+        16, 16, 32, 32, 32, ... — the first submaps are small so a short
+        sequence still gets a pose graph, and the size climbs to the measured
+        optimum for everything after.
+
+        THE CAP IS NOT ARBITRARY.  A sweep of fixed sizes {8, 16, 32, 64} on
+        TUM fr1 (keyframes frozen per sequence) gave mean Sim(3) ATE
+        0.0324 / 0.0295 / 0.0267 / 0.0270: the curve is U-shaped with its
+        minimum at 32, and 64 already ties while degrading fr1/room and
+        fr1/teddy.  Ramping past the cap would also shrink the submap COUNT —
+        loop closures already fall 3.8 -> 1.7 per sequence going from 16 to 32,
+        since fewer submaps means fewer eligible retrieval pairs — and would
+        recreate at the long end exactly the failure this ramp fixes at the
+        short end, where one submap disables chaining, the graph and loop
+        closure together.  DA3's cross-view attention is also quadratic in
+        batch frames, so very large submaps are expensive and outside the
+        regime the backbone was trained on.
+        """
+        if self._warmup_size <= 0:
+            return self._submap_size
+        step = max(1, self._warmup_submaps)
+        size = self._warmup_size * (2 ** (self._emitted // step))
+        size = min(size, self._submap_size)
+        return max(size, self._overlap + 1)
+
     def add(self, label: str, image: np.ndarray, seq_idx: int) -> _KeyframeBatch | None:
         """Append a keyframe; return a full batch when one is ready."""
+        if self._flow_budget > 0.0 and self._last_image is not None:
+            try:
+                from da3_slam.frontend.keyframe_selector import keyframe_flow
+                self._flow_accum += keyframe_flow(
+                    self._last_image, image, self._kf_config)[2]
+            except Exception:
+                pass          # never fail a run over the motion signal
+        self._last_image = image
+
         self._labels.append(label)
         self._images.append(image)
         self._indices.append(seq_idx)
-        if len(self._labels) < self._submap_size:
+        over_budget = (self._flow_budget > 0.0
+                       and self._flow_accum >= self._flow_budget
+                       and len(self._labels) > self._overlap + 1)
+        if len(self._labels) < self._target_size() and not over_budget:
             return None
+        self._emitted += 1
+        self._flow_accum = 0.0
         batch = (list(self._labels), list(self._images), list(self._indices))
         # Anchor the next submap on the last `overlap` keyframes.
         del self._labels[:-self._overlap]
@@ -586,6 +693,44 @@ def _scaled_translation(transform: np.ndarray, scale: float) -> np.ndarray:
     scaled = transform.copy()
     scaled[:3, 3] *= scale
     return scaled
+
+
+def _rolloff_damping(boundary_idx: int, config) -> float:
+    """Effective damping g for the boundary entering submap `boundary_idx`.
+
+    With boundary_scale_rolloff_tau <= 0 this returns the fixed
+    boundary_scale_damping and nothing changes.
+
+    Otherwise the per-boundary WEIGHT w = (1 - g) follows a smooth rolloff
+
+        w_j = 1 / (1 + (j / tau)^p)
+
+    so g_j = 1 - w_j.  Motivation: boundary ratios are chained
+    multiplicatively, so with a constant weight the accumulated scale variance
+    is Var(log S_k) = sigma^2 * sum_j w_j^2 = sigma^2 * k -- it grows without
+    bound in the number of boundaries.  Any w_j with sum w_j^2 < infinity keeps
+    it bounded; this form converges for p > 1/2 (sum = 7.56 at tau=10, p=3).
+
+    WHY NOT A SINGLE EXPONENTIAL: e^(-j/tau) is also summable, but one
+    parameter controls both where the transition sits and how gradual it is, so
+    it cannot be flat early and steep later.  Measured against the damping
+    sweep, tau=30 leaves w=0.46 at j=23 (UAS median, which wants w~0) while
+    tau=10 already drops to w=0.67 at j=4 (TUM median, where damping costs ~5%).
+    The rolloff separates the two: tau sets the transition, p its sharpness, so
+    tau=10 p=3 gives w=0.94 at j=4 and w=0.08 at j=23.
+
+    This is causal -- it depends only on how many boundaries have been chained
+    so far, never on total sequence length -- so it works online.
+    """
+    tau = float(getattr(config, "boundary_scale_rolloff_tau", 0.0) or 0.0)
+    if tau <= 0.0:
+        return float(config.boundary_scale_damping)
+    p = float(getattr(config, "boundary_scale_rolloff_p", 3.0) or 3.0)
+    j = max(int(boundary_idx), 0)
+    w = 1.0 / (1.0 + (j / tau) ** p)
+    # Never trust a boundary MORE than the configured floor allows.
+    w = min(w, 1.0 - float(config.boundary_scale_damping))
+    return 1.0 - w
 
 
 def _adjust_boundary_scale(
@@ -660,7 +805,8 @@ def _boundary_delta_scale(
     damping/clamp behaviour is used unchanged.
     """
     deadband = config.boundary_scale_deadband
-    if deadband <= 0 and config.boundary_scale_damping >= 1.0:
+    if (deadband <= 0 and config.boundary_scale_damping >= 1.0
+            and float(getattr(config, "boundary_scale_rolloff_tau", 0.0) or 0.0) <= 0.0):
         # Nothing would use the ratio — skip the median depth-ratio estimate.
         return 1.0, 1.0
     raw = _estimate_boundary_scale(prev_submap, curr_submap, overlap)
@@ -675,7 +821,8 @@ def _boundary_delta_scale(
               f"applying full correction {applied:.3f}")
         return raw, applied
     return raw, _adjust_boundary_scale(
-        raw, config.boundary_scale_damping, config.boundary_scale_clamp)
+        raw, _rolloff_damping(curr_submap.idx, config),
+        config.boundary_scale_clamp)
 
 
 # ── runner ────────────────────────────────────────────────────────────────────
@@ -895,8 +1042,12 @@ class DA3SLAM:
         else:
             selector = OnlineKeyframeSelector(ctx.config.keyframe)
             list_mode = False
-        batcher = _KeyframeBatcher(ctx.config.submap_size,
-                                   _effective_overlap(ctx.config))
+        batcher = _KeyframeBatcher(
+            ctx.config.submap_size, _effective_overlap(ctx.config),
+            warmup_size=getattr(ctx.config, "submap_warmup_size", 0),
+            warmup_submaps=getattr(ctx.config, "submap_warmup_submaps", 2),
+            flow_budget=getattr(ctx.config, "submap_flow_budget", 0.0),
+            keyframe_config=ctx.config.keyframe)
 
         # (seq_idx, label) of every selected keyframe, accumulated only when
         # --dump_keyframes is set (frozen-keyframe capture).
@@ -1218,8 +1369,8 @@ class DA3SLAM:
             if len(frame.points_cam) == 0:
                 continue
             frame_points_cam.append((frame.seq_idx, frame.points_cam, frame.colors))
-            global_cam_to_world = optimization.pose(frame.seq_idx).astype(np.float64)
-            points_list.append(transform_points(frame.points_cam, global_cam_to_world))
+            points_to_world = optimization.point_transform(frame.seq_idx)
+            points_list.append(transform_points(frame.points_cam, points_to_world))
             colors_list.append(frame.colors)
         new_points = (np.concatenate(points_list) if points_list
                       else np.empty((0, 3), dtype=np.float32))
@@ -1234,6 +1385,7 @@ class DA3SLAM:
             n_submaps=len([s for s in ctx.submaps if not s.is_loop_closure_submap]),
             n_loop_closures=len(ctx.loop_closures),
             frame_points_cam=frame_points_cam,
+            keyframe_scales={k: optimization.scale(k) for k in poses},
         )
         try:
             ctx.on_update(update)

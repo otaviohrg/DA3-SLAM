@@ -72,6 +72,11 @@ class _Sl4Ops:
     def to_matrix(element) -> np.ndarray:
         return element.matrix()
 
+    @staticmethod
+    def scale(element) -> float:
+        # matrix() already carries the full projective action on points.
+        return 1.0
+
 
 class _Sim3Ops:
     """7-DOF similarity parameterisation (rigid + uniform scale)."""
@@ -97,6 +102,15 @@ class _Sim3Ops:
         # scale() * translation(), per the convention noted above.
         out[:3, 3] = element.scale() * np.asarray(element.translation())
         return out
+
+    @staticmethod
+    def scale(element) -> float:
+        # to_matrix() is kept RIGID for trajectory export, but a point maps as
+        # s * (R p + t) = sR p + s t — so geometry placement must also scale the
+        # rotation block, or each frame's points keep raw DA3 depth while its
+        # camera centre sits in the rescaled frame (duplicated doors/chairs
+        # wherever per-frame scales diverge).  See OptimizationResult.point_transform.
+        return float(element.scale())
 
 
 PARAMETERISATIONS = {"sl4": _Sl4Ops, "sim3": _Sim3Ops}
@@ -137,9 +151,24 @@ class OptimizationResult:
     # Number of LM iterations
     iterations: int
 
+    # Per-keyframe similarity scale (Sim(3) only; SL(4) and missing keys → 1.0)
+    frame_scales: dict[int, float] | None = None
+
     def pose(self, seq_idx: int) -> np.ndarray:
-        """(4, 4) cam-to-world for the frame with the given seq_idx."""
+        """(4, 4) rigid cam-to-world for the frame with the given seq_idx."""
         return self.frame_poses[seq_idx]
+
+    def scale(self, seq_idx: int) -> float:
+        return (self.frame_scales or {}).get(seq_idx, 1.0)
+
+    def point_transform(self, seq_idx: int) -> np.ndarray:
+        """(4, 4) transform mapping camera-space POINTS to world: [sR | st].
+
+        Use this, not pose(), to place geometry — pose() drops the scale on the
+        rotation block so it can be exported as a rigid trajectory."""
+        out = self.frame_poses[seq_idx].astype(np.float64)
+        out[:3, :3] *= self.scale(seq_idx)
+        return out
 
 
 # ── graph ─────────────────────────────────────────────────────────────────────
@@ -264,12 +293,41 @@ class PoseGraph:
         self._values = result
 
         frame_poses: dict[int, np.ndarray] = {}
+        frame_scales: dict[int, float] = {}
+        worst_drift = 0.0
         for seq_idx in self._initialized:
-            frame_poses[seq_idx] = self._ops.to_matrix(
-                self._ops.at(result, X(seq_idx))).astype(np.float32)
+            element = self._ops.at(result, X(seq_idx))
+            M = self._ops.to_matrix(element)
+            frame_scales[seq_idx] = self._ops.scale(element)
+            # RIGID-SUBGROUP DRIFT.
+            # SL(4) is 15-DOF projective.  It is the right manifold for VGGT,
+            # whose reconstructions are only defined up to a projectivity when
+            # intrinsics are unknown — but DA3 supplies METRIC depth, which
+            # pins the reconstruction to at most a similarity.  The extra 8 DOF
+            # are unconstrained by the data, so the solution can wander off the
+            # rigid subgroup; the 3x3 block then stops being a rotation and
+            # trajectory export dies in scipy with "Non-positive determinant".
+            # Measure how far off it is BEFORE that happens: for a true
+            # rotation (up to scale s) R^T R = s^2 I, so the normalised
+            # residual below is 0 on the rigid subgroup and grows with drift.
+            R = np.asarray(M[:3, :3], dtype=np.float64)
+            s2 = float(np.trace(R.T @ R)) / 3.0
+            if s2 > 1e-12:
+                drift = float(np.linalg.norm(R.T @ R / s2 - np.eye(3)))
+                worst_drift = max(worst_drift, drift)
+                if np.linalg.det(R) <= 0.0:
+                    worst_drift = max(worst_drift, 1e3)   # sign flip: already invalid
+            frame_poses[seq_idx] = M.astype(np.float32)
+        if worst_drift > 0.05:
+            print(f"[PoseGraph] WARNING: solution off the rigid subgroup — "
+                  f"worst ||R^T R / s^2 - I|| = {worst_drift:.3f} over "
+                  f"{len(self._initialized)} nodes. SL(4) has 8 DOF that DA3's "
+                  f"metric depth does not require; pose_parameterisation: sim3 "
+                  f"cannot drift this way.")
 
         return OptimizationResult(
             frame_poses=frame_poses,
+            frame_scales=frame_scales,
             final_error=float(final_error),
             iterations=int(iterations),
         )

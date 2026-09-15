@@ -140,6 +140,27 @@ def add_da3_cli(parser) -> None:
                              "-1 = plain Gaussian)")
 
     # inter-submap scale chaining
+    parser.add_argument("--boundary_scale_rolloff_tau", type=float, default=None,
+                        help="Rolloff scale for the boundary-scale weight "
+                             "w_j = 1/(1+(j/tau)^p). 0 = fixed damping.")
+    parser.add_argument("--boundary_scale_rolloff_p", type=float, default=None,
+                        help="Rolloff sharpness p (default 3).")
+    parser.add_argument("--pose_parameterisation",
+                        choices=["sl4", "sim3"], default=None,
+                        help="Pose-graph manifold. sl4 is 15-DOF projective "
+                             "(VGGT-SLAM's choice, for unknown intrinsics); "
+                             "sim3 is 7-DOF rigid+scale, which DA3's metric "
+                             "depth makes sufficient and which cannot leave "
+                             "the rigid subgroup.")
+    parser.add_argument("--submap_flow_budget", type=float, default=None,
+                        help="Close a submap when accumulated inter-keyframe "
+                             "optical flow (px) exceeds this. 0 = count only.")
+    parser.add_argument("--submap_warmup_size", type=int, default=None,
+                        help="Keyframes in the first few submaps (0 = off). "
+                             "Guards a short sequence against yielding one "
+                             "submap, which disables the whole SLAM layer.")
+    parser.add_argument("--submap_warmup_submaps", type=int, default=None,
+                        help="How many submaps use the warmup size.")
     parser.add_argument("--boundary_scale_damping", type=float, default=None,
                         help="Damping g for inter-submap scale chaining: each "
                              "boundary depth-ratio is raised to (1-g). "
@@ -216,6 +237,12 @@ def build_config(args: Namespace):
         depth_model_resolution=args.depth_model_resolution,
         backbone_dtype=args.backbone_dtype,
         boundary_scale_damping=args.boundary_scale_damping,
+        boundary_scale_rolloff_tau=args.boundary_scale_rolloff_tau,
+        boundary_scale_rolloff_p=args.boundary_scale_rolloff_p,
+        pose_parameterisation=args.pose_parameterisation,
+        submap_flow_budget=args.submap_flow_budget,
+        submap_warmup_size=args.submap_warmup_size,
+        submap_warmup_submaps=args.submap_warmup_submaps,
         boundary_scale_clamp=args.boundary_scale_clamp,
         boundary_scale_deadband=args.boundary_scale_deadband,
     )

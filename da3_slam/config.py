@@ -204,6 +204,27 @@ class SLAMConfig:
     # boundary and enables the boundary-consistency check, so one bad DA3
     # anchor pose can no longer displace a whole submap silently.
     submap_overlap: int = 1
+    # Warmup ramp for submap size.  0 = disabled (fixed submap_size, the
+    # historical behaviour).  When > 0, the first `submap_warmup_submaps`
+    # submaps hold `submap_warmup_size` keyframes and the rest hold
+    # `submap_size`.  Guards against a short sequence yielding ONE submap,
+    # which disables chaining, the SL(4) graph and loop closure at once.
+    # Smooth rolloff of the boundary-scale weight w = 1 - g:
+    #     w_j = 1 / (1 + (j / tau)^p)
+    # tau <= 0 disables it and the fixed boundary_scale_damping is used.
+    # Keeps accumulated scale variance bounded (sum w_j^2 converges for p > 1/2)
+    # without damping the first few boundaries, which measurement shows is
+    # harmful on short sequences.
+    # Close a submap once accumulated inter-keyframe optical flow (px) since
+    # its first keyframe exceeds this, in addition to the submap_size cap.
+    # 0 disables it.  Measures VIEW CHANGE rather than keyframe count, which is
+    # what DA3's cross-view attention actually depends on; scale-free, so one
+    # value serves indoor and aerial.
+    submap_flow_budget: float = 0.0
+    boundary_scale_rolloff_tau: float = 0.0
+    boundary_scale_rolloff_p: float = 3.0
+    submap_warmup_size: int = 0
+    submap_warmup_submaps: int = 2
 
     # Pose-graph parameterisation: "sl4" (15 DOF projective, inherited from
     # VGGT-SLAM) or "sim3" (7 DOF rigid+scale).  SL(4)'s extra DOF are
@@ -367,6 +388,11 @@ def load_slam_config(
     return SLAMConfig(
         submap_size=cfg["submap_size"],
         submap_overlap=int(cfg.get("submap_overlap", 1)),
+        submap_flow_budget=float(cfg.get("submap_flow_budget", 0.0)),
+        boundary_scale_rolloff_tau=float(cfg.get("boundary_scale_rolloff_tau", 0.0)),
+        boundary_scale_rolloff_p=float(cfg.get("boundary_scale_rolloff_p", 3.0)),
+        submap_warmup_size=int(cfg.get("submap_warmup_size", 0)),
+        submap_warmup_submaps=int(cfg.get("submap_warmup_submaps", 2)),
         confidence_percentile=cfg["confidence_percentile"],
         depth_model=cfg["depth_model"],
         depth_model_resolution=cfg["depth_model_resolution"],

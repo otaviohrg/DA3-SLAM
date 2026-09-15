@@ -22,7 +22,7 @@ import argparse
 from pathlib import Path
 
 import benchmark_common as bc
-from da3_runner import add_da3_cli, run_benchmark, run_da3
+from da3_runner import build_config, add_da3_cli, run_benchmark, run_da3
 
 SYSTEM = "DA3-SLAM"
 DATASET = "tum"
@@ -54,7 +54,23 @@ def benchmark_sequence(seq_dir: Path, out_dir: Path, args, model) -> dict | None
     return bc.evaluate_trajectory(
         est_ts_to_pose, gt_all, out_dir, seq_name,
         system=SYSTEM, dataset=DATASET, n_frames=timings["n_frames"],
-        timings=timings, max_diff=0.02, headline=HEADLINE, **counts)
+        timings=timings, max_diff=0.02, headline=HEADLINE, config=_resolved_config(args), **counts)
+
+
+
+def _resolved_config(args):
+    """The SLAMConfig actually used, as a dict, for results.json provenance.
+
+    Without this, results.json recorded no settings at all, so tracing a number
+    back to (say) whether token_merging was enabled relied on config/default.yaml
+    and the sweep script being unchanged months later.
+    """
+    try:
+        from dataclasses import asdict, is_dataclass
+        cfg = build_config(args)
+        return asdict(cfg) if is_dataclass(cfg) else dict(vars(cfg))
+    except Exception as exc:            # never fail a run over provenance
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def parse_args() -> argparse.Namespace:

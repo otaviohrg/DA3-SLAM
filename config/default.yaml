@@ -10,12 +10,30 @@
 #     TUM      Sim3 ATE 0.0389 -> 0.0295   (8/9 vs VGGT-SLAM 2.0's 0.0383)
 #     Replica  Sim3 ATE 0.0561 -> 0.0080   (8/8 vs VGGT-SLAM 2.0's 0.0304)
 #
-# DO NOT USE THESE ON AERIAL / KM-SCALE FOOTAGE.  Two of them diverge there:
+# DO NOT USE THESE ON AERIAL / KM-SCALE FOOTAGE.  THREE of them diverge there:
 # `boundary_scale_damping: 0.0` collapses scale on UAS (+29..58% ATE, scale
-# down to 0.097) and `loop_closure.distance_threshold: 0.80` drives the SL(4)
+# down to 0.097); `loop_closure.distance_threshold: 0.80` drives the SL(4)
 # graph off the rigid manifold on all four UAS sequences (trajectory export
-# fails with a non-positive determinant).  For that domain use the previous
-# defaults: damping 1.0 and distance_threshold 0.45.  See the notes on each key.
+# fails with a non-positive determinant — re-confirmed 2026-09-15, 0/4); and
+# `submap_size: 32` costs 2.4x on the two tunnel sequences.
+# For that domain use: damping 1.0, distance_threshold 0.45, submap_size 16.
+#
+# SUBMAP SIZE IS DOMAIN-DEPENDENT AND THIS WAS NOT PREVIOUSLY DOCUMENTED.
+# A submap is one DA3 batch, and DA3 estimates its geometry by attending
+# BETWEEN views, which needs the views to still overlap.  submap_size counts
+# KEYFRAMES, not view change, and keyframes are picked at a fixed frame stride
+# — so a fixed count spans whatever distance the camera travelled:
+#     TUM fr1/teddy   2.8 m per submap      UAS fyllingsdalen  51 m
+#     Replica room2   3.3 m per submap      UAS hornbill       65 m
+# At 65 m the first and last frames of a batch share no visible surface.
+# Measured (damping 1.0, thr 0.45, gate 0.2, % of GT path length):
+#     sequence        submap_size 32   submap_size 16   m/submap 32 -> 16
+#     fyllingsdalen        12.0%            5.0%            51 -> 27
+#     hornbill             11.8%            5.3%            65 -> 33
+#     campus_fog           10.5%            8.0%             8 ->  4
+# campus_fog was never span-limited and barely moves; the two tunnels recover
+# completely.  The 5.0-9.0% UAS figures quoted for this system were measured at
+# submap_size 16 — they do NOT hold at 32.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── DA3 model ──────────────────────────────────────────────────────────────────
@@ -77,6 +95,37 @@ submap_size: 32                # max keyframes per submap (including anchor over
                                 # reversed.  Watch: loop closures fall 3.8 -> 1.7
                                 # per sequence from 16 to 32 (fewer submaps, so
                                 # fewer eligible retrieval pairs).
+# ── submap size ramp (online-safe guard against a one-submap sequence) ────────
+# The first `submap_warmup_submaps` submaps hold `submap_warmup_size` keyframes;
+# the size then DOUBLES every `submap_warmup_submaps` submaps up to
+# `submap_size`.  At the shipped values that is 16, 16, 32, 32, 32, ...
+#
+# WHY: a short sequence at submap_size 32 can yield exactly ONE submap, which
+# silently disables the entire SLAM layer at once — no boundary to chain, a
+# one-node SL(4) graph with nothing to optimise, and loop closure structurally
+# impossible (min_submaps_apart >= 1 cannot be met).  Measured on
+# 7-Scenes/stairs (500 frames -> 32 keyframes -> 1 submap): ATE 0.1149 with
+# scale 1.140, versus 0.0305 and scale 1.008 with this ramp, which gives it 3
+# submaps.  A 3.8x difference produced purely by whether the pose graph exists.
+#
+# The ramp is CAUSAL — it depends only on how many submaps have been emitted,
+# never on total sequence length — so it works online where the length is
+# unknown.  Differing submap sizes need no special handling: graph nodes are
+# submaps and factors are relative poses at shared anchors, so no re-inference
+# is required.
+#
+# Measured cost/benefit vs fixed 32 (DASH-SLAM, 1 repeat, Sim3 ATE):
+#     TUM      0.0267 -> 0.0277  (+3.9%)
+#     Replica  0.0089 -> 0.0092  (+3.0%, within per-scene spread)
+#     7-Scenes 0.0652 -> 0.0531  (-18.6%, entirely from stairs)
+# A steeper ramp (8, 16, 32, 64, cap 128) was WORSE everywhere — TUM 0.0291,
+# Replica 0.0094, 7-Scenes 0.0539 — because an 8-keyframe first submap has
+# weak DA3 cross-view geometry exactly where errors propagate furthest.  The
+# benefit comes from guaranteeing a minimum submap COUNT, not from growth.
+# Set submap_warmup_size: 0 to restore fixed-size behaviour exactly.
+submap_warmup_size: 16
+submap_warmup_submaps: 2
+
 submap_overlap: 1              # anchor keyframes shared between consecutive submaps.
                                 # 1 = single shared node (VGGT-SLAM style).  >= 2
                                 # measures the shared frame pair in both DA3 batches:
