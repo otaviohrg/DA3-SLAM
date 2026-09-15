@@ -172,8 +172,10 @@ class SLAMResult:
                 seen_seq_idx.add(frame.seq_idx)
                 if len(frame.points_cam) == 0:
                     continue
+                # Batch unit -> submap 0's unit, matching the graph translations.
+                points_cam = frame.points_cam * np.float32(submap.global_scale)
                 points_to_world = self.optimization.point_transform(frame.seq_idx)
-                all_points.append(transform_points(frame.points_cam, points_to_world))
+                all_points.append(transform_points(points_cam, points_to_world))
                 all_colors.append(frame.colors)
 
         if not all_points:
@@ -1183,6 +1185,7 @@ class DA3SLAM:
                     pose_graph, submap, accumulated_scale,
                     tuple(ctx.config.submap_skip_strides))
 
+                submap.global_scale = accumulated_scale
                 ctx.submaps.append(submap)
                 submap_scales[submap.idx] = accumulated_scale
                 submaps_by_idx[submap.idx] = submap
@@ -1368,9 +1371,12 @@ class DA3SLAM:
         for frame in frames:
             if len(frame.points_cam) == 0:
                 continue
-            frame_points_cam.append((frame.seq_idx, frame.points_cam, frame.colors))
+            # Batch unit -> submap 0's unit, matching the graph translations
+            # (the viewer caches these, so its re-projections stay consistent).
+            points_cam = frame.points_cam * np.float32(submap.global_scale)
+            frame_points_cam.append((frame.seq_idx, points_cam, frame.colors))
             points_to_world = optimization.point_transform(frame.seq_idx)
-            points_list.append(transform_points(frame.points_cam, points_to_world))
+            points_list.append(transform_points(points_cam, points_to_world))
             colors_list.append(frame.colors)
         new_points = (np.concatenate(points_list) if points_list
                       else np.empty((0, 3), dtype=np.float32))

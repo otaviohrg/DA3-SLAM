@@ -127,6 +127,13 @@ class Submap:
     # Global confidence threshold used at build time (absolute value in [0, 1])
     confidence_threshold: float | None = None
 
+    # Running product of boundary scale ratios up to this submap (set by
+    # _processing): converts this batch's DA3 unit to submap 0's.  Graph
+    # translations are multiplied by it, so camera-space points must be too,
+    # or the submap renders at the wrong size relative to its own cameras
+    # (seams / duplicated geometry between neighbouring submaps).
+    global_scale: float = 1.0
+
     @property
     def n_frames(self) -> int:
         return len(self.frames)
