@@ -72,6 +72,21 @@ realsense: ## Run the live RealSense demo in Docker (start `make viewer` on the 
 	$(COMPOSE) run --rm realsense \
 		python3 scripts/run_realsense.py --selection_mode disparity $(ARGS)
 
+## -- Demo video -----------------------------------------------------------
+
+# Video of a run: the point cloud appearing submap by submap and the camera
+# moving along a fading trail (scripts/make_video.py).  VIDEO is written next
+# to a reusable recording, so re-rendering does not re-run SLAM.
+VIDEO ?= outputs/video/dash_slam.mp4
+
+.PHONY: video
+video: ## Record + render a demo video (IMAGE_DIR, VIDEO, ARGS overridable)
+	$(RUN) python3 scripts/make_video.py --image_dir $(IMAGE_DIR) --video $(VIDEO) $(ARGS)
+
+.PHONY: video-render
+video-render: ## Re-render an existing recording only (set VIDEO=..., ARGS=--view orbit)
+	$(RUN) python3 scripts/make_video.py --render_only --video $(VIDEO) $(ARGS)
+
 ## -- Benchmarks & ablations ----------------------------------------------
 
 .PHONY: benchmark-tum

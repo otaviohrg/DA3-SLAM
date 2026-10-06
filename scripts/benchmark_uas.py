@@ -37,11 +37,24 @@ from pathlib import Path
 
 import benchmark_common as bc
 import uas_common as uas
-from da3_runner import add_da3_cli, run_benchmark, run_da3
+from da3_runner import build_config, add_da3_cli, run_benchmark, run_da3
 
 SYSTEM = "DA3-SLAM"
 DATASET = "uas"
 HEADLINE = "sim3"
+
+
+def _cache_dir(seq_name: str, out_dir: Path, args, kind: str) -> Path:
+    """Cache dir for `kind` (frames|undistorted): shared --frames_dir ROOT/<seq>/<kind>
+    when given, else out_dir/<kind>.
+
+    Mirrors VGGT-SLAM's helper of the same name, so a single extracted-frame
+    cache serves both systems.  Bag extraction is ~20 GB and idempotent, and a
+    cross-system comparison should be reading byte-identical frames anyway.
+    """
+    if args.frames_dir:
+        return Path(args.frames_dir) / seq_name / kind
+    return out_dir / kind
 
 
 def benchmark_sequence(seq_dir: Path, out_dir: Path, args, model) -> dict | None:
@@ -73,7 +86,8 @@ def benchmark_sequence(seq_dir: Path, out_dir: Path, args, model) -> dict | None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     image_paths, timestamps = uas.extract_bag_frames(
-        bag, topic, out_dir / "frames", max_frames=args.max_frames)
+        bag, topic, _cache_dir(seq_name, out_dir, args, "frames"),
+        max_frames=args.max_frames)
     if not image_paths:
         print(f"  [SKIP] {seq_name}: no frames extracted")
         return None
@@ -82,7 +96,8 @@ def benchmark_sequence(seq_dir: Path, out_dir: Path, args, model) -> dict | None
 
     if args.undistort:
         image_paths = uas.undistort_frames(
-            image_paths, calibration, out_dir / "undistorted")
+            image_paths, calibration,
+            _cache_dir(seq_name, out_dir, args, "undistorted"))
 
     gt_all = bc.load_groundtruth(gt_txt)
     est_ts_to_pose, timings, counts = run_da3(
@@ -91,7 +106,24 @@ def benchmark_sequence(seq_dir: Path, out_dir: Path, args, model) -> dict | None
     return bc.evaluate_trajectory(
         est_ts_to_pose, gt_all, out_dir, seq_name,
         system=SYSTEM, dataset=DATASET, n_frames=timings["n_frames"],
-        timings=timings, max_diff=args.max_diff, headline=HEADLINE, **counts)
+        timings=timings, max_diff=args.max_diff, headline=HEADLINE, config=_resolved_config(args), **counts)
+
+
+
+def _resolved_config(args):
+    """The SLAMConfig actually used, as a dict, for results.json provenance.
+
+    Without this, results.json records no settings and a question as basic as
+    "which damping did this run use?" cannot be answered from the file — it
+    depends on the sweep script still existing unchanged.  That is exactly how
+    a number becomes untraceable.
+    """
+    try:
+        from dataclasses import asdict, is_dataclass
+        cfg = build_config(args)
+        return asdict(cfg) if is_dataclass(cfg) else dict(vars(cfg))
+    except Exception as exc:            # never fail a run over provenance
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,6 +140,12 @@ def parse_args() -> argparse.Namespace:
                         help="Calibration YAML override (else inferred per sequence)")
     parser.add_argument("--calib_dir", type=Path, default=None,
                         help="Dataset calibration/ folder (else auto-discovered)")
+    parser.add_argument("--frames_dir", default=None,
+                        help="Shared extracted-frame cache ROOT; frames are "
+                             "read from ROOT/<seq>/frames and undistorted into "
+                             "ROOT/<seq>/undistorted.  Same flag and layout as "
+                             "VGGT-SLAM's, so both systems consume identical "
+                             "frames instead of re-extracting ~20 GB of bags")
     parser.add_argument("--no_undistort", dest="undistort", action="store_false",
                         help="Skip fisheye undistortion")
     parser.add_argument("--max_diff", type=float, default=0.02,

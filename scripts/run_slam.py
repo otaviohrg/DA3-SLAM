@@ -20,7 +20,13 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from da3_slam.config import load_slam_config, DEFAULT_YAML, SLAMConfig
+from da3_slam.config import (
+    DEFAULT_YAML,
+    SLAMConfig,
+    add_token_merging_cli,
+    apply_token_merging_cli,
+    load_slam_config,
+)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -60,14 +66,37 @@ def parse_args(yaml_config: dict) -> argparse.Namespace:
     parser.add_argument("--depth_model_resolution", type=int,
                         default=yaml_config.get("depth_model_resolution"),
                         help="DA3 processing resolution")
+    parser.add_argument("--backbone_dtype", choices=["fp32", "bf16"],
+                        default=yaml_config.get("backbone_dtype", "fp32"),
+                        help="ViT backbone weight precision; bf16 cuts peak GPU "
+                             "memory ~40%% (see da3_slam.backend.inference.precision)")
     parser.add_argument("--use_ray_pose", action=argparse.BooleanOptionalAction,
                         default=bool(yaml_config.get("use_ray_pose", False)),
                         help="Use ray-based pose estimation instead of the camera decoder")
 
     # ── submap ────────────────────────────────────────────────────────────────
+    parser.add_argument("--submap_overlap", type=int,
+                        default=yaml_config.get("submap_overlap", 1),
+                        help="Anchor keyframes shared between consecutive "
+                             "submaps.  >=2 measures the shared frame pair in "
+                             "both DA3 batches, enabling the boundary "
+                             "consistency check (see scripts/diagnose_boundaries.py)")
     parser.add_argument("--submap_size", type=int,
                         default=yaml_config.get("submap_size"),
                         help="Max keyframes per submap (including anchor overlap)")
+    parser.add_argument("--submap_skip_strides", type=int, nargs="*", default=None,
+                        help="Extra within-submap between-factors linking frames "
+                             "k apart (e.g. 2 4 8).  DA3 measures these directly "
+                             "rather than by composition, and they make the graph "
+                             "over-determined.  Empty = consecutive only")
+    parser.add_argument("--pose_parameterisation", choices=["sl4", "sim3"],
+                        default=yaml_config.get("pose_parameterisation", "sl4"),
+                        help="Pose-graph variable type: sl4 (15-DOF projective, "
+                             "VGGT-SLAM style) or sim3 (7-DOF rigid + uniform "
+                             "scale).  Only differs where the graph has "
+                             "redundancy (loop closures, overlap>=2); SL(4) can "
+                             "then drift off the rigid subgroup, which on KITTI "
+                             "degenerates far enough to break trajectory export")
     parser.add_argument("--boundary_scale_damping", type=float,
                         default=yaml_config.get("boundary_scale_damping"),
                         help="Damping g for inter-submap scale chaining: each "
@@ -119,6 +148,26 @@ def parse_args(yaml_config: dict) -> argparse.Namespace:
     parser.add_argument("--viewer_max_points", type=int, default=60_000,
                         help="Max points logged per submap (subsampled for speed)")
 
+    # ── per-frame tracking ────────────────────────────────────────────────────
+    parser.add_argument("--realtime", type=float, nargs="?", const=-1.0, default=None,
+                        metavar="FPS",
+                        help="Feed frames at this rate (default: inferred from "
+                             "filenames, else 30) instead of as fast as the disk "
+                             "allows.  REQUIRED for --tracking to do anything "
+                             "offline: an unpaced replay finishes the frontend "
+                             "before the first submap is optimised, so the "
+                             "tracker never receives geometry")
+    parser.add_argument("--tracking", action=argparse.BooleanOptionalAction,
+                        default=bool(yaml_config.get("tracking", {}).get("enable", False)),
+                        help="Track every frame against the latest submap "
+                             "(LK + PnP) for a camera-rate pose stream; does "
+                             "not affect the map or the saved trajectory")
+
+    parser.add_argument("--tracking_set", action="append", metavar="KEY=VALUE",
+                        help="Override any TrackerConfig field, e.g. "
+                             "--tracking_set matcher=xfeat --tracking_set "
+                             "publish_all_keyframes=true (repeatable)")
+
     # ── loop closure ──────────────────────────────────────────────────────────
     parser.add_argument("--no_loop_closure", action="store_true",
                         default=not loop_closure_cfg.get("enable", True),
@@ -129,7 +178,24 @@ def parse_args(yaml_config: dict) -> argparse.Namespace:
                         help="DINO-SALAD descriptor L2 distance threshold for loop "
                              "detection (lower = stricter)")
 
+    add_token_merging_cli(parser, yaml_config)
+
     return parser.parse_args()
+
+
+def _resolve_alias(name: str | None) -> str | None:
+    """Map a short model alias (nested-giant, giant, …) to its HuggingFace ID.
+
+    The benchmark drivers go through da3_runner.resolve_model_alias; run_slam
+    took the raw string, so `--depth_model nested-giant` used to fail with a
+    404 against a repo literally named "nested-giant".
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from da3_runner import resolve_model_alias
+        return resolve_model_alias(name)
+    except Exception:
+        return name
 
 
 def build_config(args: argparse.Namespace) -> SLAMConfig:
@@ -138,11 +204,14 @@ def build_config(args: argparse.Namespace) -> SLAMConfig:
     config = load_slam_config(
         args.config,
         submap_size=args.submap_size,
+        submap_overlap=args.submap_overlap,
         confidence_percentile=args.confidence_percentile,
-        depth_model=args.depth_model,
+        depth_model=_resolve_alias(args.depth_model),
+        backbone_dtype=args.backbone_dtype,
         depth_model_resolution=args.depth_model_resolution,
         use_ray_pose=args.use_ray_pose,
         boundary_scale_damping=args.boundary_scale_damping,
+        pose_parameterisation=args.pose_parameterisation,
         boundary_scale_clamp=args.boundary_scale_clamp,
     )
     if args.no_loop_closure:
@@ -151,6 +220,12 @@ def build_config(args: argparse.Namespace) -> SLAMConfig:
         config.loop_closure.distance_threshold = args.loop_distance_threshold
     if args.min_disparity_fraction is not None:
         config.keyframe.min_disparity_fraction = args.min_disparity_fraction
+    config.tracking.enable = args.tracking
+    for override in args.tracking_set or []:
+        key, _, value = override.partition("=")
+        current = getattr(config.tracking, key)
+        setattr(config.tracking, key, value.lower() == "true"
+                if isinstance(current, bool) else type(current)(value))
     config.keyframe.selection_mode = args.selection_mode
     if args.segment_length is not None:
         config.keyframe.segment_length = args.segment_length
@@ -158,6 +233,9 @@ def build_config(args: argparse.Namespace) -> SLAMConfig:
         config.keyframe.segment_disparity_threshold = args.segment_threshold
     config.keyframes_from = args.keyframes_from
     config.dump_keyframes = args.dump_keyframes
+    if args.submap_skip_strides is not None:
+        config.submap_skip_strides = tuple(args.submap_skip_strides)
+    apply_token_merging_cli(config, args)
     return config
 
 
@@ -169,15 +247,18 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 def collect_image_paths(image_dir: str, max_frames: int | None) -> list[str]:
     """Sorted RGB image paths from a directory.
 
-    If the directory mixes RGB frames (frame*.jpg) and depth maps
-    (depth*.png), only the RGB frames are kept.
+    If the directory mixes RGB frames and depth maps, only the RGB frames are
+    kept — both the `depth*.png` layout (Replica) and the `frame-N.depth.png`
+    one (7-Scenes, where the *stem* ends in ".depth").
     """
     all_images = sorted(
         p for p in Path(image_dir).iterdir()
         if p.suffix.lower() in IMAGE_EXTENSIONS
     )
-    if any(p.stem.startswith("depth") for p in all_images):
-        all_images = [p for p in all_images if not p.stem.startswith("depth")]
+    def is_depth(path: Path) -> bool:
+        return path.stem.startswith("depth") or path.stem.endswith(".depth")
+    if any(is_depth(p) for p in all_images):
+        all_images = [p for p in all_images if not is_depth(p)]
     image_paths = [str(p) for p in all_images]
     if max_frames:
         image_paths = image_paths[:max_frames]
@@ -190,6 +271,32 @@ def timestamps_from_filenames(image_paths: list[str]) -> dict[int, float] | None
         return {i: float(Path(p).stem) for i, p in enumerate(image_paths)}
     except ValueError:
         return None  # non-numeric filenames — caller falls back to seq_idx / fps
+
+
+def _infer_fps(image_paths: list[str], default: float = 30.0) -> float:
+    """Capture rate from numeric filenames (TUM-style), else `default`."""
+    stamps = timestamps_from_filenames(image_paths)
+    if not stamps or len(stamps) < 2:
+        return default
+    span = stamps[len(stamps) - 1] - stamps[0]
+    fps = (len(stamps) - 1) / span if span > 0 else default
+    return fps if 0.5 < fps < 240 else default
+
+
+def _paced(source, fps: float):
+    """Yield frames on the camera's clock rather than the disk's.
+
+    Offline replay otherwise runs the frontend far ahead of the backend, which
+    is harmless for the map but makes live behaviour (tracking latency, queue
+    depth) impossible to observe or measure.
+    """
+    start = time.time()
+    for i, item in enumerate(source):
+        due = start + i / fps
+        delay = due - time.time()
+        if delay > 0:
+            time.sleep(delay)
+        yield item
 
 
 # ── reporting ──────────────────────────────────────────────────────────────────
@@ -217,6 +324,9 @@ def print_summary(result, n_frames: int, model_load_seconds: float, pipeline_sec
     print(f"  FPS (pipeline):      {n_frames / pipeline_seconds:.1f}")
     print()
     print("  Timing breakdown (total | per unit):")
+    if timings.get("tracking"):
+        print(f"    {'tracking':<25} {timings['tracking']:6.2f}s  "
+              f"| {timings['tracking'] / n_frames * 1000:.2f} ms/frame")
     print(f"    {'keyframe_selection':<25} {timings['keyframe_selection']:6.2f}s  "
           f"| {timings['keyframe_selection'] / n_frames * 1000:.2f} ms/frame")
     print(f"    {'submap_building':<25} {timings['submap_building']:6.2f}s  "
@@ -302,8 +412,21 @@ def main():
     slam = DA3SLAM(config)
     model_load_seconds = time.time() - model_load_seconds
 
+    if config.tracking.enable and args.realtime is None:
+        print("[run_slam] WARNING: --tracking without --realtime — an unpaced "
+              "replay runs the frontend to the end of the sequence before the "
+              "first submap is optimised, so no frame is ever tracked.")
+
+    source = None
+    if args.realtime is not None:
+        fps = args.realtime if args.realtime > 0 else _infer_fps(image_paths)
+        print(f"[run_slam] pacing input at {fps:.2f} fps "
+              f"({len(image_paths) / fps:.1f}s of footage)")
+        source = _paced(slam._disk_frame_source(image_paths), fps)
+
     pipeline_seconds = time.time()
-    result = slam.run(image_paths, on_update=viewer)
+    result = (slam.run_stream(source, on_update=viewer) if source is not None
+              else slam.run(image_paths, on_update=viewer))
     pipeline_seconds = time.time() - pipeline_seconds
 
     print_summary(result, len(image_paths), model_load_seconds, pipeline_seconds)

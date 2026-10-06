@@ -206,10 +206,93 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# ── datasets, run artifacts and vendored third-party checkouts ─────────────────
+# outputs/ alone is ~71 GB across ~245k files (map.ply up to 1.7 GB), so these
+# must never enter git history — GitHub blocks single files over 100 MB.
 data/
 outputs/
 logs/
 plots/
 salad/
+evals/
 Depth-Anything-3/
-recording.rrd
+third_party/
+checkpoints/
+_seqcache/
+
+# Benchmark/report products (results.json, *_summary.json, sweep rows, figures)
+*.json
+*.jsonl
+*.csv
+
+# Images and rendered figures
+*.png
+*.jpg
+*.jpeg
+
+# Point clouds, meshes and reconstruction output
+*.ply
+*.obj
+*.pcd
+
+# Model weights and caches
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.pkl
+
+# Recordings and dataset archives
+*.rrd
+*.bag
+*.mcap
+*.zip
+*.tgz
+*.tar.gz
+
+# ── rendered media ────────────────────────────────────────────────────────────
+# videos/ is 277 MB of rendered demo clips, regenerable from the recordings in
+# outputs/ with `make_video.py --render_only`.  The extensions also cover the
+# media inside presentation_build/, whose generators (build_slides.py,
+# build_video.sh) and .html slide sources ARE tracked.
+videos/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.gif
+*.mp3
+*.wav
+*.m4a
+
+# Compressed pickles (SLAM recordings are *.rec.pkl.gz; *.pkl does not match)
+*.pkl.gz
+
+# ── LaTeX build artefacts ─────────────────────────────────────────────────────
+# paper/ holds .tex sources and stays tracked; only the build products go.
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.toc
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
+*.synctex.gz
+
+# ── editor and OS cruft ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Evaluation harnesses and their result tables — kept on disk, out of git.
+evals/

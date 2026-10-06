@@ -1,0 +1,1005 @@
+================================================================================
+Branch C, part 2: does FastVGGT's cross-view token merging transfer to DA3?
+================================================================================
+
+GOAL
+----
+FastVGGT (ICLR 2026, ../FastVGGT) is a TRAINING-FREE acceleration of VGGT: it
+observes that the global (cross-view) attention maps of a visual geometry
+transformer are highly redundant, and therefore merges most tokens together
+BEFORE the global attention, runs attention on the merged (much shorter)
+sequence, and un-merges the result back to full length. No retraining, no
+checkpoint change, ~4x on 1000-frame ScanNet reconstructions at ~equal accuracy.
+
+DA3's backbone is architecturally the same animal (alternating per-frame /
+cross-view attention over a ViT), so the method should port almost verbatim.
+This plan works out (a) exactly where it hooks into DA3, (b) the honest ceiling
+on what it can buy DA3-SLAM, and (c) how to test it.
+
+THE HEADLINE CAVEAT, UP FRONT
+-----------------------------
+FastVGGT's 4x comes from N^2 domination: at 1000 input frames the global
+attention IS the model. DA3-SLAM runs submaps of 16 keyframes. The global
+attention share of the forward pass — and therefore the entire prize — is a
+function of submap size S, and at S=16 it is SMALL.
+
+  Analytic FLOP model (nested-giant @504, TUM 640x480 -> 504x378 -> 36x27 grid,
+  n = 973 tokens/frame, giant d=1536, 14 global blocks of 40):
+
+    global-attention share of nested-giant FLOPs
+      S=8   18%     S=32  46%
+      S=16  30%     S=64  63%      S=128  78%
+
+  Best-case speedup if merging cuts the global token count to ~35% (i.e.
+  attention cost to 0.35^2 = 12%):
+      S=16  1.36x   S=32  1.68x   S=64  2.25x   S=128  3.1x
+
+  BUT the repo's own measurement disagrees with the FLOP model, in the
+  pessimistic direction. outputs/kf_submap_grid/grid.csv gives per-frame submap
+  latency 0.168 / 0.174 / 0.193 s at S = 8 / 16 / 32. Fitting t(S) = c + k*S
+  gives k = 1.04 ms/frame/S, i.e. an EMPIRICAL global-attention share of only
+  ~10% at S=16 and ~17% at S=32 — roughly a third of the FLOP model, because
+  SDPA/flash attention runs at far higher hardware efficiency than the
+  linear/MLP layers that dominate the rest.
+
+  Empirical ceiling, then: ~1.10x at S=16, ~1.20x at S=32, ~1.35x at S=64.
+  And that is BEFORE the merge/unmerge gather-scatter overhead, which is pure
+  memory traffic and buys nothing back.
+
+CONCLUSION THAT SHAPES THIS WHOLE PLAN: porting FastVGGT to accelerate the
+CURRENT operating point is not worth it. The interesting question is the other
+direction —
+
+    FastVGGT does not make S=16 faster. It makes LARGE S AFFORDABLE.
+
+  Peak memory at S=16 is 12.8 GB (T2) on a 20 GB card; S=32 does not fit. Global
+  attention memory is what blocks it, and that is exactly what merging cuts.
+  And larger submaps are a KNOWN accuracy lever in this system: every submap
+  boundary is an anchor-frame composition + a metric-scale hop (CLAUDE.md,
+  "two concepts that are non-obvious"), so halving the number of submaps halves
+  the number of places drift can enter.
+
+  So the claim to test is NOT "same accuracy, faster". It is:
+      "merging buys a submap size we could not otherwise run, and that larger
+       submap is more accurate at equal-or-lower latency and memory."
+  That is a genuine SLAM-specific contribution, not a re-run of the FastVGGT
+  paper on a different backbone.
+
+COMPUTE: light-to-moderate. No retraining. Step 0 is an afternoon of profiling
+and decides whether to continue at all.
+
+--------------------------------------------------------------------------------
+GLOSSARY
+--------------------------------------------------------------------------------
+  Local / frame attention .. attention within ONE frame's tokens. Tensor is
+                       reshaped (b s) n c, so frames cannot see each other.
+                       Cost ~ n^2, independent of submap size.
+  Global / cross-view attention .. attention over ALL frames of the submap at
+                       once. Tensor is b (s n) c. Cost ~ (S*n)^2. THE target.
+  alt_start .......... the DA3 block index where alternating attention begins.
+                       Blocks [0, alt_start) are pure per-frame encoder; from
+                       alt_start on, ODD block indices are global and EVEN ones
+                       are local. da3-giant: alt_start=13, depth=40.
+  ToMe / bipartite soft matching .. the merging algorithm FastVGGT borrows from
+                       ToMeSD. Tokens are split into a DESTINATION set (dst, a
+                       strided sample kept intact) and a SOURCE set (src); each
+                       src token is averaged into its most cosine-similar dst
+                       token. r = how many src tokens get absorbed.
+  merge_ratio ........ FastVGGT's r as a fraction of N. Default 0.9, which in
+                       practice absorbs every src token.
+  merging (int) ...... the block index from which merging is switched ON. 0 =
+                       every global block. This is the accuracy/speed dial.
+  Protection ......... FastVGGT keeps ~10% of tokens (a uniform stride over the
+                       global index range) out of the merge, plus ALL of frame
+                       0 and all per-frame special tokens.
+  unmerge ............ scatter the attention output of a dst token back to every
+                       src token that was absorbed into it. The residual stream
+                       stays full-length; only the attention is short.
+  The "triple" ....... (ATE, backbone latency, peak GPU memory), always reported
+                       together — same convention as plan_static-compute-
+                       reduction.txt.
+
+================================================================================
+PART 1 -- THE MAPPING: FastVGGT -> DA3 (what the port actually is)
+================================================================================
+
+WHERE FASTVGGT LIVES (3 files, ~300 lines that matter)
+  ../FastVGGT/merging/merge.py
+      token_merge_bipartite2d(metric, w, h, sx, sy, r, no_rand, generator,
+                              enable_protection) -> (merge_fn, unmerge_fn)
+      The whole algorithm. Backbone-agnostic EXCEPT for one hardcoded line:
+          tokens_per_img = w * h + 5
+      (5 = VGGT's 1 camera + 4 register tokens.)
+  ../FastVGGT/vggt/layers/attention.py
+      Attention.forward(x, pos, global_merging): if global_merging is not None,
+      build (m, u) from x, merge q/k/v (m applied to all three via the
+      extra_tensors / extra_tensors_2 arguments), run SDPA on the short
+      sequence, project, then x = u(x). ~40 lines.
+  ../FastVGGT/vggt/models/aggregator.py
+      Bookkeeping only: passes global_merging=block_num into global blocks once
+      block_num >= self.merging.
+
+WHERE IT LANDS IN DA3
+  Depth-Anything-3/src/depth_anything_3/model/
+    dinov2/vision_transformer.py :: DinoVisionTransformer
+        ._get_intermediate_layers_not_chunked()  <- the block loop
+        .process_attention(x, blk, "global"|"local", pos, attn_mask)
+    utils/block.py     :: Block.forward(x, pos, attn_mask)
+    utils/attention.py :: Attention.forward(x, pos, attn_mask)   <- THE HOOK
+
+  For the default nested-giant, the anyview branch (da3-giant.yaml) is a
+  40-block vitg with alt_start=13, so the GLOBAL blocks are the odd indices
+      i = 13, 15, 17, ..., 39   ->  14 global blocks of 40.
+  Each DA3 block is used for exactly ONE attention type (unlike VGGT, which has
+  two separate ModuleLists), so the port is simply: identify those 14 blocks,
+  wrap their .attn.forward.
+
+  In DA3-SLAM this must be done as a RUNTIME PATCH, not an edit to the
+  Depth-Anything-3 checkout — that checkout is gitignored and re-cloned by
+  setup.sh, so edits there vanish on rebuild. The precedent already exists and
+  should be copied: da3_slam/backend/inference/token_tap.py attaches hooks to
+  the SAME block loop (blocks [0, alt_start), the frame-independent prefix) and
+  documents the pattern, including per-thread arming via threading.local so the
+  concurrent loop-closure re-inference is unaffected. A new
+  da3_slam/backend/inference/token_merge.py should mirror it exactly.
+  The two compose cleanly: the tap owns blocks < 13, merging owns odd blocks
+  >= 13. They never touch the same block.
+
+SEVEN CONCRETE DIFFERENCES THE PORT MUST HANDLE
+  1. SPECIAL TOKENS PER FRAME. VGGT: 5. DA3: patch_start_idx = 1 and
+     num_register_tokens = 0 (DinoV2 in DA3 never passes it), so
+         tokens_per_img = w*h + 1.
+     merge.py's `+ 5` must become a parameter. Everything downstream (the
+     cls_indices block that marks special tokens as dst) follows from it.
+     The single special token is the CAMERA TOKEN — vision_transformer.py does
+     `x[:, :, 0] = cam_token` at i == alt_start, and cam_dec reads feats[-1][1]
+     (index 0 of each frame at block 39) to produce the pose. It is already in
+     the dst set, so it is never absorbed. Good; see risk R1 below anyway.
+
+  2. THE PATCH GRID IS NOT SQUARE-FRIENDLY. At process_res 504, TUM 640x480 is
+     upper_bound_resize'd to 504x378 -> 36 x 27 patches. sy=2 does not divide
+     27: FastVGGT's `effective_h = min(hsy*sy, h)` silently leaves the bottom
+     patch row unassigned, so the last row of every frame becomes src. Not a
+     crash, but it is an undocumented asymmetry. Either pass sy=1 for odd
+     heights or extend the remainder handling. Also note FastVGGT calls
+     model.update_patch_dimensions(w, h) per scene — the grid is per-batch
+     data, not a constructor constant, and the DA3 port needs the same because
+     DA3 resolution is a swept knob (SharedSLAM.set_resolution).
+
+  3. ROPE IN GLOBAL BLOCKS IS A NO-OP IN DA3 (and this is good news).
+     _prepare_rope builds two position tensors. Local blocks get `pos` (real 2D
+     patch coordinates). Global blocks get `pos_nodiff`, which is ONES for every
+     patch token and ZERO for the special token. So DA3's cross-view attention
+     carries no spatial position at all — it is permutation-invariant over patch
+     tokens. Consequences:
+       - merging destroys no positional information here, unlike in VGGT where
+         global attention does use real 2D RoPE. The port is strictly SAFER.
+       - the (sx, sy) spatial grid used to pick dst is therefore only a
+         heuristic for spreading dst evenly over the image, nothing more.
+       - it also makes FastVGGT's founding observation (global attention maps
+         are highly redundant across tokens) a priori MORE likely in DA3.
+     Verify this empirically in Step 1 rather than trusting the reading.
+
+  3b. THE SHIPPED YAML MODEL CANNOT MERGE AT ALL. config/default.yaml sets
+     depth_model: DA3METRIC-LARGE, which is configured alt_start = -1 -- no
+     cross-view attention, so TokenMerger refuses it outright. Every merging
+     experiment must pass --depth_model nested-giant (or giant/large), the same
+     model the benchmarks and the Branch B results already use.
+
+  4. THE METRIC BRANCH IS OUT OF SCOPE. nested-giant = DA3-GIANT (anyview) +
+     DA3METRIC-LARGE (metric). The metric branch is configured alt_start = -1,
+     i.e. it has NO cross-view attention whatsoever. Merging cannot touch it.
+     It is ~20% of nested-giant's latency (T2: giant 19.1 s vs nested-giant
+     23.8 s on TUM), so it is a hard floor on any speedup: even infinitely fast
+     global attention leaves that 4.7 s. (It IS the target of a different
+     Branch C idea — it is frame-independent end to end, so it is a pure
+     temporal-reuse opportunity. Different plan.)
+
+  5. ALL FOUR DPT TAPS ARE GLOBAL BLOCKS. da3-giant out_layers = [19, 27, 33,
+     39] — every one is odd, i.e. every one is a global block, and cat_token
+     concatenates the preceding local output. So merging degradation feeds the
+     depth head at all four scales AND the pose head. There is no "safe" head.
+
+  6. REFERENCE-VIEW REORDERING ALREADY PUTS THE ANCHOR AT INDEX 0. At
+     i == alt_start - 1, when S >= THRESH_FOR_REF_SELECTION (=3) and no camera
+     conditioning is supplied (DA3-SLAM supplies none), select_reference_view /
+     reorder_by_reference move the chosen reference view to index 0.
+     FastVGGT independently marks frame 0 entirely as dst. Those two decisions
+     agree, and in DA3 the choice is principled rather than arbitrary. Keep it.
+
+  6b. THERE ARE TWO `Attention` CLASSES IN DA3 AND THE OBVIOUS ONE IS THE WRONG
+     ONE. `model/utils/attention.py` is NOT what the ViT uses; the blocks come
+     from `model/dinov2/layers/`, whose Attention keeps `head_dim` as a local
+     (derive it as C // num_heads), carries a `fused_attn` flag with a manual
+     softmax fallback, and guards RoPE on `pos is not None`. Copying the
+     `model/utils` version gives a module that looks right and fails on the
+     first attribute access. The drift guard in token_merge.py exists because
+     of this and caught it on the first GPU run.
+
+  7. attn_mask. DA3's Attention.forward accepts attn_mask and passes it to SDPA.
+     Merging changes the sequence length, so a non-None mask would be silently
+     wrong. DA3-SLAM never passes one (kwargs.get("attn_mask", None) is always
+     None from da3.py), but the port must assert this, not assume it.
+
+RISKS SPECIFIC TO USING THIS FOR SLAM
+  R1. POSE IS THE OUTPUT THAT MATTERS HERE, AND POSE IS THE MOST FRAGILE.
+      FastVGGT's headline evaluation is Chamfer distance on ScanNet point
+      clouds; it does report ate/are/rpe_rot/rpe_trans (eval/eval_scannet.py),
+      but reconstruction is the pitch. DA3-SLAM's headline is Sim3 ATE.
+      AND THE CAMERA TOKEN IS WORSE OFF THAN "EXACT QUERY, APPROXIMATE CONTEXT":
+      being a merge DESTINATION means never being absorbed into another token,
+      NOT being left untouched. ToMe's merge is a symmetric mean, so a
+      destination that absorbs sources becomes the mean of itself and them --
+      the camera token's own q/k/v are averaged with whatever patch tokens land
+      on it, and cam_dec reads exactly that token (feats[-1][1]) to produce the
+      pose. Verified in scripts/test_token_merge.py. Measure pose directly and
+      early (Step 1); the first measurements above already put it at 280x the
+      bf16 noise floor at FastVGGT's own default setting.
+  R2. SMALL BATCHES. The loop-closure worker re-infers 2 + 2*context_frames
+      (~4) frames. Merging there saves nothing and risks accuracy on the exact
+      inference that decides whether a closure is accepted. Gate merging on a
+      minimum S; leave loop-closure re-inference unmerged. (The token_tap's
+      per-thread arming already gives the mechanism.)
+  R3. NON-DETERMINISM. FastVGGT seeds its dst sampling (manual_seed(33)) so
+      merging is reproducible, but it is a NEW source of config-dependent
+      variance on top of the bf16 non-determinism the Branch B plan already
+      insists on handling with N>=3 repeats. Keep the seed fixed AND keep the
+      repeats; optionally sweep the seed once to size the merge-pattern
+      variance separately.
+  R4. A SUBTLETY IN FastVGGT's PROTECTION SET. protected_indices is a uniform
+      stride over ALL N global indices (`torch.arange(0, N, step)`), so it
+      overlaps the dst set and the special tokens. Those tokens then appear
+      TWICE in the merged sequence — once with merge-averaged q/k/v, once
+      untouched — which double-counts them in the attention denominator; the
+      unmerge scatters the protected copy last, so it wins. This ships in
+      FastVGGT and evidently works, but it is an accident of their token
+      layout. With DA3's different tokens_per_img it should be checked, and
+      `enable_protection=False` is a cheap ablation to run.
+  R5. WALL-CLOCK vs FLOPs. Merging replaces a dense, high-arithmetic-intensity
+      SDPA call with a shorter SDPA plus several gather/scatter passes that are
+      pure memory traffic. The measured share above already says the FLOP model
+      over-promises by ~3x. Report wall-clock only; FLOPs are a sanity proxy.
+
+================================================================================
+PART 2 -- THE MECHANISM: a DA3-SLAM module, zero edits to Depth-Anything-3
+================================================================================
+
+The whole port fits in one new file, `da3_slam/backend/inference/token_merge.py`,
+plus a vendored copy of the merge kernel. Nothing under `Depth-Anything-3/` is
+touched. This is not a workaround — it is the same thing `token_tap.py` already
+does to the same block loop of the same model, and its model-introspection
+helpers are reusable verbatim.
+
+WHY IT WORKS AT ALL
+  The merge is a per-block, per-call transformation of ONE tensor. It needs
+  exactly three things, and all three are reachable from a loaded model object:
+    (a) which blocks are global   -> vit.alt_start + the odd-index rule;
+    (b) the patch grid and frame count of the current batch
+                                  -> the DinoV2 wrapper's (B, S, 3, H, W) input;
+    (c) a place to intervene inside attention
+                                  -> the block's `.attn` submodule.
+  `token_tap.py` already solves (a) and (b) and its resolvers can be imported
+  as-is:
+      _resolve_net(model, "anyview")       # api wrapper -> nested -> .da3
+      _resolve_backbone(model, "anyview")  # the DinoV2 wrapper (sees B,S,3,H,W)
+      _resolve_vit(model, "anyview")       # DinoVisionTransformer: .blocks, .alt_start
+  Global blocks are then
+      [i for i in range(len(vit.blocks)) if i >= vit.alt_start and i % 2 == 1]
+  read off the loaded model — never hardcoded, so it follows model size
+  automatically (giant: 14 of 40; large: alt_start 8, depth 24 -> 8 of 24).
+
+THREE POSSIBLE MECHANISMS (pick M1; M2 is the cheap variant; M3 is a different
+method wearing the same clothes)
+
+  M1 -- MODULE SWAP.  blk.attn = MergingAttention(blk.attn)
+    A small nn.Module that holds the ORIGINAL attention's submodules by
+    reference (qkv, q_norm, k_norm, proj, proj_drop, rope, num_heads, head_dim)
+    and reimplements the ~15-line forward with the merge spliced in:
+        norm1(x) -> qkv -> qk_norm -> rope -> MERGE(q,k,v) -> SDPA -> proj
+                 -> UNMERGE
+    * Bit-exact reproduction of FastVGGT's operation order, which is what makes
+      a Step-1 accuracy result attributable to the METHOD rather than to your
+      variant of it.
+    * Fully reversible: `blk.attn = blk.attn.inner`. No weights are copied, so
+      swapping in and out is free and the sweep can flip merging on/off on a
+      model that stays loaded (SharedSLAM reuses one model across configs).
+    * Cost: duplicates ~15 lines of DA3's Attention.forward, so it can drift if
+      setup.sh re-clones a changed upstream. Guard it — see DRIFT GUARD below.
+    RECOMMENDED as the primary implementation.
+
+  M2 -- PURE PRE/POST HOOKS on blk.attn.  No duplicated code at all.
+    pre-hook  (with_kwargs=True): build (m, u) from the incoming x, return
+                                  (m(x),) and a `pos` gathered down to the
+                                  merged index set;
+    post-hook (with_kwargs=True): return u(output).
+    DA3's own unmodified Attention.forward runs on the short sequence in
+    between. This is EXACTLY equivalent to M1 for the linear parts, because the
+    qkv projection is affine:
+        Linear(mean(x_i)) = W*mean(x_i) + b = mean(W*x_i + b) = mean(Linear(x_i))
+    so merging the input and then projecting gives precisely FastVGGT's
+    mean-merged q/k/v. It differs in exactly two places:
+      - `qk_norm` (LayerNorm, nonlinear) applies AFTER merging instead of
+        before. Second-order for near-identical tokens — which is the premise
+        of merging in the first place — but it is a real difference;
+      - RoPE applies to the merged tokens' gathered positions rather than
+        pre-merge. In DA3 this is a non-issue for patch-to-patch merges because
+        global positions are UNIFORM (difference #3: pos_nodiff is all-ones for
+        every patch token), and bites only for a patch token absorbed into a
+        camera token (pos 0).
+    * Zero duplication, pure public nn.Module hook API, needs no drift guard.
+    * Worth implementing as a flag on the same module and ablating in Step 1:
+      if M2 matches M1 inside the noise band, keep M2 and the implementation
+      becomes maintenance-free.
+
+  M3 -- HOOK THE WHOLE BLOCK (merge before norm1, unmerge after the MLP).
+    Tempting, because it would also shorten the MLP — 16*d^2 per token, the
+    single largest term in the forward, far bigger than the attention this plan
+    is chasing. But it is NOT FastVGGT: it collapses the residual stream, so
+    every absorbed token receives the destination token's entire block output
+    rather than its own residual. That is a strictly more aggressive method
+    with a different accuracy profile.
+    Do not ship it as "the port". Note it as a follow-up idea and, if Step 1
+    shows DA3 tolerates merging easily, test it as its own hypothesis — the
+    upside is much larger than FastVGGT's, precisely because it attacks the
+    term that actually dominates at S=16.
+
+WHAT THE MODULE OWNS (all of it inside da3_slam/)
+  1. `_tome.py` — vendored from ../FastVGGT/merging/merge.py, with
+     tokens_per_img parameterised (w*h + patch_start_idx + num_register_tokens
+     instead of the hardcoded w*h + 5) and the odd-patch-height remainder
+     handled (difference #2). The file imports nothing but torch, so it
+     vendors cleanly. LICENSING: FastVGGT ships under Meta's *VGGT License*
+     (research-use terms), not Apache-2.0 — keep its header, do not relabel it
+     under this repo's MIT. If that is a problem, bipartite soft matching is
+     ~80 lines and can be reimplemented from the ToMe paper.
+  2. `token_merge.py` — discovery (reusing token_tap's resolvers), the M1/M2
+     wrapper, arming, and the knobs.
+  3. Per-batch geometry: a forward_pre_hook on the DinoV2 wrapper reads
+     (B, S, 3, H, W) and stores w = W // patch_size, h = H // patch_size, and
+     S for the call. This is DA3's equivalent of FastVGGT's per-scene
+     model.update_patch_dimensions(w, h), and it makes the module automatically
+     correct across the resolution sweep (SharedSLAM.set_resolution) instead of
+     hardcoding a 36x27 grid. Copy `_on_backbone_start` from token_tap.
+  4. Per-thread arming (threading.local), same as the tap: the loop-closure
+     worker shares one DepthEstimator with the inference thread, and its ~4-frame
+     re-inference must never be merged (R2). Gate on a minimum S there too.
+  5. Knobs: merging start expressed as a POSITION AMONG THE GLOBAL BLOCKS (0-13
+     for giant), not a raw block index — that is the unit that transfers across
+     model sizes; plus merge_ratio, sx, sy, enable_protection, seed, min_frames.
+
+DRIFT GUARD (M1 only)
+  The Depth-Anything-3 checkout is gitignored and re-cloned by setup.sh, so an
+  upstream change could silently invalidate the duplicated forward. On attach,
+  assert the attention module still has the attributes the copy assumes
+  (qkv, q_norm, k_norm, proj, proj_drop, rope, num_heads, head_dim) and that
+  attn_mask is None (difference #7); optionally hash inspect.getsource of the
+  upstream Attention.forward and warn loudly on mismatch. M2 needs none of this.
+
+INTERACTION WITH THE EXISTING TAP
+  None. The tap hooks blocks [0, alt_start); merging wraps odd blocks
+  >= alt_start. They never touch the same block and can be armed together.
+  The reference-view reorder at i == alt_start - 1 happens in the block LOOP,
+  not in a block, and permutes frames before the first global block — so by the
+  time the wrapper sees (B, S*n, C), index 0 is already the reference view,
+  which is exactly the frame FastVGGT wants held out as destination (#6).
+
+================================================================================
+STATUS -- the module is BUILT; first measurements are in
+================================================================================
+
+Implemented (M1, nothing under Depth-Anything-3/ touched):
+  da3_slam/backend/inference/_tome.py         vendored merge kernel
+  da3_slam/backend/inference/token_merge.py   TokenMerger + MergingAttention
+  da3_slam/config.py                          TokenMergingConfig + CLI helpers
+  config/default.yaml                         token_merging: block (enable: false)
+  scripts/test_token_merge.py                 kernel + model smoke test
+
+  scripts/sweep_merging.py                    the Step-2 grid driver
+  scripts/report_merging.py                   tables + figures from its rows
+
+  On/off:  --token_merging / --no_token_merging  (run_slam.py and every
+           benchmark_*.py), YAML token_merging.enable, or
+           SharedSLAM.set_token_merging(cfg) for a sweep on a resident model.
+           OFF detaches the wrapper entirely.
+
+  Step 2 is therefore runnable as written:
+      python scripts/sweep_merging.py --seq_dir <the 4 UAS GT sequences> \
+          --submap_sizes 16 24 32 48 --merge_starts off 0 7 --repeats 3 \
+          --seqcache outputs/sweep/step1_uas_resolution/_seqcache \
+          --out_dir outputs/merging
+      python scripts/report_merging.py --rows outputs/merging/merging_rows.jsonl \
+          --out_dir outputs/merging
+  It freezes keyframes once per sequence and replays them across the whole grid
+  (without that control, submap_size also moves keyframe SELECTION through
+  keyframe.max_submap_size and every ATE difference is confounded), records OOM
+  cells with their high-water memory instead of dropping them, and reports UAS
+  ATE as % of GT path length.
+
+FIRST MEASUREMENTS (nested-giant @504, fr1/xyz, ONE 16-frame batch, no repeats —
+indicative only, not a benchmark):
+
+  bf16 noise floor over two unmerged runs:  depth 2.3e-03 m,  pose 2.3e-05
+  realised token ratio: 0.389  (attention cost ~0.151x in merged blocks)
+
+    merge start   backbone s   d depth      d pose      d pose / noise
+    off (base)        2.726    2.3e-03      2.3e-05           1x
+    block  0/14       2.614    1.02e+00     6.49e-03        280x
+    block  4/14       2.692    7.76e-01     4.13e-03        178x
+    block  7/14       2.696    5.23e-01     3.80e-03        164x
+    block 10/14       2.713    5.94e-01     2.15e-03         93x
+    block 13/14       2.731    5.19e-02     1.32e-03         57x
+
+Two things fall straight out, and both were predicted above:
+
+  1. THE SPEEDUP IS ~4% AT S=16, EVEN MERGING EVERY GLOBAL BLOCK. 2.726 ->
+     2.614 s, while the merged blocks' attention dropped to ~15% of its cost.
+     This is the empirical version of the Step-0 argument: at a 16-frame submap
+     the cross-view attention is ~10% of the forward, and the merge/unmerge
+     gather-scatter eats most of what it saves.  The "same config, faster"
+     framing is dead on arrival; Step 2's large-submap framing is the study.
+
+  2. THE DEVIATION IS LARGE AND POSE IS THE SENSITIVE OUTPUT.  At FastVGGT's own
+     default (start=0, ratio 0.9) the pose deviation is 280x the bf16 noise
+     floor, and even merging ONLY THE LAST global block leaves it at 57x.  The
+     deviation does fall monotonically as merging starts later, so the knob
+     behaves, but there is no obviously free setting.  Note this is a raw
+     backbone deviation, NOT an ATE result — the pose graph may well absorb it,
+     which is exactly what Step 1 has to establish against the noise band, on
+     real sequences, with repeats.
+
+SECOND MEASUREMENT — AND IT UNDERCUTS STEP 2's PREMISE
+(sweep_merging.py smoke run: nested-giant @504, UAS frozen_lake, first 2500
+frames, 257 frozen keyframes, loop closure off, ONE repeat — the ATE column is
+not conclusive, but the MEMORY column is, because peak memory is a
+near-deterministic quantity that does not need repeats.)
+
+  submap  merging   ATE %   submaps   backbone s   peak MB   tok ratio
+    16      off      5.30      18        45.3      12396.8      —
+    16      on       7.54      18        44.4      12395.8    0.389
+    32      off      8.67       9        47.5      14024.4      —
+    32      on      15.62       9        43.5      14024.8    0.367
+
+  MERGING DOES NOT REDUCE PEAK MEMORY. Not by a little — by 1 MB out of 12.4 GB
+  at submap 16, and by nothing at all (in fact +0.4 MB) at submap 32, while the
+  token count in the merged blocks fell to 0.39x. The whole "merging makes a
+  larger submap affordable" argument rests on merging relieving the memory
+  wall, and it does not.
+
+  Why, in hindsight: SDPA/flash attention is already O(N) in memory, not
+  O(N^2), so shortening the sequence saves little that was ever allocated; the
+  residual stream stays full-length through every block regardless; the merge
+  itself allocates flattened q/k/v plus merged copies, which gives back most of
+  what it saves; and the peak is evidently set somewhere else entirely (the DPT
+  head decoding four full-resolution feature maps, and/or the per-frame token
+  tensor across all frames). Step 0's profiling should now be pointed at
+  WHERE the peak actually is, because that — not attention — is what gates
+  submap size.
+
+  Note also that ATE got WORSE with the larger submap in both arms here
+  (5.30 -> 8.67 baseline), which is the opposite of Step 2's H2. One truncated
+  sequence with loop closure off proves nothing, but combined with the mixed
+  evidence already in outputs/kf_submap_grid/grid.csv it is a warning that the
+  "fewer boundaries = less drift" story may not survive contact with data.
+
+THIRD MEASUREMENT — WHY IT WORKS ON VGGT AND NOT HERE (and the memory wall)
+Backbone-only forwards, nested-giant @504, same frames repeated to fill the
+batch, warm, one measurement per cell (memory is deterministic; the timings
+are stable to ~1%):
+
+    S     off s   off GB   merged s   merged GB    tok   speedup   mem ratio
+   16      2.70    12.10       2.64       12.11  0.389     1.02x       1.00x
+   32      5.94    13.69       5.38       13.69  0.365     1.10x       1.00x
+   64       OOM    16.72        OOM       16.69      -         -           -
+  128       OOM    16.97        OOM       17.57      -         -           -
+
+  BOTH ARMS OOM AT THE SAME SUBMAP SIZE.  Merging does not move the memory wall
+  by a single step.  That kills the large-submap framing outright: the memory
+  that gates submap size is not attention memory, so merging cannot buy a
+  submap size the baseline cannot reach.  H2 has no mechanism.
+
+  The reason is structural, and it applies to VGGT identically: both models use
+  `F.scaled_dot_product_attention` (VGGT-SLAM/third_party/vggt/vggt/layers/
+  attention.py:60; DA3 model/dinov2/layers/attention.py), which is O(N) in
+  memory, not O(N^2).  There was never an N^2 memory term for merging to
+  remove.  FastVGGT never claimed one — its claim is wall-clock on long
+  sequences — and this plan's "merging makes large submaps affordable" premise
+  was an inference of ours that the measurement does not support.
+
+WHY FASTVGGT WORKS ON VGGT: IT IS SEQUENCE LENGTH, NOT THE ARCHITECTURE
+Global-attention share of per-token FLOPs, from the two repos' actual configs
+(VGGT: DINOv2 ViT-L patch_embed 24 blocks + 24 aggregator blocks doing frame
+AND global attention, d=1024, 1041 tokens/frame.  DA3 nested-giant: 26 local +
+14 global at d=1536, plus a 24-block metric branch at d=1024 with NO global
+attention at all, 973 tokens/frame).  "max speedup" applies the measured token
+ratio 0.389 to the merged blocks:
+
+      S      VGGT share   max speedup      DA3 share   max speedup
+      8           28.9%         1.32x          17.7%         1.18x
+     16          44.8%         1.61x          30.0%         1.34x
+     17          46.3%         1.65x          31.3%         1.36x
+     32          61.9%         2.11x          46.2%         1.64x
+    128          86.7%         3.78x          77.4%         2.92x
+   1000          98.1%         5.96x          96.4%         5.50x
+
+  Read the last row against the first few.  FastVGGT evaluates at
+  --input_frame 1000, where global attention is 98% of VGGT and essentially
+  the whole model; that is where "up to 4x" comes from.  At S=16-17 — which is
+  VGGT-SLAM's OWN default (main.py:27, submap_size=16 + 1 overlapping frame) —
+  the ceiling is 1.65x, and the FLOP model overstates reality by ~3x on this
+  hardware (attention runs at far higher efficiency than the linear layers:
+  we measured 1.02x against a 1.34x ceiling at S=16, 1.10x against 1.64x at
+  S=32).  So FastVGGT applied to VGGT-SLAM would buy roughly what it buys us:
+  a few percent.
+
+  The architecture difference is real but SECONDARY — a 1.5x gap in attention
+  share at S=16 (45% vs 30%), from three compounding causes:
+    1. VGGT makes 24 of its 48 aggregator blocks global (50%); DA3-giant makes
+       14 of 40 (35%).
+    2. VGGT is d=1024, DA3-giant d=1536.  Linear cost scales d^2 but attention
+       scales d, so the wider model buries attention 1.5x deeper.
+    3. nested-giant carries a whole second branch (metric, 24 blocks) with
+       alt_start=-1 — zero global attention, pure dead weight for merging.
+  Closing all three would move DA3 from 30% to VGGT's 45% at S=16, i.e. from a
+  1.34x ceiling to 1.65x.  Not the difference between "works" and "doesn't".
+
+DECISION FOR THIS BRANCH
+  The method is correctly ported and verified; the regime is wrong.  Merging
+  pays only when the batch is long enough for cross-view attention to dominate
+  (S >~ 128), and SLAM submaps are 16-32 by construction — and cannot be grown,
+  because merging does not move the memory wall.  DO NOT RUN STEP 2 AT SCALE.
+  Report the negative result: it is a clean, quantified statement about where a
+  VGT-based SLAM system's compute actually is, it explains a published 4x
+  without contradicting it, and it applies to VGGT-SLAM as much as to DA3-SLAM.
+
+Steps 0 and 1 below stand as written if the branch is revived.
+
+================================================================================
+STEP 2 RAN AFTER ALL — AND IT CLOSES THE BRANCH (results/merging_uas/)
+================================================================================
+bf16 backbones made the large submaps reachable, so the full grid was run:
+7 submap sizes x 2 arms x 4 UAS GT sequences, nested-giant @504, frozen
+keyframes, loop closure on, 1 repeat.  56/56 cells, zero OOM.
+
+  submap   unmerged   merged   d backbone   d peak mem
+      8      5.66%     6.40%       -0.5%        -5.0%
+     16      6.34%     9.09%       -1.8%        -4.5%
+     32      9.65%    11.64%       -7.3%        -2.2%
+     48     13.39%    13.52%      -14.8%        -2.2%
+     64     12.88%    13.26%      -20.1%        +0.9%
+     96     12.69%    14.10%      -26.9%       +13.3%
+    128     12.73%    11.87%      -32.6%       +16.0%
+
+  H2 IS NOT MERELY UNSUPPORTED, IT IS BACKWARDS.  ATE more than DOUBLES from
+  submap 8 to 48 and then plateaus.  Larger DA3 batches lose more than the
+  submap boundaries they remove ever cost.  The best cell in the grid is the
+  SMALLEST size tested, and the best single run is fyllingsdalen at submap 8
+  (3.51%) — which means the knee may well be below 8 and nobody has looked.
+
+  Large submaps are STRICTLY DOMINATED: worse ATE, more time (205.9 s -> 323.7 s
+  from 16 to 128, attention being quadratic within a batch while the frame count
+  is fixed) and nearly double the memory.  There is no trade to make.
+
+  Merging costs accuracy at 6 of 7 sizes and only earns real speed past submap
+  48, by which point the baseline ATE is already ruined.  Its best speed result
+  (-32.6% at submap 128) buys +16% memory at twice the submap-8 error.  The one
+  size where merging wins on ATE is the worst operating point in the grid.
+
+  CAVEAT: 1 repeat.  The submap-size effect (2.4x) is far beyond any plausible
+  noise; the merged-vs-unmerged deltas at submaps 8/48/64 (+0.13..+0.74 pp) are
+  NOT established.  `sweep_merging.py --resume --repeat_offset 1` appends more.
+
+  BRANCH DECISION: closed, negative, and quantified.  The follow-up work this
+  points at is NOT merging — it is (a) sweep submap size DOWNWARD from 16, and
+  (b) validate bf16 backbones against fp32 on ATE, since bf16 is the only lever
+  measured so far that moves memory (-40%) at apparently no accuracy cost.
+
+================================================================================
+WHERE THE PEAK ACTUALLY IS (scripts/profile_da3_memory.py)
+================================================================================
+Module-boundary sampling of torch.cuda.max_memory_allocated (monotonic between
+resets, so the stage during which it last rose IS the stage that set the peak —
+no attribution heuristics).  nested-giant @504, 16 frames, RTX 4000 Ada 20 GB:
+
+  PEAK 11,819 MB
+    6,511 MB (55%)  PARAMETERS — 1,689,845,528 of them, ALL fp32
+    5,308 MB (45%)  activations, peak inside model.da3.head
+                    (`scratch.refinenet1`, `refinenet1_aux`, `output_conv1_aux`
+                     — the DPT decoder's finest, full-pixel-resolution stages)
+
+  The metric branch raises the peak by 0 MB (it runs after the anyview branch
+  has released its working set) but keeps 610 MB resident.
+
+  Scaling: peak(MB) ~= 9,500 + 127 * frames.  At submap 16 that is 80%
+  frame-INDEPENDENT.  This is why submap size is memory-gated so hard: you are
+  paying ~9.5 GB before the first frame, and only ~127 MB per frame after it.
+  It is also why cross-view attention could never have been the lever — it is a
+  fraction of the 45% that varies at all.
+
+  Resolution matters more than frames for the activation part, as expected from
+  the head working at pixel resolution: 4 frames at 280/392/504 gives
+  8,580 / 8,846 / 9,391 MB.
+
+SCALING ACROSS SUBMAP SIZES AND LONG SEQUENCES
+  `profile_da3_memory.py --scaling --arms fp32 fp32+merge bf16 bf16+merge`,
+  nested-giant @504, RTX 4000 Ada 20 GB:
+
+  PEAK MEMORY (MB)                        BACKBONE LATENCY (s)
+    N     fp32  +merge    bf16  +merge      fp32  +merge    bf16  +merge  spdup
+    8    11047   11050    6688    6689      1.29    1.35    1.28    1.32  0.97x
+   16    11819   11816    7100    7099      2.67    2.66    2.67    2.64  1.01x
+   32    13375   13372    7918    7919      5.82    5.28    5.84    5.36  1.09x
+   48    14918   14922    8740    8740      9.26    8.02    9.47    7.97  1.19x
+   64      OOM     OOM    9558    9733       OOM     OOM   13.92   11.19  1.24x
+   96      OOM     OOM   11198   12732       OOM     OOM   23.98   17.72  1.35x
+  128      OOM     OOM   13504   15724       OOM     OOM   37.30   24.75  1.51x
+  192      OOM     OOM     OOM     OOM       OOM     OOM     OOM     OOM      -
+
+  peak(MB) = constant + slope*N          constant   MB/frame   they cross at N
+    fp32                                    10272       96.8              106
+    bf16                                     6139       55.4              111
+    bf16+merge                               5606       75.0               75
+
+  THREE THINGS FALL OUT.
+
+  1. MEMORY IS CONSTANT-DOMINATED ACROSS EVERY SUBMAP SIZE ANYONE WOULD USE.
+     The frame-independent floor equals the frame-dependent part only at
+     N ~ 106 (fp32) / 111 (bf16).  Below that — i.e. at every submap size this
+     system runs — you are mostly paying a fixed cost.  The measured wall is
+     between 48 and 64 frames for fp32, and between 128 and 192 for bf16
+     backbones (the linear fit's "max N" is optimistic; fragmentation and
+     transient spikes bring the wall in earlier).
+
+  2. MERGING NEVER SAVES MEMORY, AND AT LONG SEQUENCES IT COSTS MEMORY.
+     Identical to within 5 MB up to N=48, then it goes the wrong way:
+     +175 MB at N=64, +1534 MB at N=96, +2220 MB (+16%) at N=128.  The
+     merge/unmerge buffers (flattened full-length q/k/v plus their merged
+     copies) grow with N faster than the shortened attention saves, so merging
+     LOWERS the maximum usable sequence length — the fit puts the bf16 ceiling
+     at N~240 without merging and N~185 with it.  Merging is memory-negative at
+     exactly the lengths where it was supposed to help.
+
+  3. THE SPEEDUP IS REAL AND GROWS WITH N, EXACTLY AS THE SEQUENCE-LENGTH
+     EXPLANATION PREDICTS: 1.01x at N=16 -> 1.09x at 32 -> 1.24x at 64 ->
+     1.51x at 128.  This is the empirical confirmation of the VGGT comparison
+     above: FastVGGT's mechanism is genuine, it simply needs sequence lengths
+     that submap-based SLAM never uses.  (The FLOP ceiling overstates the
+     measurement by ~1.5-2x throughout, as expected.)
+
+  So for long sequences the honest summary is: merging buys ~1.5x speed at
+  N=128 in exchange for ~16% more memory — a real trade, but one that only
+  exists at submap sizes 4-8x larger than DA3-SLAM uses, and the earlier UAS
+  smoke test found larger submaps made ATE worse, not better.
+
+THE LEVER THE PROFILE POINTS AT (measured, NOT adopted)
+  The parameters are fp32 while the backbone runs under autocast bf16 — so for
+  the ViTs the fp32 master copies are storage the forward never benefits from
+  (autocast re-casts them to bf16 on every matmul).  Casting ONLY the two ViT
+  backbones to bf16, with a forward hook casting their outputs back to fp32 at
+  the head boundary (DA3 runs the heads under autocast(enabled=False), so the
+  dtypes must be reconciled explicitly — a bare `.to(bfloat16)` dies with
+  "mat1 and mat2 must have the same dtype" in cam_dec):
+
+    variant     N   weights MB   peak MB    d depth    d pose
+      fp32     16         6520     11819          -         -
+      fp32     32         6520     13374          -         -
+      fp32     48         6520     14918          -         -
+      fp32     64         6520       OOM          -         -
+    bf16-bb    16         3735      7098   1.94e+01  7.29e-03
+    bf16-bb    32         3735      7919   1.95e+01  1.03e-02
+    bf16-bb    48         3735      8739   3.28e+01  7.50e-03
+    bf16-bb    64         3735      9558          -         -
+
+  -40% peak at submap 16, and SUBMAP 64 RUNS where fp32 OOMs.  The peak falls
+  by more than the 2.8 GB of weights saved because autocast's per-matmul bf16
+  copies of fp32 weights disappear too.  That is the memory lever token merging
+  was supposed to be and was not.
+
+  BUT IT IS NOT FREE, AND IT IS NOT ADOPTED.  The pose deviation (7.3e-03) is
+  ~300x the bf16 run-to-run noise floor measured earlier (2.3e-05) — the same
+  order as full token merging's perturbation.  The difference is what it buys:
+  merging bought ~0% memory and ~4% speed for that damage, bf16 backbones buy
+  40% memory and a submap size the baseline cannot reach.  Before adopting it,
+  it needs exactly the Step-1 treatment: does the pose graph absorb the
+  deviation, measured as ATE against the noise band over >=3 repeats?  That is
+  a much better use of the harness in scripts/sweep_merging.py (point its arms
+  at fp32-vs-bf16 instead of unmerged-vs-merged) than finishing Step 2.
+
+================================================================================
+STEP 0 -- Measure the prize before building anything (HALF A DAY, DO THIS FIRST)
+================================================================================
+
+WHAT:
+  HYPOTHESIS H0: the global-attention share of the nested-giant forward pass is
+  ~10% at S=16 and grows roughly linearly in S, so that merging is worth
+  building only in combination with a larger submap size.
+
+  This step is a kill switch. It costs almost nothing and it decides whether
+  Steps 1-3 happen at all.
+
+HOW:
+  1. Profile the DA3 forward directly. torch.profiler around
+     DepthEstimator.infer (da3_slam/backend/inference/depth_estimator.py — it
+     already brackets the forward with cuda.synchronize and resets peak-memory
+     stats, so the instrumentation point exists). Attribute time to the 14 odd
+     blocks >= 13 of the anyview branch, and within them separate the SDPA call
+     from the qkv/proj/MLP linears. A simpler equivalent: register forward hooks
+     that time each block, then subtract a local block of the same index parity.
+  2. Sweep S = 8, 16, 24, 32 on ONE TUM sequence with frozen keyframes and
+     report (a) total backbone seconds, (b) global-SDPA seconds, (c) peak
+     memory. Find where S OOMs on the 20 GB card.
+  3. Sanity-check against outputs/kf_submap_grid/grid.csv (0.168 / 0.174 /
+     0.193 s per frame at S = 8 / 16 / 32) — different dataset and aspect
+     ratio, so expect agreement in slope, not absolute value.
+
+EXPECTED OUTPUT / DECISION:
+  TABLE T0 -- rows = S in {8,16,24,32}, columns = {backbone s, global-SDPA s,
+    global-SDPA %, peak GB, OOM?}.
+  - If global-SDPA is >= ~25% at a submap size that FITS, the "faster at S=16"
+    framing is alive after all; proceed with both framings.
+  - If it is ~10% at S=16 (the expected outcome), DROP the speed framing
+    entirely and run Steps 1-3 as the "merging unlocks large submaps" study.
+  - If S=32 already fits in 20 GB without merging, the memory argument weakens
+    and the whole plan should be re-scoped to a pure accuracy study of submap
+    size — cheaper, and it does not need FastVGGT at all. Learn this now.
+
+================================================================================
+STEP 1 -- Port the merge and validate it in isolation (no SLAM yet)
+================================================================================
+
+WHAT:
+  HYPOTHESIS H1: bipartite token merging in DA3's global blocks changes the
+  backbone's per-submap outputs (depth, confidence, relative poses) by less
+  than the bf16 run-to-run noise band, for some non-trivial (merging,
+  merge_ratio) setting.
+
+  Testing this on raw backbone outputs — before the pose graph, before the
+  keyframe selector, before loop closure — is what makes a later ATE result
+  interpretable. If the poses out of a single forward pass are already wrong,
+  no amount of backend tuning will save the ATE, and you will have learned it
+  in one afternoon instead of one week.
+
+HOW:
+  1. Build the module exactly as specified in PART 2 (M1 module swap +
+     vendored _tome.py, both under da3_slam/, no edits to the DA3 checkout).
+  2. Reproduce FastVGGT's founding observation ON DA3 before trusting it: dump
+     the global attention maps for a 16-frame TUM batch and check the
+     token-to-token similarity per block. FastVGGT ships this
+     (eval_scannet.py --vis_attn_map --merging 0 writes per-block overlays);
+     the DA3 equivalent is a few lines given the wrapper. Given difference #3
+     (no positional signal in DA3's global attention), redundancy should be at
+     least as strong — but the point is to SEE it, and to see WHICH blocks are
+     redundant, because that directly sets the `merging` start index.
+  3. Backbone-level A/B on frozen keyframes, one submap at a time:
+       - depth: relative error and confidence-weighted error vs the unmerged
+         forward, per frame;
+       - POSE: relative rotation (deg) and translation (as a fraction of submap
+         extent) of every frame w.r.t. the anchor, vs the unmerged forward.
+         This is the number that matters (R1);
+       - both compared against a NOISE FLOOR obtained by running the unmerged
+         forward 3 times (bf16 non-determinism).
+     Sweep the start block: merging at global-block position 0, 2, 4, 7, 10 of
+     14, at merge_ratio 0.9. Then sweep merge_ratio {0.5, 0.7, 0.9} at the best
+     start. Then ablate enable_protection (R4).
+
+WHAT TO EXPECT:
+  Early global blocks are where the model still does real cross-view matching;
+  merging there should hurt most. Expect a threshold: merging from some middle
+  global block onward is inside the noise band, merging from block 0 is not.
+  FastVGGT's own default (--merging 0, i.e. everything) may well NOT transfer,
+  because DA3-giant has 14 global blocks where VGGT has 24 — proportionally,
+  DA3 has less depth to absorb the approximation.
+
+MEETING ARTIFACTS:
+  FIGURE F0 -- per-global-block token-similarity heatmap for DA3 (the DA3
+    version of FastVGGT's assets/attn_map.png). Read together: is the founding
+    observation true here, and from which block?
+  TABLE T1 -- rows = (merging start, merge_ratio), columns = {depth rel-err,
+    pose rot deg, pose trans %, global-SDPA speedup, noise floor for each}.
+    Read together: the largest merge that stays inside the noise band on POSE.
+
+================================================================================
+STEP 2 -- The real experiment: does merging buy a better submap size?
+================================================================================
+
+WHAT:
+  HYPOTHESIS H2: with merging on, a submap of S=32 (or 48/64) runs at
+  latency and memory at or below the unmerged S=16 baseline, AND is more
+  accurate, because it halves the number of submap boundaries — and every
+  boundary is an anchor-frame pose composition plus a metric-scale hop, i.e. a
+  place where drift enters (CLAUDE.md, the two structural invariants).
+
+  This is the paper-worthy version of the idea. "Training-free merging makes a
+  visual-geometry backbone 1.1x faster" is not interesting. "Training-free
+  merging changes which submap size a VGT-based SLAM system can afford, and the
+  bigger submap is more accurate" is a result about the SYSTEM, and it is one
+  that only shows up if you evaluate inside a SLAM pipeline.
+
+  The counter-hypothesis to take seriously: larger submaps might NOT help ATE.
+  outputs/kf_submap_grid/grid.csv (UAS, 2 sequences) is genuinely mixed —
+  S=32 is best at stride 4, worst at stride 16. And RPE gets monotonically
+  WORSE with larger submaps at every stride. If H2 fails, that is still a clean
+  finding: it says DA3's cross-view attention does not improve with more views
+  in the batch, which is itself worth knowing and which closes Branch C's
+  cross-view axis the way Branch B closed the static axis.
+
+HOW:
+  Reuse the existing harness — do NOT build a new one. scripts/sweep_compute.py
+  already does frozen keyframes, N repeats, one model load per size, backbone-
+  only latency, peak memory, and one JSONL row per run
+  (plan_static-compute-reduction.txt Step 0 built exactly this). Add two axes:
+    - --merging / --merge_ratio, threaded through a
+      SharedSLAM.set_merging(...) that mirrors set_resolution(...) (the merge
+      wrapper lives on the estimator, which reconfigure() does not rebuild, so
+      one model load covers the whole grid);
+    - --submap_size, which sweep_compute currently does not vary.
+
+  GRID: {merging off, merging at the Step-1 best} x S in {16, 32, 64} x
+  N>=3 repeats, on the Branch B dev subset (fr1/desk, fr1/xyz, fr1/room) with
+  the SAME frozen keyframe lists Steps 1-3 of Branch B used — that is what makes
+  this comparable to the existing baseline (T2: nested-giant @504, TUM Sim3 ATE
+  0.0509 m, 23.8 s backbone, 12.8 GB).
+
+  Cells where merging is off and S is large will OOM. THAT IS THE RESULT, not a
+  failure: record it as OOM in the table. It is the whole argument for the
+  method.
+
+  Then VALIDATE the winner on all 9 TUM fr1 sequences + Replica (8 scenes),
+  3 repeats, against the S=16 unmerged default. Branch B's Step 3 was overturned
+  once already by held-out validation on UAS, so also run the 4 UAS GT
+  sequences — km-scale, long, and the domain where submap count matters most.
+
+WHAT TO EXPECT:
+  The plausible win is at S=32: about the same latency as unmerged S=16 (the
+  merge cancels the extra attention, the linear layers scale with frame count
+  either way, so expect latency roughly proportional to frames — the saving is
+  in MEMORY and in submap COUNT, not in per-frame cost), clearly lower peak
+  memory than unmerged S=32 would need, and fewer boundaries. Whether ATE
+  improves is the open question.
+
+MEETING ARTIFACTS:
+  TABLE T2 -- rows = (merging on/off) x S in {16,32,64}, columns = {Sim3 ATE
+    mean+-std, backbone s, peak GB, n_submaps, OOM?} per dataset. Read together:
+    which cells are even RUNNABLE without merging, and does the extra submap
+    size pay for itself in ATE?
+  FIGURE F1 (the headline) -- ATE (y) vs backbone latency (x), points for every
+    (merging, S) config, unmerged points marked, OOM configs drawn as ghost
+    markers at their predicted position with an X. The Pareto frontier drawn,
+    the Branch B baseline (nested-giant @504, S=16) starred. Read together: does
+    the frontier move, and is the mover a config that only merging makes
+    possible?
+  TABLE T3 -- winner vs default on all 9 TUM + 8 Replica + 4 UAS, mean+-std.
+
+================================================================================
+STEP 3 -- Where the boundaries actually go (the mechanism check)
+================================================================================
+
+WHAT:
+  If Step 2 shows an ATE win, do not report it as a black box. HYPOTHESIS H3:
+  the win is specifically a BOUNDARY effect — error concentrated at submap
+  seams shrinks because there are fewer seams — and not a general improvement
+  in per-frame prediction quality.
+
+HOW:
+  Decompose the ATE by position within the submap. For each configuration, plot
+  per-keyframe Sim3-aligned position error against (index within its submap),
+  and separately the boundary-consistency disagreement that
+  _check_boundary_consistency already computes when submap_overlap >= 2. Run the
+  comparison at overlap 2 so that instrumentation is live.
+  If H3 holds, the unmerged S=16 curve shows error steps at seams that the
+  merged S=32/64 curve does not.
+
+WHAT TO EXPECT:
+  Either a clean mechanism story (error is seam-localised, fewer seams = less
+  error) or the discovery that the win came from somewhere else entirely — in
+  which case find out where before writing it up.
+
+MEETING ARTIFACT:
+  FIGURE F2 -- per-keyframe error vs within-submap index, one line per config,
+    seam positions marked. Read together: is the error a staircase at seams?
+
+================================================================================
+DECISION
+================================================================================
+  - Step 0 says global attention is a large share at a runnable S:
+      the simple "faster at the same config" framing is available; run Steps 1-2
+      and report both framings.
+  - Step 0 says ~10% at S=16 (expected): report the negative speed result
+      honestly in one paragraph — training-free attention merging does not
+      accelerate short-batch VGT SLAM, and here is the measured share that
+      explains why — and pivot the whole study to Step 2's large-submap framing.
+  - Step 1 says pose degrades outside the noise band at every merge setting:
+      STOP. Report it. That is a real finding about DA3 vs VGGT (14 global
+      blocks vs 24, and all four DPT taps on global blocks), and it saves the
+      project from Step 2.
+  - Step 2 says larger submaps do not improve ATE: STOP, and report that
+      DA3's cross-view attention does not benefit from more views in the batch.
+      Combined with Branch B's two negative results this is a coherent story
+      about where the compute in this system actually is, and it redirects
+      Branch C entirely onto temporal reuse (the encoder prefix + the
+      frame-independent metric branch), which is where token_tap.py already
+      points.
+
+================================================================================
+DELIVERABLES
+================================================================================
+  T0  Global-attention share vs submap size (the kill-switch table).
+  F0  DA3 per-global-block attention redundancy (the DA3 attn_map.png).
+  T1  Backbone-level A/B: depth + POSE error vs merge setting, against the
+      bf16 noise floor.
+  T2  (merging x submap size) grid with OOM cells marked.
+  F1  THE headline Pareto scatter: ATE vs latency, OOM configs ghosted.
+  T3  Winner vs default on all 9 TUM + 8 Replica + 4 UAS.
+  F2  Per-keyframe error vs within-submap index (the boundary mechanism).
+  MEMO One paragraph off T0 + F1: what share of DA3-SLAM's compute is
+      cross-view attention, and does removing most of it buy anything a SLAM
+      system cares about?
+  (Plus the reusable artifact: da3_slam/backend/inference/token_merge.py and
+   the --merging / --submap_size axes on sweep_compute.py.)
+
+================================================================================
+KEY CODE HOOKS
+================================================================================
+  FastVGGT side (read-only reference):
+    Merge algorithm ......... ../FastVGGT/merging/merge.py
+                              (token_merge_bipartite2d; note tokens_per_img =
+                              w*h + 5 is VGGT-specific)
+    Merge call site ......... ../FastVGGT/vggt/layers/attention.py
+                              Attention.forward, the `if global_merging is not
+                              None and global_merging in merge_num` blocks
+    Which blocks merge ...... ../FastVGGT/vggt/models/aggregator.py:344-347
+    Per-scene patch grid .... ../FastVGGT/eval/eval_scannet.py
+                              model.update_patch_dimensions(w, h)
+    Their eval metrics ...... eval/eval_scannet.py -> chamfer_distance, ate,
+                              are, rpe_rot, rpe_trans
+
+  DA3 side (patch target):
+    Block loop / alt_start .. Depth-Anything-3/src/depth_anything_3/model/
+                              dinov2/vision_transformer.py,
+                              _get_intermediate_layers_not_chunked +
+                              process_attention
+    Attention to wrap ....... .../model/utils/attention.py :: Attention.forward
+    Global block indices .... odd i >= alt_start; da3-giant.yaml alt_start=13,
+                              depth 40 -> 14 global blocks
+    Special-token count ..... patch_start_idx = 1, num_register_tokens = 0
+    Global RoPE ............. _prepare_rope -> pos_nodiff (all-ones patches)
+    Ref-view reorder ........ .../model/reference_view_selector.py, fires at
+                              i == alt_start - 1 when S >= 3
+    Metric branch (no global) .../configs/da3metric-large.yaml, alt_start = -1
+
+  DA3-SLAM side:
+    Runtime-hook precedent .. da3_slam/backend/inference/token_tap.py
+                              (block-loop hooks, threading.local arming, why
+                              not to patch the DA3 checkout)
+    Forward + timers ........ da3_slam/backend/inference/depth_estimator.py
+                              DepthEstimator.infer (already brackets the
+                              forward with synchronize + peak-memory reset)
+    Sweep harness ........... scripts/sweep_compute.py (frozen keyframes,
+                              repeats, JSONL rows) + scripts/plot_sweep.py
+    Model reuse knobs ....... scripts/tum_eval_common.py :: SharedSLAM
+                              (set_resolution is the template for set_merging)
+    Submap size ............. config/default.yaml submap_size (16)
+    Existing size evidence .. outputs/kf_submap_grid/grid.csv
+    Baseline to beat ........ results/step2_size_ladder/README.md (T2) and
+                              results/step3_stacking/README.md (T3/F3)
+
+================================================================================
+VERIFICATION
+================================================================================
+  1. Merging OFF must reproduce the current baseline EXACTLY (bitwise, same
+     seed) — the wrapper is inert unless armed. If it is not, the port has a
+     side effect and nothing after this is trustworthy.
+  2. The loop-closure worker's re-inference is never merged (assert on S, and
+     check the per-thread arming with the concurrency check that
+     test_token_hook.py already uses for the tap).
+  3. attn_mask is None on every merged block (assert, do not assume).
+  4. Frozen keyframes: merged and unmerged runs at the same S produce
+     byte-identical processed-frame lists.
+  5. Every ATE is mean +- std over N >= 3 repeats; a config wins only beyond
+     that band. Merging adds its own variance source (R3) — seed it, and size
+     it once with a seed sweep.
+  6. Report WALL-CLOCK backbone latency and PEAK MEMORY. FLOPs are a sanity
+     proxy only, and Step 0 exists precisely because the FLOP model over-
+     promises here by roughly 3x.
+  7. Any OOM cell is recorded, not silently dropped — the OOM pattern is the
+     evidence for the method.
+================================================================================

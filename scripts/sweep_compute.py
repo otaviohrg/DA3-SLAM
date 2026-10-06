@@ -70,15 +70,18 @@ def parse_args() -> argparse.Namespace:
                    help="Disable loop closure for the whole sweep")
 
     # dataset selection + per-dataset I/O
-    p.add_argument("--dataset", choices=["tum", "uas"], default="tum",
-                   help="Sequence format: 'tum' (rgb.txt + groundtruth.txt) or "
-                        "'uas' (ROS bag + fisheye undistort + .tum GT)")
+    p.add_argument("--dataset", choices=["tum", "uas", "replica"], default="tum",
+                   help="Sequence format: 'tum' (rgb.txt + groundtruth.txt), "
+                        "'uas' (ROS bag + fisheye undistort + .tum GT), or "
+                        "'replica' (results/frame*.jpg + gt_tum.txt, synthetic ts)")
+    p.add_argument("--fps", type=float, default=30.0,
+                   help="Replica frame rate (synthetic timestamps = idx/fps)")
     p.add_argument("--max_diff", type=float, default=None,
                    help="Estimate↔GT association tolerance (s).  Default is "
                         "dataset-aware: 0.02 for tum (30 Hz GT), 0.05 for uas "
                         "(10 Hz GT + a camera/odometry clock offset up to ~50 ms "
                         "— 0.02 matches zero keyframes and the sequence is "
-                        "silently dropped).")
+                        "silently dropped), 0.5/fps for replica (half-frame).")
     # UAS-only (ignored for tum); mirror benchmark_uas.py
     p.add_argument("--topic", default=None, help="UAS camera topic override")
     p.add_argument("--calib", default=None, help="UAS calibration YAML override")
@@ -99,9 +102,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     # Dataset-aware GT association tolerance (see --max_diff help): UAS GT is
-    # 10 Hz with a camera/odometry clock offset, so 0.02 s drops whole sequences.
+    # 10 Hz with a camera/odometry clock offset, so 0.02 s drops whole sequences;
+    # Replica synthesises timestamps at idx/fps, matched to a half-frame.
     if args.max_diff is None:
-        args.max_diff = 0.05 if args.dataset == "uas" else 0.02
+        args.max_diff = {"uas": 0.05, "replica": 0.5 / args.fps}.get(
+            args.dataset, 0.02)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results_row = Path(args.results_row) if args.results_row \
@@ -215,6 +220,14 @@ def prepare_sequence(seq_dir: Path, args: Namespace, seqcache: Path,
         if image_paths and args.undistort:
             image_paths = uas.undistort_frames(
                 image_paths, calibration, cache / "undistorted")
+    elif args.dataset == "replica":
+        gt_txt = seq_dir / "gt_tum.txt"
+        if not gt_txt.exists():
+            print(f"  [SKIP] {seq_dir.name}: missing gt_tum.txt")
+            prepared[key] = None
+            return None
+        image_paths, timestamps = bc.load_replica_images(
+            seq_dir, args.max_frames, args.fps)
     else:
         rgb_txt, gt_txt = seq_dir / "rgb.txt", seq_dir / "groundtruth.txt"
         if not rgb_txt.exists() or not gt_txt.exists():
@@ -277,6 +290,19 @@ def _run_one(model, seq_dir: Path, args: Namespace, repeat: int,
     return row
 
 
+def gt_path_length(gt_poses: list) -> float:
+    """Total distance travelled along a list of 4x4 ground-truth poses (m).
+
+    Summed over the *matched* GT poses — the ones ATE is actually computed
+    over — so `ate / path_length` is a like-for-like ratio.
+    """
+    import numpy as np
+    positions = np.asarray([np.asarray(T)[:3, 3] for T in gt_poses], dtype=float)
+    if len(positions) < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
+
+
 def _score(est_ts_to_pose: dict, gt_all: list, seq_name: str,
            timings: dict, counts: dict, dataset: str = "tum",
            max_diff: float = 0.02) -> dict | None:
@@ -296,6 +322,9 @@ def _score(est_ts_to_pose: dict, gt_all: list, seq_name: str,
     drop = ("per_frame_errors", "align_T", "per_frame_trans", "per_frame_rot")
     return {
         "system": "DA3-SLAM", "dataset": dataset, "sequence": seq_name,
+        # Ground-truth path length over the poses actually evaluated, so ATE can
+        # be reported as a fraction of distance travelled (km-scale datasets).
+        "gt_path_length_m": gt_path_length(gt_m),
         "n_frames": timings.get("n_frames"),
         "n_keyframes": counts.get("n_keyframes"),
         "n_submaps": counts.get("n_submaps"),

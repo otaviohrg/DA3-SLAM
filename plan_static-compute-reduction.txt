@@ -1,0 +1,353 @@
+================================================================================
+Branch B, part 1: is the model bigger and sharper than the trajectory needs?
+================================================================================
+
+GOAL
+----
+Our SLAM system spends almost all of its time in one place: the DA3 backbone
+forward pass (~1248 ms of a ~1900 ms submap on a 3090; the pose-graph backend is
+8 ms). Before we invent anything clever, we should ask the cheapest question
+first: is the default backbone simply OVER-PROVISIONED for the job? Two knobs
+cost us nothing to turn and might already move the frontier:
+
+  - INPUT RESOLUTION  (how many pixels/tokens the encoder chews on), and
+  - MODEL SIZE        (which DA3 variant: Small / Base / Large / Giant).
+
+This plan sweeps both, measured properly, and produces the project's accuracy-vs-speed-vs-memory picture. It is mostly a MEASUREMENT study: no
+retraining, no architecture surgery. Every step ends in a figure or a table and
+in a decision.
+
+Why this matters strategically: if a big accuracy-neutral "knee" exists (a config
+that is much faster at basically the same trajectory error), the paper is already
+half-safe BEFORE we build the risky headline idea (temporal reuse). And there is
+a genuinely publishable nuance hiding here — see H2.
+
+COMPUTE: light. A handful of TUM sequences, a few resolutions x a few model
+sizes x 3 seeds. Runnable in a day or two of GPU time once the harness (Step 0)
+exists. Do it on BOTH targets if you can — a server GPU and the Jetson — because
+they may not pick the same knee.
+
+PREREQUISITE: this touches the backbone, which lives in the fork
+`third_party/vggt` (the DA3 fork). You already run multiple DA3 sizes end-to-end,
+so you have it checked out. Resolution is set inside that fork's
+`vggt/utils/load_fn.py`; model size in the `VGGT()` construction. If a fresh
+clone is missing, run `setup.sh` first.
+
+--------------------------------------------------------------------------------
+GLOSSARY (all terms used below)
+--------------------------------------------------------------------------------
+  Backbone / DA3 ..... the transformer that turns a batch of images into per-frame
+                       depth + pose + intrinsics. THE expensive part. Called at
+                       vggt_slam/solver.py:337 as `model(images)`.
+  Encoder ............ the first half of the backbone: each image -> patch tokens,
+                       run INDEPENDENTLY per frame. Its cost grows with the number
+                       of tokens, i.e. with (resolution / patch_size)^2.
+  Token .............. one patch of the image after the encoder splits it up (e.g.
+                       a 14x14 pixel patch -> one token vector). Fewer tokens =
+                       less compute, roughly quadratically.
+  Aggregator ......... the second half: attention that mixes tokens ACROSS the
+                       frames of a submap. (Branch C's target, not this plan's.)
+  Submap ............. the short batch of keyframes (default 16 + 1 overlap = 17)
+                       fed to one backbone forward. main.py:29, main.py:111.
+  ATE ................ Absolute Trajectory Error: after aligning the estimated
+                       trajectory to ground truth, the RMS position error (meters).
+                       Our accuracy number. Computed by evals/eval_tum.sh via
+                       `evo_ape tum <gt> <est> -as` (the -a -s = align + rescale,
+                       i.e. Sim(3) alignment, the honest metric for monocular scale
+                       ambiguity).
+  The "triple" ....... the three numbers we ALWAYS report together:
+                       (ATE, latency, peak GPU memory). A method only "wins" if it
+                       improves the frontier of the triple, not one number alone.
+  Pareto frontier .... the set of configs that are not beaten on ALL axes at once.
+                       A config Pareto-DOMINATES another if it is at least as good
+                       on every axis and strictly better on one. Our whole goal is
+                       to push this frontier outward.
+  Knee ............... the point on a curve where returns flatten — e.g. below some
+                       resolution ATE is basically flat, then it suddenly gets
+                       worse ("cliffs"). We want to operate just before the cliff.
+  Frozen keyframes ... running two configs on the EXACT SAME list of frames, so any
+                       difference in ATE comes from the network, not from the two
+                       configs happening to pick different keyframes.
+  FLOP vs wall-clock . FLOPs = arithmetic count (hardware-independent). Wall-clock =
+                       actual seconds on THIS GPU. They are NOT the same: a config
+                       can cut FLOPs a lot but save little time (launch overhead,
+                       memory-bound ops). We optimize WALL-CLOCK; FLOPs are a
+                       sanity proxy only.
+
+METHOD NOTE (read before touching anything): the DA3 forward is
+GPU-NONDETERMINISTIC (bf16 + fused kernels), so the SAME config gives slightly
+different ATE across runs. Therefore EVERY comparison is N >= 3 seeds, reported as
+mean +/- std, and we only claim a config is better if it beats another BEYOND that
+noise band. A single run proves nothing here.
+
+================================================================================
+STEP 0 -- Build the small reusable harness (the foundation for all of Branch B)
+================================================================================
+
+WHAT:
+  You cannot sweep what you cannot set from the command line, and you cannot trust
+  a comparison whose keyframes drift between runs. So before any science, add
+  three small things to the OUTER repo (not the fork, mostly). These are reused by
+  every later experiment in the project, so it is worth doing cleanly once.
+
+  HYPOTHESIS H0 (a harness sanity claim, not a science claim): a config can be
+  fully specified by a command line, two configs can be forced to see identical
+  frames, and one run emits one machine-readable row of results. If the default
+  config through this harness reproduces our known baseline ATE, the harness is
+  trustworthy.
+
+HOW TO DO IT:
+  1. CONFIG FLAGS. Add `--input_resolution` and `--backbone_size` to the argparse
+     block (main.py:29-34 is where the other knobs live).
+       - Wire `--input_resolution` into the preprocessing call. Resolution is
+         currently fixed inside `load_and_preprocess_images(image_names)`
+         (vggt_slam/solver.py:304), which lives in the fork at
+         `vggt/utils/load_fn.py`. Give it a resolution argument and pass it
+         through. Check whether load_fn resizes by long-side / short-side / crop —
+         keep the aspect-ratio handling identical across resolutions so you are
+         only changing scale.
+       - Wire `--backbone_size` into the `VGGT()` construction (main.py:74-80).
+         You already have the size-selection mechanism working; just expose it.
+  2. FROZEN-KEYFRAME REPLAY. Online keyframe selection happens at main.py:101-106
+     (`solver.flow_tracker.compute_disparity(...)`). Add:
+       - `--dump_keyframes <path>`: write out the selected `image_names_subset`
+         list (the actual frames that became keyframes), and
+       - `--keyframes_from <path>`: SKIP the optical-flow gate and read that list
+         instead.
+     Produce the canonical keyframe list ONCE per sequence at default settings;
+     every sweep run consumes it. Verify by diffing two configs' frame lists —
+     they must be byte-identical.
+  3. STRUCTURED LOGGING + HONEST TIMERS. Extend the end-of-run block
+     (main.py:134-148) to append ONE JSON/CSV row per run containing: config
+     (size, resolution, seed, sequence), ATE (+ RPE if easy), per-stage latency,
+     and crucially BACKBONE-ONLY latency and PEAK MEMORY
+     (`torch.cuda.max_memory_allocated()`).
+       - Fix the timer while you are here: `self.vggt_timer` currently wraps BOTH
+         the preprocessing (solver.py:303-304) AND the forward (solver.py:336-337),
+         so it OVERSTATES model time. Split them: time preprocessing and the
+         forward `model(images)` separately.
+       - Add a ONE-SHOT FLOP/token count per config (fvcore's FlopCountAnalysis on
+         the backbone, or just the analytic token proxy (res/patch)^2). Config-
+         level, logged once, not per run.
+
+EXPECTED OUTPUT:
+  One command runs a (size, resolution, seed, sequence) config end-to-end and
+  emits a results row, on a guaranteed-identical set of keyframes.
+
+SANITY CHECK (do NOT skip):
+  Run the DEFAULT config (biggest size, resolution 518) through the new harness
+  and confirm it reproduces the baseline ATE you already trust (TUM avg ~0.04 m
+  ballpark from VGGT-SLAM 2.0). If it does not, the harness is wrong — fix that
+  before believing any sweep.
+
+================================================================================
+STEP 1 -- Resolution / patch sweep
+================================================================================
+
+WHAT:
+  HYPOTHESIS H1: encoder cost scales as (resolution / patch)^2, but ATE is driven
+  by SCENE STRUCTURE (walls, edges, layout) far more than by fine TEXTURE. So as we
+  lower resolution we expect a SUPER-LINEAR speedup with only a SUB-LINEAR rise in
+  ATE — i.e. a resolution below the 518 default that Pareto-dominates it.
+
+  The intuition to hold: depth/pose for SLAM needs to know where surfaces are, and
+  coarse images already carry that. High resolution mostly buys fine detail in the
+  MAP (the point cloud), which is a different axis than TRAJECTORY accuracy. Watch
+  for that split — it is the seed of Step 2's nuance.
+
+HOW:
+  Fix backbone = default size. Sweep `--input_resolution` in {336, 392, 448, 518}
+  (multiples of the patch size — check DA3's patch, typically 14). Dev subset:
+  fr1/desk, fr1/xyz, fr1/room (an easy one, a looping one, a large-motion one).
+  N >= 3 seeds each. ALL on the SAME frozen keyframes from Step 0. That is 4 res x
+  3 seq x 3 seeds ~ 36 runs.
+
+  Report the triple for each: ATE (mean +/- std), backbone-only latency, peak
+  memory. Separately, log a MAP-DETAIL proxy — e.g. point count and, if you have
+  time, Chamfer distance of the dumped cloud (main.py:210 dumps the .pcd) to the
+  518 config's cloud used as a pseudo-ground-truth. This lets you see map quality
+  degrade even while ATE stays flat.
+
+  WATCH OUT — positional embeddings. Transformers add a POSITIONAL EMBEDDING per
+  token, learned for a specific token-grid size. Change the resolution and the grid
+  changes; the model must INTERPOLATE those embeddings. Most DA3/VGGT loaders do
+  this automatically, but confirm it — a silent mismatch will tank ATE and you will
+  wrongly conclude "low resolution is bad." Sanity: at 518 (native) you must
+  reproduce the Step-0 baseline exactly.
+
+WHAT TO EXPECT:
+  Latency and memory drop STEEPLY (quadratically) as resolution falls. ATE stays
+  roughly FLAT down to some resolution, then CLIFFS. The map-detail proxy starts
+  degrading EARLIER than ATE. The deliverable is the location of the ATE knee and
+  a first sense of how far below 518 we can safely operate.
+
+  If instead ATE rises immediately and steeply from 518 downward, that is also a
+  clean result: resolution is NOT a free lever for this backbone, and we lean
+  harder on model size (Step 2) and temporal reuse (Branch C). Learn it cheaply.
+
+MEETING ARTIFACTS:
+  TABLE T1 -- rows = resolution {336,392,448,518}, columns = {ATE mean+/-std,
+    backbone latency, peak memory, map-detail proxy}. Read together: find the row
+    where ATE is still within the 518 seed band but latency/memory have dropped.
+  FIGURE F1 -- ATE (y) vs backbone latency (x), one point per resolution with error
+    bars, the resolution knee circled. Read together: is there a flat stretch then a
+    cliff, and where is the cliff? Overlay the map-detail proxy as a second line to
+    see it degrade BEFORE ATE.
+
+================================================================================
+STEP 2 -- DA3 model-size ladder
+================================================================================
+
+WHAT:
+  HYPOTHESIS H2: trajectory ATE SATURATES below the largest DA3 — because the
+  system already fuses many views per submap and filters low-confidence points
+  (conf_threshold), which ABSORBS the extra per-frame depth noise of a smaller
+  model. And the paper-worthy corollary: MAP QUALITY degrades BEFORE trajectory
+  accuracy does. If true, a smaller DA3 Pareto-dominates the default for
+  localization, and we get a clean "trajectory is cheap, dense map is what costs"
+  story.
+
+  This is supported by the DA3 paper itself: DA3-Large (~0.30 B, about 3x smaller
+  than VGGT) already beats VGGT on many settings. So "smaller can be at least as
+  good" is not a wild bet — we are locating WHERE the knee is for OUR task.
+
+HOW:
+  Fix resolution = 518 (native, to isolate the size axis from the resolution axis).
+  Sweep the available DA3 sizes (Small / Base / Large / Giant, whichever you have)
+  with the heads fixed. SAME frozen keyframes, N >= 3 seeds, dev subset, both
+  hardware targets if possible. Report the triple + the same map-detail proxy as
+  Step 1.
+
+  Keep the DPT depth/pose heads identical across sizes so you are measuring the
+  ENCODER/AGGREGATOR capacity, not head differences. If a smaller size needs a
+  different head dimension, note it — that is a confound to control.
+
+WHAT TO EXPECT:
+  A diminishing-returns curve: ATE improves as size grows but FLATTENS well below
+  the biggest model, with large latency + memory savings at near-equal ATE. Expect
+  the map-detail proxy to keep improving with size even after ATE has flattened —
+  that DISSOCIATION (trajectory saturates, map keeps sharpening) is the figure to
+  capture; it is a genuine scientific finding, not just an engineering knob.
+
+  On the Jetson, the memory axis may matter more than latency — a size that fits in
+  memory comfortably is a real win even at similar speed. Report per-hardware; the
+  edge and server may choose different sizes.
+
+MEETING ARTIFACTS:
+  FIGURE F2 -- two lines on shared x = model size (S/B/L/G): ATE and the map-detail
+    proxy, one panel per hardware (server, Jetson). Read together: ATE flattens at a
+    smaller size than the map-detail line does -- that GAP is the trajectory-vs-map
+    dissociation (the publishable nuance of H2). Circle the size where ATE flattens.
+  TABLE T2 -- rows = size, columns = {ATE mean+/-std, latency, peak memory} per
+    hardware. Read together: does the edge pick a different knee than the server
+    (memory-limited vs latency-limited)?
+
+================================================================================
+STEP 3 -- Do the two levers stack? + validate the winner
+================================================================================
+
+WHAT:
+  HYPOTHESIS H3: the resolution knee and the size knee are LARGELY INDEPENDENT, so
+  their savings COMPOUND — the (knee-size, knee-resolution) config is far cheaper
+  than default at close-to-default ATE. The risk we are testing: maybe cutting BOTH
+  at once is one cut too many and ATE collapses (the errors interact).
+
+HOW:
+  Fill the small 2-D grid around the two knees: {knee-size, one size up} x
+  {knee-resolution, one step up/down}. SAME frozen keyframes, N >= 3 seeds. Pick the
+  single best operating point on the triple. Then VALIDATE it: run that one config
+  on ALL 9 TUM fr1 sequences (3 seeds) against the default config — this checks it
+  was not overfit to the 3-sequence dev subset.
+
+  Produce THE figure: ATE (y) vs backbone-only latency (x), one point per config,
+  COLORED by model size and ANNOTATED/sized by resolution, with the Pareto frontier
+  drawn through the non-dominated points and the DEFAULT config clearly marked. A
+  second panel: peak memory vs ATE. This is the project's first frontier plot and a
+  template for every later experiment.
+
+WHAT TO EXPECT:
+  The savings mostly stack: a config noticeably faster and lighter than default at
+  ATE within the seed band, validated across all 9 sequences. If ATE instead
+  collapses only when BOTH are cut, report the interaction and back off one lever —
+  that is still a clean, useful result.
+
+MEETING ARTIFACTS:
+  TABLE T3 -- the 2-D grid (size x resolution) with ATE / latency / memory per cell.
+    Read together: do the two knees' savings COMPOUND, or does ATE collapse in the
+    both-cut corner (an interaction)?
+  FIGURE F3 (THE headline plot) -- ATE (y) vs backbone latency (x), one point per
+    config, COLORED by size, MARKER-SIZED by resolution, with the Pareto frontier
+    drawn through the non-dominated points and the DEFAULT config starred. A second
+    panel: peak memory (y) vs ATE (x). Read together: how far LEFT of the default
+    star does the frontier reach at the same ATE? This is the whole story in one
+    picture.
+  TABLE T4 -- the chosen operating point vs. default on ALL 9 TUM sequences
+    (ATE mean+/-std per sequence + average). Read together: does the win hold
+    everywhere, or only on the 3 dev sequences (i.e. did we overfit)?
+
+================================================================================
+DECISION
+================================================================================
+  - If a clear accuracy-neutral knee exists (SUCCESS): adopt that (size, resolution)
+    as the NEW baseline. Every later experiment in the project (temporal reuse,
+    adaptive control) is reported ON TOP of it, so we never mistake an un-tuned
+    default for a contribution. The paper is now de-risked before the headline.
+  - If ATE cliffs early on BOTH levers (FAIL): static reduction is not the free win
+    here. That pushes weight onto Branch C (temporal reuse) and Branch D (adaptive
+    computation), and the map-vs-trajectory dissociation still stands as a finding.
+  - Either way, hand the chosen operating point + the frozen-keyframe harness to the
+    next experiment.
+
+================================================================================
+DELIVERABLES (the figures/tables to bring to the meeting)
+================================================================================
+  Every step ends in a numbered artifact below; walk through them in order and the
+  decision (next section) falls out of F3 + T4.
+  T1  Resolution sweep table (res x {ATE, latency, memory, map-detail}).
+  F1  ATE-vs-latency curve over resolution, knee circled (+ map-detail overlay).
+  F2  ATE and map-detail vs model size, per hardware -- the trajectory-vs-map gap.
+  T2  Size table (size x {ATE, latency, memory}) per hardware.
+  T3  2-D stacking grid (size x resolution) -- do the levers compound?
+  F3  THE headline Pareto scatter: ATE vs latency, colored by size / sized by
+      resolution, frontier drawn, default starred (+ memory panel).
+  T4  Chosen operating point vs default on all 9 TUM sequences.
+  MEMO One paragraph read off F3 + T4: does an accuracy-neutral knee exist, how far
+      does it move the frontier, and what is the new baseline config?
+  (Plus the reusable harness itself: config flags, frozen-keyframe replay, one-row
+  logging with backbone-only latency + peak memory, one-shot FLOP/token count.)
+
+================================================================================
+KEY CODE HOOKS
+================================================================================
+  Model construction / size .. main.py:74-80 (`VGGT()`, bf16 cast).
+  Resolution ................. `load_and_preprocess_images(...)`, called at
+                               vggt_slam/solver.py:304; defined in the fork
+                               vggt/utils/load_fn.py (add a resolution arg).
+  Backbone forward (timing) .. vggt_slam/solver.py:336-337 (`model(images)`);
+                               split the `vggt_timer` that also wraps preprocessing
+                               at solver.py:303-304.
+  Knobs / argparse ........... main.py:29-34.
+  Keyframe gate (to freeze) .. main.py:101-106 -> frame_overlap.py:23
+                               (`compute_disparity`).
+  ATE / eval ................. evals/eval_tum.sh (`evo_ape tum ... -as`) +
+                               evals/process_logs_tum.py.
+  Map-detail source .......... dense cloud dumped at main.py:210 (.pcd) — Chamfer
+                               vs the 518/Giant cloud as pseudo-GT.
+  Timers ..................... `Accumulator` in vggt_slam/slam_utils.py.
+
+================================================================================
+VERIFICATION
+================================================================================
+  1. Harness sanity: default config through the harness reproduces the known
+     baseline ATE (else the harness is stale — fix first).
+  2. Frozen keyframes: two different configs produce BYTE-IDENTICAL processed-frame
+     lists (diff them).
+  3. Native-resolution identity: at resolution 518 the pipeline matches the Step-0
+     baseline exactly (confirms positional-embedding interpolation is correct).
+  4. Every ATE is mean +/- std over N >= 3 seeds; a config is only "better" if it
+     beats another BEYOND the seed band.
+  5. The chosen operating point is validated on all 9 TUM sequences, not just the
+     3-sequence dev subset.
+  6. Report WALL-CLOCK (backbone-only) latency and PEAK MEMORY, with FLOPs/tokens as
+     a secondary sanity proxy only.
+================================================================================

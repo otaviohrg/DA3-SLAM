@@ -27,22 +27,111 @@ from gtsam import (
     SL4,
     PriorFactorSL4,
     BetweenFactorSL4,
+    Similarity3,
+    PriorFactorSimilarity3,
+    BetweenFactorSimilarity3,
+    Rot3,
+    Point3,
 )
 from gtsam.symbol_shorthand import X
 
 # Re-exported so callers can import the config next to the component it tunes.
 from da3_slam.config import NoiseConfig
 
+
+# ── pose parameterisation ─────────────────────────────────────────────────────
+#
+# SL(4) is inherited from VGGT-SLAM, where it is justified by the PROJECTIVE
+# ambiguity of uncalibrated monocular reconstruction: submaps there are genuinely
+# related by homographies.  DA3 is a different case — it predicts metric depth
+# AND intrinsics per frame, which collapses most of that ambiguity before the
+# graph sees it.  Measured inter-submap disagreement is 0.245 deg of rotation
+# and 4.8% of scale, i.e. Sim(3) (7 DOF), not the 15 DOF of SL(4).
+#
+# Sim(3) convention (verified against GTSAM, do not assume): a Similarity3 acts
+# as transformFrom(p) = s * (R p + t), and `matrix()` returns [R, t; 0, 1/s].
+# So the camera CENTRE in world is scale() * translation() — reading
+# translation() alone silently discards the scale correction, which is the
+# entire reason for using Sim(3).
+
+class _Sl4Ops:
+    """15-DOF projective parameterisation (the shipped default)."""
+
+    name, dim = "sl4", 15
+    PriorFactor, BetweenFactor = PriorFactorSL4, BetweenFactorSL4
+
+    @staticmethod
+    def make(matrix: np.ndarray):
+        return SL4(matrix.astype(np.float64))
+
+    @staticmethod
+    def at(values, key):
+        return values.atSL4(key)
+
+    @staticmethod
+    def to_matrix(element) -> np.ndarray:
+        return element.matrix()
+
+    @staticmethod
+    def scale(element) -> float:
+        # matrix() already carries the full projective action on points.
+        return 1.0
+
+
+class _Sim3Ops:
+    """7-DOF similarity parameterisation (rigid + uniform scale)."""
+
+    name, dim = "sim3", 7
+    PriorFactor, BetweenFactor = PriorFactorSimilarity3, BetweenFactorSimilarity3
+
+    @staticmethod
+    def make(matrix: np.ndarray):
+        matrix = matrix.astype(np.float64)
+        # Incoming measurements are rigid, so scale enters as 1.0 and the
+        # optimiser is free to move it only where constraints conflict.
+        return Similarity3(Rot3(matrix[:3, :3]), Point3(*matrix[:3, 3]), 1.0)
+
+    @staticmethod
+    def at(values, key):
+        return values.atSimilarity3(key)
+
+    @staticmethod
+    def to_matrix(element) -> np.ndarray:
+        out = np.eye(4, dtype=np.float64)
+        out[:3, :3] = element.rotation().matrix()
+        # scale() * translation(), per the convention noted above.
+        out[:3, 3] = element.scale() * np.asarray(element.translation())
+        return out
+
+    @staticmethod
+    def scale(element) -> float:
+        # to_matrix() is kept RIGID for trajectory export, but a point maps as
+        # s * (R p + t) = sR p + s t — so geometry placement must also scale the
+        # rotation block, or each frame's points keep raw DA3 depth while its
+        # camera centre sits in the rescaled frame (duplicated doors/chairs
+        # wherever per-frame scales diverge).  See OptimizationResult.point_transform.
+        return float(element.scale())
+
+
+PARAMETERISATIONS = {"sl4": _Sl4Ops, "sim3": _Sim3Ops}
+
 __all__ = ["NoiseConfig", "OptimizationResult", "PoseGraph"]
 
 
-def _isotropic_noise(sigma: float, huber_k: float | None):
-    """15-dim isotropic noise model, optionally Huber-robustified.
+def _isotropic_noise(sigma: float, huber_k: float | None, dim: int = 15):
+    """Isotropic noise model of the given dimension, optionally Huber-robustified.
 
     With a Huber kernel an outlier measurement is down-weighted instead of
     warping the whole map; huber_k=None keeps plain Gaussian noise.
+
+    NOTE the isotropy is a modelling compromise, not a principled choice: the
+    dimensions are not commensurable (rotation in radians, translation in
+    metres, and for SL(4) the shear/projective components are dimensionless).
+    One sigma across all of them is dimensionally incoherent; it is kept
+    because it mirrors VGGT-SLAM and because a chain-only graph is exactly
+    determined, where the noise model has no effect at all.
     """
-    noise = noiseModel.Diagonal.Sigmas(np.full(15, sigma))
+    noise = noiseModel.Diagonal.Sigmas(np.full(dim, sigma))
     if huber_k:
         noise = noiseModel.Robust.Create(
             noiseModel.mEstimator.Huber.Create(float(huber_k)), noise)
@@ -62,9 +151,24 @@ class OptimizationResult:
     # Number of LM iterations
     iterations: int
 
+    # Per-keyframe similarity scale (Sim(3) only; SL(4) and missing keys → 1.0)
+    frame_scales: dict[int, float] | None = None
+
     def pose(self, seq_idx: int) -> np.ndarray:
-        """(4, 4) cam-to-world for the frame with the given seq_idx."""
+        """(4, 4) rigid cam-to-world for the frame with the given seq_idx."""
         return self.frame_poses[seq_idx]
+
+    def scale(self, seq_idx: int) -> float:
+        return (self.frame_scales or {}).get(seq_idx, 1.0)
+
+    def point_transform(self, seq_idx: int) -> np.ndarray:
+        """(4, 4) transform mapping camera-space POINTS to world: [sR | st].
+
+        Use this, not pose(), to place geometry — pose() drops the scale on the
+        rotation block so it can be exported as a rigid trajectory."""
+        out = self.frame_poses[seq_idx].astype(np.float64)
+        out[:3, :3] *= self.scale(seq_idx)
+        return out
 
 
 # ── graph ─────────────────────────────────────────────────────────────────────
@@ -95,23 +199,31 @@ class PoseGraph:
         result = graph.optimize()
     """
 
-    def __init__(self, noise: NoiseConfig | None = None):
+    def __init__(self, noise: NoiseConfig | None = None,
+                 parameterisation: str = "sl4"):
         self.noise = noise or NoiseConfig(prior_sigma=1e-6, between_sigma=0.05, loop_sigma=0.05)
+        try:
+            self._ops = PARAMETERISATIONS[str(parameterisation).lower()]
+        except KeyError:
+            raise ValueError(
+                f"unknown pose parameterisation {parameterisation!r}; "
+                f"expected one of {sorted(PARAMETERISATIONS)}") from None
 
         self._graph  = NonlinearFactorGraph()
         self._values = Values()
         self._initialized: set[int] = set()   # seq_idx values currently in graph
 
-        self._prior_noise = _isotropic_noise(self.noise.prior_sigma, None)
+        self._prior_noise = _isotropic_noise(self.noise.prior_sigma, None,
+                                             self._ops.dim)
         # Huber on odometry factors acts only where redundancy exists
         # (overlap>=2 duplicate boundary factors, loop-closure cycles) — a
         # broken boundary measurement then absorbs its own error instead of
         # deforming the whole cycle into offset ghost copies.  Huber on loop
         # factors cushions an aliased closure that survived the gates.
         self._between_noise = _isotropic_noise(
-            self.noise.between_sigma, self.noise.between_huber_k)
+            self.noise.between_sigma, self.noise.between_huber_k, self._ops.dim)
         self._loop_noise = _isotropic_noise(
-            self.noise.loop_sigma, self.noise.loop_huber_k)
+            self.noise.loop_sigma, self.noise.loop_huber_k, self._ops.dim)
 
     # ── building ──────────────────────────────────────────────────────────────
 
@@ -119,13 +231,13 @@ class PoseGraph:
         """Insert a new frame node. Silently skips if seq_idx is already in the graph."""
         if seq_idx in self._initialized:
             return
-        self._values.insert(X(seq_idx), SL4(cam_to_world.astype(np.float64)))
+        self._values.insert(X(seq_idx), self._ops.make(cam_to_world))
         self._initialized.add(seq_idx)
 
     def add_prior(self, seq_idx: int) -> None:
         """Add a prior factor anchoring the given frame at its current value."""
-        pose = self._values.atSL4(X(seq_idx))
-        self._graph.add(PriorFactorSL4(X(seq_idx), pose, self._prior_noise))
+        pose = self._ops.at(self._values, X(seq_idx))
+        self._graph.add(self._ops.PriorFactor(X(seq_idx), pose, self._prior_noise))
 
     def add_between(
         self,
@@ -147,16 +259,16 @@ class PoseGraph:
         """
         noise = self._loop_noise if loop else self._between_noise
         self._graph.add(
-            BetweenFactorSL4(
+            self._ops.BetweenFactor(
                 X(seq_idx_a), X(seq_idx_b),
-                SL4(relative_cam_to_world.astype(np.float64)),
+                self._ops.make(relative_cam_to_world),
                 noise,
             )
         )
 
     def get_pose(self, seq_idx: int) -> np.ndarray:
         """(4, 4) current cam-to-world estimate for the given frame."""
-        return self._values.atSL4(X(seq_idx)).matrix()
+        return self._ops.to_matrix(self._ops.at(self._values, X(seq_idx)))
 
     # ── optimization ──────────────────────────────────────────────────────────
 
@@ -181,11 +293,41 @@ class PoseGraph:
         self._values = result
 
         frame_poses: dict[int, np.ndarray] = {}
+        frame_scales: dict[int, float] = {}
+        worst_drift = 0.0
         for seq_idx in self._initialized:
-            frame_poses[seq_idx] = result.atSL4(X(seq_idx)).matrix().astype(np.float32)
+            element = self._ops.at(result, X(seq_idx))
+            M = self._ops.to_matrix(element)
+            frame_scales[seq_idx] = self._ops.scale(element)
+            # RIGID-SUBGROUP DRIFT.
+            # SL(4) is 15-DOF projective.  It is the right manifold for VGGT,
+            # whose reconstructions are only defined up to a projectivity when
+            # intrinsics are unknown — but DA3 supplies METRIC depth, which
+            # pins the reconstruction to at most a similarity.  The extra 8 DOF
+            # are unconstrained by the data, so the solution can wander off the
+            # rigid subgroup; the 3x3 block then stops being a rotation and
+            # trajectory export dies in scipy with "Non-positive determinant".
+            # Measure how far off it is BEFORE that happens: for a true
+            # rotation (up to scale s) R^T R = s^2 I, so the normalised
+            # residual below is 0 on the rigid subgroup and grows with drift.
+            R = np.asarray(M[:3, :3], dtype=np.float64)
+            s2 = float(np.trace(R.T @ R)) / 3.0
+            if s2 > 1e-12:
+                drift = float(np.linalg.norm(R.T @ R / s2 - np.eye(3)))
+                worst_drift = max(worst_drift, drift)
+                if np.linalg.det(R) <= 0.0:
+                    worst_drift = max(worst_drift, 1e3)   # sign flip: already invalid
+            frame_poses[seq_idx] = M.astype(np.float32)
+        if worst_drift > 0.05:
+            print(f"[PoseGraph] WARNING: solution off the rigid subgroup — "
+                  f"worst ||R^T R / s^2 - I|| = {worst_drift:.3f} over "
+                  f"{len(self._initialized)} nodes. SL(4) has 8 DOF that DA3's "
+                  f"metric depth does not require; pose_parameterisation: sim3 "
+                  f"cannot drift this way.")
 
         return OptimizationResult(
             frame_poses=frame_poses,
+            frame_scales=frame_scales,
             final_error=float(final_error),
             iterations=int(iterations),
         )

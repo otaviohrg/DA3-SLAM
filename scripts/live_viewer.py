@@ -224,13 +224,24 @@ class LiveViewer:
                 static=True,
             )
 
+        # Points are placed with [sR | t]: keyframe_poses are rigid, and under
+        # Sim(3) dropping s leaves each frame's geometry at raw depth (ghost
+        # copies).  Scaling the rotation block also lets _pose_shift see a
+        # pure scale correction and re-project for it.
+        scales = getattr(update, "keyframe_scales", None) or {}
+        point_poses = {}
+        for k, pose in poses.items():
+            scaled = pose.copy()
+            scaled[:3, :3] *= scales.get(k, 1.0)
+            point_poses[k] = scaled
+
         if update.frame_points_cam:
             # Cache once (the final refresh re-emits the last submap — the
             # cache is kept, only the projection is redone), then draw with
             # the current poses.
             if update.submap_idx not in self._submap_cache:
                 self._cache_submap(update.submap_idx, update.frame_points_cam)
-            self._log_submap(update.submap_idx, poses)
+            self._log_submap(update.submap_idx, point_poses)
 
         # Re-project earlier submaps whose poses moved since they were drawn
         # (loop closure / later optimisation) — otherwise corrected geometry
@@ -238,10 +249,10 @@ class LiveViewer:
         relogged = [
             submap_idx for submap_idx in sorted(self._submap_cache)
             if submap_idx != update.submap_idx
-            and self._pose_shift(submap_idx, poses) > self._repose_threshold
+            and self._pose_shift(submap_idx, point_poses) > self._repose_threshold
         ]
         for submap_idx in relogged:
-            self._log_submap(submap_idx, poses)
+            self._log_submap(submap_idx, point_poses)
         if relogged:
             print(f"[viewer] re-projected {len(relogged)} submap(s) after "
                   f"pose correction: {relogged}", flush=True)

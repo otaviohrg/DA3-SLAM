@@ -19,6 +19,11 @@ import torch
 
 from depth_anything_3.api import DepthAnything3
 
+from da3_slam.config import TokenMergingConfig
+from da3_slam.backend.inference.precision import cast_backbones, resolve_dtype
+from da3_slam.backend.inference.token_merge import MergeSettings, TokenMerger
+from da3_slam.backend.inference.token_tap import EncoderTokenTap
+
 
 @dataclass
 class DepthPrediction:
@@ -38,6 +43,12 @@ class DepthPrediction:
 
     # (N, H, W, 3) uint8 — images at DA3's processed resolution
     processed_images: np.ndarray
+
+    # Per-frame encoder tokens (N tensors of shape (n_tokens, dim)), present
+    # only when infer(capture_tokens=True) asked for them — the Branch C
+    # temporal-redundancy study.  Left off the normal path so nothing else
+    # pays for it.
+    tokens: list[torch.Tensor] | None = None
 
     @property
     def n_frames(self) -> int:
@@ -107,8 +118,12 @@ class DepthEstimator:
         process_resolution: int = 504,
         device: torch.device | None = None,
         use_ray_pose: bool = False,
+        token_merging: TokenMergingConfig | None = None,
+        backbone_dtype: str = "fp32",
     ):
         self.process_resolution = process_resolution
+        # Guards temporary per-call resolution changes (see infer(resolution=)).
+        self._resolution_lock = threading.Lock()
         self.use_ray_pose = use_ray_pose
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -117,6 +132,16 @@ class DepthEstimator:
         print(f"[DepthEstimator] Loading {model_id} on {self.device}...")
         self.model = DepthAnything3.from_pretrained(model_id).to(self.device)
         self.model.eval()
+
+        # Narrow the ViT backbones' weights if asked.  One-way (the fp32
+        # mantissa bits are gone), so it happens once here at load rather than
+        # being a per-run knob.
+        dtype = resolve_dtype(backbone_dtype)
+        self.backbone_dtype = backbone_dtype
+        if dtype is not None:
+            branches = cast_backbones(self.model, dtype)
+            print(f"[DepthEstimator] backbone precision {backbone_dtype} "
+                  f"(cast: {', '.join(branches) or 'none'})")
         print("[DepthEstimator] Ready.")
 
         # Backbone (DA3 forward) instrumentation — the isolated cost of the
@@ -131,6 +156,15 @@ class DepthEstimator:
         self.n_infer_calls: int = 0
         self.peak_memory_bytes: int = 0
 
+        # Encoder-token tap (Branch C); created on first use so the normal
+        # pipeline never registers the hooks.
+        self._token_tap: EncoderTokenTap | None = None
+
+        # Cross-view token merging (Branch C, the FastVGGT port).  Nothing is
+        # installed unless it is enabled, so a baseline run is untouched by it.
+        self._merger: TokenMerger | None = None
+        self.set_token_merging(token_merging)
+
     def reset_stats(self) -> None:
         """Zero the backbone timing / peak-memory accumulators.  Call once at
         the start of a run — the heavy model persists across runs, but its
@@ -139,9 +173,77 @@ class DepthEstimator:
             self.backbone_seconds = 0.0
             self.n_infer_calls = 0
             self.peak_memory_bytes = 0
+        if self._merger is not None:
+            self._merger.reset_stats()
+
+    def set_token_merging(self, config: TokenMergingConfig | None) -> None:
+        """Turn cross-view token merging on, off, or reconfigure it in place.
+
+        This is the A/B switch.  Disabling **detaches** the wrapper entirely, so
+        an unmerged run is bit-identical to one from a process that never knew
+        about merging — which is what makes a merged-vs-unmerged comparison
+        mean anything.  Enabling is cheap and needs no model reload, so a sweep
+        can flip configurations on a model that stays resident (see
+        ``SharedSLAM.set_token_merging``).
+        """
+        if config is None or not config.enable:
+            if self._merger is not None:
+                self._merger.detach()
+                self._merger = None
+                print("[DepthEstimator] token merging OFF (backbone restored)")
+            return
+
+        if self._merger is None:
+            self._merger = TokenMerger(self.model).attach()
+            print(f"[DepthEstimator] token merging — {self._merger.describe()}")
+
+        self._merger.configure(MergeSettings(
+            enable=True,
+            start=config.start,
+            merge_ratio=config.merge_ratio,
+            sx=config.sx,
+            sy=config.sy,
+            protect=config.protect,
+            protect_ratio=config.protect_ratio,
+            seed=config.seed,
+            min_frames=config.min_frames,
+        ))
+        print(
+            f"[DepthEstimator] token merging ON — from global block "
+            f"{config.start}/{len(self._merger.global_blocks)}, "
+            f"ratio {config.merge_ratio}, min_frames {config.min_frames}"
+        )
+
+    @property
+    def token_merging_stats(self):
+        """Realised merge statistics, or None when merging is off.
+
+        ``stats.token_ratio`` is the achieved merged/full token ratio — report
+        it alongside latency, since attention cost scales with its square.
+        """
+        return self._merger.stats if self._merger is not None else None
+
+    def token_tap(self) -> EncoderTokenTap:
+        """
+        The attached encoder-token tap (created and attached on first call).
+
+        Only diagnostic code (Branch C) needs this; the hooks are inert for any
+        thread that has not armed them, so leaving them attached is harmless.
+        """
+        if self._token_tap is None:
+            self._token_tap = EncoderTokenTap(self.model).attach()
+            print(f"[DepthEstimator] token tap — {self._token_tap.info.describe()}")
+        return self._token_tap
 
     @torch.no_grad()
-    def infer(self, images: list[str | np.ndarray]) -> DepthPrediction:
+    def infer(
+        self,
+        images: list[str | np.ndarray],
+        *,
+        capture_tokens: bool = False,
+        inject_tokens: dict[int, torch.Tensor] | None = None,
+        resolution: int | None = None,
+    ) -> DepthPrediction:
         """
         Run DA3 on a batch of images.
 
@@ -149,10 +251,32 @@ class DepthEstimator:
             images: list of file paths (recommended) or HxWx3 uint8 numpy arrays.
                     Note: numpy array inputs may trigger CUDA nvrtc JIT compilation
                     on small batches; prefer file paths in the pipeline.
+            capture_tokens: also return each frame's encoder tokens (Branch C).
+            inject_tokens:  {frame index in this batch: (n_tokens, dim) tensor} —
+                    reuse those tokens instead of encoding the frame.  The frame
+                    must be the same image the tokens were captured from; the
+                    encoder prefix is frame-independent, so this is exact.
+            resolution: process this batch at a different resolution, restoring
+                    the default afterwards.  The estimator is shared across
+                    threads (the loop-closure worker infers concurrently), so
+                    the swap is serialised — cost is only the GPU serialisation
+                    those calls already have.
 
         Returns:
             DepthPrediction with normalised outputs
         """
+        if resolution is not None and resolution != self.process_resolution:
+            with self._resolution_lock:
+                previous = self.process_resolution
+                self.process_resolution = int(resolution)
+                try:
+                    return self.infer(images, capture_tokens=capture_tokens,
+                                      inject_tokens=inject_tokens)
+                finally:
+                    self.process_resolution = previous
+
+        tapped = capture_tokens or inject_tokens is not None
+
         # Time and peak-memory the backbone forward in isolation.  synchronize()
         # brackets the async GPU work so the wall-clock is the true forward
         # time, not the kernel-launch return; peak memory is reset per call and
@@ -163,8 +287,16 @@ class DepthEstimator:
             torch.cuda.reset_peak_memory_stats(self.device)
 
         t0 = time.perf_counter()
-        raw = self.model.inference(images, process_res=self.process_resolution,
-                                   use_ray_pose=self.use_ray_pose)
+        if tapped:
+            tap = self.token_tap()
+            with tap.armed(capture=capture_tokens, inject=inject_tokens):
+                raw = self.model.inference(images, process_res=self.process_resolution,
+                                           use_ray_pose=self.use_ray_pose)
+                captured = tap.captured
+        else:
+            captured = None
+            raw = self.model.inference(images, process_res=self.process_resolution,
+                                       use_ray_pose=self.use_ray_pose)
         if on_cuda:
             torch.cuda.synchronize(self.device)
         elapsed = time.perf_counter() - t0
@@ -186,6 +318,7 @@ class DepthEstimator:
             extrinsics=extrinsics,
             intrinsics=intrinsics,
             processed_images=raw.processed_images,
+            tokens=captured,
         )
 
 
