@@ -15,13 +15,15 @@ own config class for convenience, e.g.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from argparse import BooleanOptionalAction
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from da3_slam.frontend.keyframe_selector import KeyframeSelectorConfig
+from da3_slam.frontend.tracker import TrackerConfig
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_YAML = _REPO_ROOT / "config" / "default.yaml"
@@ -95,6 +97,17 @@ class LoopClosureConfig:
     # relative pose and the confidence gate meaningful.  0 = pair only.
     context_frames: int = 1
 
+    # Dense-matching verification gate (RoMa v2).  Retrieval with a single
+    # global DINO-SALAD descriptor cannot do spatial verification and gives no
+    # credit for partial overlap, so `distance_threshold` ends up doing two
+    # jobs at once and does not transfer between domains (TUM wants 0.80, UAS
+    # 0.60).  With this gate on, retrieval becomes a pure RECALL knob — set
+    # distance_threshold loose — and precision comes from dense correspondence:
+    # a candidate is rejected unless RoMa's predicted overlap reaches
+    # `roma_min_overlap`.  None/0 = gate disabled (the shipped behaviour).
+    roma_gate: bool = False
+    roma_min_overlap: float = 0.30
+
     # Geometric sanity gate: reject a closure whose measured relative pose
     # disagrees with the pose graph's current prediction by more than this
     # rotation angle (degrees).  Generous by design — drift is exactly what
@@ -106,6 +119,48 @@ class LoopClosureConfig:
     # scenario — room-scale demos can use a few metres; large-scale runs
     # should leave it off.  None = disabled.
     max_translation_error: float | None = None
+
+
+@dataclass
+class TokenMergingConfig:
+    """Cross-view token merging in the DA3 backbone (the FastVGGT port).
+
+    Training-free acceleration of the backbone's *global* (cross-view)
+    attention: most tokens are merged into a smaller destination set before
+    attention and scattered back afterwards.  Implementation and the full
+    rationale: ``da3_slam.backend.inference.token_merge``.
+
+    **Off by default.**  This is an experimental compute lever, not a tuned
+    one — the baseline it must be compared against is ``enable: false``, and
+    that comparison is the whole point of the flag.
+    """
+
+    # Master switch.  False = the backbone runs exactly as upstream DA3 does.
+    enable: bool = False
+
+    # First merging block, as a POSITION AMONG THE GLOBAL BLOCKS (0 = merge in
+    # all of them).  Not a raw block index: giant has 14 global blocks and large
+    # has 8, so only the relative position transfers across model sizes.
+    start: int = 0
+
+    # Fraction of tokens to absorb into the destination set.
+    merge_ratio: float = 0.9
+
+    # Destination stride over the patch grid (one kept per sx-by-sy cell).
+    sx: int = 2
+    sy: int = 2
+
+    # Hold a uniform stride of tokens out of the merge entirely.
+    protect: bool = True
+    protect_ratio: float = 0.1
+
+    # Seed for the destination choice — fixed so a config is reproducible.
+    seed: int = 33
+
+    # Never merge batches smaller than this.  Keeps the loop-closure worker's
+    # small re-inference batches on the exact path, where merging would save
+    # nothing and could degrade the inference that accepts or rejects a closure.
+    min_frames: int = 8
 
 
 @dataclass
@@ -136,12 +191,58 @@ class SLAMConfig:
     # Use DA3's ray-based pose estimation instead of the camera decoder
     use_ray_pose: bool = False
 
+    # Weight precision for the two ViT backbones: "fp32" (as shipped) or
+    # "bf16".  The backbones already run under autocast bf16, so fp32 masters
+    # are storage the forward never uses; bf16 cuts peak GPU memory ~40% and
+    # roughly doubles the reachable submap size.  EXPERIMENTAL — it perturbs
+    # poses well beyond the bf16 noise floor, so validate ATE before adopting.
+    # See da3_slam.backend.inference.precision.
+    backbone_dtype: str = "fp32"
+
     # Anchor keyframes shared between consecutive submaps.  1 = single shared
     # node (VGGT-SLAM style).  >= 2 measures the shared frame pair in *both*
     # DA3 batches: the duplicate between-factor adds redundancy across the
     # boundary and enables the boundary-consistency check, so one bad DA3
     # anchor pose can no longer displace a whole submap silently.
     submap_overlap: int = 1
+    # Warmup ramp for submap size.  0 = disabled (fixed submap_size, the
+    # historical behaviour).  When > 0, the first `submap_warmup_submaps`
+    # submaps hold `submap_warmup_size` keyframes and the rest hold
+    # `submap_size`.  Guards against a short sequence yielding ONE submap,
+    # which disables chaining, the SL(4) graph and loop closure at once.
+    # Smooth rolloff of the boundary-scale weight w = 1 - g:
+    #     w_j = 1 / (1 + (j / tau)^p)
+    # tau <= 0 disables it and the fixed boundary_scale_damping is used.
+    # Keeps accumulated scale variance bounded (sum w_j^2 converges for p > 1/2)
+    # without damping the first few boundaries, which measurement shows is
+    # harmful on short sequences.
+    # Close a submap once accumulated inter-keyframe optical flow (px) since
+    # its first keyframe exceeds this, in addition to the submap_size cap.
+    # 0 disables it.  Measures VIEW CHANGE rather than keyframe count, which is
+    # what DA3's cross-view attention actually depends on; scale-free, so one
+    # value serves indoor and aerial.
+    submap_flow_budget: float = 0.0
+    boundary_scale_rolloff_tau: float = 0.0
+    boundary_scale_rolloff_p: float = 3.0
+    submap_warmup_size: int = 0
+    submap_warmup_submaps: int = 2
+
+    # Pose-graph parameterisation: "sl4" (15 DOF projective, inherited from
+    # VGGT-SLAM) or "sim3" (7 DOF rigid+scale).  SL(4)'s extra DOF are
+    # justified by projective ambiguity in UNCALIBRATED monocular
+    # reconstruction; DA3 predicts metric depth and intrinsics, so the measured
+    # inter-submap disagreement is rotation + scale, i.e. Sim(3).  Note the
+    # choice is inert in a chain-only graph (exactly determined) — it can only
+    # matter where loop closures or overlap>=2 create redundancy.
+    pose_parameterisation: str = "sl4"
+
+    # Extra within-submap between-factors linking frames k apart (k = 2, 4, 8).
+    # DA3 estimates a batch jointly, so a stride-k relative pose is one direct
+    # measurement rather than k composed ones; adding them costs no inference
+    # and makes the pose graph over-determined (a consecutive-only chain is
+    # exactly determined, so the noise model has no effect on it at all).
+    # Empty = consecutive links only (previous behaviour).
+    submap_skip_strides: tuple[int, ...] = ()
 
     # Inter-submap boundary scale chaining (see DA3SLAM._processing).
     # Damping g applies ratio^(1-g) to each boundary depth-ratio:
@@ -164,11 +265,94 @@ class SLAMConfig:
     # HuggingFace CLIP model ID for semantic embeddings (None = disabled)
     semantic_model: str | None = None
 
+    # Cross-view token merging in the DA3 backbone (off by default — it is an
+    # experimental compute lever whose baseline is `enable: false`).
+    token_merging: TokenMergingConfig = field(default_factory=TokenMergingConfig)
+
+    # Per-frame PnP tracking between submaps (da3_slam/frontend/tracker.py).
+    # Off by default: it buys pose *latency*, which benchmarks do not score.
+    tracking: TrackerConfig = field(default_factory=TrackerConfig)
+
     # Runtime flag (not read from YAML): set False when nothing consumes point
     # clouds (no map.ply export, no live viewer) — benchmark/sweep drivers do
     # this.  SubmapBuilder then stores empty points/colors/confidence/mask on
     # every Frame, cutting resident memory per keyframe ~3x.
     build_pointclouds: bool = True
+
+    # Frozen-keyframe harness (runtime flags, not read from YAML; set by the
+    # CLI in run_slam.py / da3_runner.py).  keyframes_from replays exactly the
+    # recorded keyframe seq_idxs, bypassing optical-flow selection so two
+    # configs are compared on byte-identical frames; dump_keyframes writes the
+    # selected list after the run.  See da3_slam.frontend.keyframe_selector.
+    keyframes_from: str | None = None
+    dump_keyframes: str | None = None
+
+
+class _BoolFlag(BooleanOptionalAction):
+    """BooleanOptionalAction that also accepts the underscore negation.
+
+    Stock argparse only generates ``--no-token_merging``; every other negated
+    flag in this repo is underscored (``--no_loop_closure``, ``--no_undistort``),
+    so both spellings are registered and mean the same thing.
+    """
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, **kwargs)
+        self.option_strings = list(self.option_strings) + [
+            f"--no_{opt[2:]}" for opt in option_strings if opt.startswith("--")
+        ]
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest,
+                not option_string.startswith(("--no-", "--no_")))
+
+
+def add_token_merging_cli(parser, yaml_defaults: dict | None = None) -> None:
+    """Add the token-merging flags to an argparse parser.
+
+    Shared by run_slam.py and the benchmark drivers so the two never drift.
+    All defaults are None ("leave the YAML value alone") except the master
+    switch, which reads its default from the YAML when one is supplied.
+
+        --token_merging / --no_token_merging     the A/B switch
+        --merge_start / --merge_ratio / --merge_min_frames / --no_merge_protect
+    """
+    merging = (yaml_defaults or {}).get("token_merging", {}) or {}
+    group = parser.add_argument_group("cross-view token merging (experimental)")
+    group.add_argument(
+        "--token_merging", action=_BoolFlag,
+        default=bool(merging.get("enable", False)) if yaml_defaults else None,
+        help="Merge cross-view attention tokens in the DA3 backbone "
+             "(--no_token_merging for the unmerged baseline)")
+    group.add_argument(
+        "--merge_start", type=int, default=None,
+        help="First merging block as a position among the global blocks "
+             "(0 = all of them)")
+    group.add_argument(
+        "--merge_ratio", type=float, default=None,
+        help="Fraction of tokens absorbed into the destination set")
+    group.add_argument(
+        "--merge_min_frames", type=int, default=None,
+        help="Never merge batches smaller than this")
+    group.add_argument(
+        "--merge_protect", action=_BoolFlag, default=None,
+        help="Hold a uniform stride of tokens out of the merge")
+
+
+def apply_token_merging_cli(config: "SLAMConfig", args) -> None:
+    """Apply the flags added by add_token_merging_cli() to a built config."""
+    merging = config.token_merging
+    if getattr(args, "token_merging", None) is not None:
+        merging.enable = bool(args.token_merging)
+    for flag, field_name in (
+        ("merge_start", "start"),
+        ("merge_ratio", "merge_ratio"),
+        ("merge_min_frames", "min_frames"),
+        ("merge_protect", "protect"),
+    ):
+        value = getattr(args, flag, None)
+        if value is not None:
+            setattr(merging, field_name, value)
 
 
 def load_slam_config(
@@ -202,21 +386,85 @@ def load_slam_config(
             cfg[key] = value
 
     keyframe = cfg.get("keyframe", {})
+    tracking = cfg.get("tracking", {}) or {}
     noise = cfg.get("noise", {})
     loop_closure = cfg.get("loop_closure", {})
+    token_merging = cfg.get("token_merging", {}) or {}
 
     return SLAMConfig(
         submap_size=cfg["submap_size"],
         submap_overlap=int(cfg.get("submap_overlap", 1)),
+        submap_flow_budget=float(cfg.get("submap_flow_budget", 0.0)),
+        boundary_scale_rolloff_tau=float(cfg.get("boundary_scale_rolloff_tau", 0.0)),
+        boundary_scale_rolloff_p=float(cfg.get("boundary_scale_rolloff_p", 3.0)),
+        submap_warmup_size=int(cfg.get("submap_warmup_size", 0)),
+        submap_warmup_submaps=int(cfg.get("submap_warmup_submaps", 2)),
         confidence_percentile=cfg["confidence_percentile"],
         depth_model=cfg["depth_model"],
         depth_model_resolution=cfg["depth_model_resolution"],
         use_ray_pose=bool(cfg.get("use_ray_pose", False)),
+        backbone_dtype=str(cfg.get("backbone_dtype", "fp32")),
+        pose_parameterisation=str(cfg.get("pose_parameterisation", "sl4")),
+        submap_skip_strides=tuple(cfg.get("submap_skip_strides", ()) or ()),
         boundary_scale_damping=float(cfg.get("boundary_scale_damping", 0.0)),
         boundary_scale_clamp=_optional_float(cfg, "boundary_scale_clamp"),
         boundary_scale_deadband=float(cfg.get("boundary_scale_deadband", 0.0)),
         enable_loop_closure=loop_closure.get("enable", True),
         semantic_model=cfg.get("semantic_model", None),
+        token_merging=TokenMergingConfig(
+            enable=bool(token_merging.get("enable", False)),
+            start=int(token_merging.get("start", 0)),
+            merge_ratio=float(token_merging.get("merge_ratio", 0.9)),
+            sx=int(token_merging.get("sx", 2)),
+            sy=int(token_merging.get("sy", 2)),
+            protect=bool(token_merging.get("protect", True)),
+            protect_ratio=float(token_merging.get("protect_ratio", 0.1)),
+            seed=int(token_merging.get("seed", 33)),
+            min_frames=int(token_merging.get("min_frames", 8)),
+        ),
+        tracking=TrackerConfig(
+            enable=bool(tracking.get("enable", False)),
+            max_features=int(tracking.get("max_features", 1200)),
+            min_features=int(tracking.get("min_features", 900)),
+            flow_window_size=tuple(tracking.get("flow_window_size", (31, 31))),
+            flow_pyramid_levels=int(tracking.get("flow_pyramid_levels", 4)),
+            quality_level=float(tracking.get("quality_level", 0.01)),
+            min_distance=float(tracking.get("min_distance", 12.0)),
+            fb_threshold=float(tracking.get("fb_threshold", 2.0)),
+            reproj_error=float(tracking.get("reproj_error", 5.0)),
+            min_inliers=int(tracking.get("min_inliers", 20)),
+            max_cloud_radii=float(tracking.get("max_cloud_radii", 10.0)),
+            replenish_radius=int(tracking.get("replenish_radius", 4)),
+            relocalize=bool(tracking.get("relocalize", True)),
+            matcher=str(tracking.get("matcher", "orb")),
+            xfeat_device=str(tracking.get("xfeat_device", "cuda")),
+            xfeat_min_cossim=float(tracking.get("xfeat_min_cossim", 0.82)),
+            orb_features=int(tracking.get("orb_features", 2500)),
+            ratio_test=float(tracking.get("ratio_test", 0.90)),
+            max_hamming=int(tracking.get("max_hamming", 64)),
+            ransac_iterations=int(tracking.get("ransac_iterations", 1000)),
+            publish_all_keyframes=bool(tracking.get("publish_all_keyframes", False)),
+            local_map_size=int(tracking.get("local_map_size", 12)),
+            replenish_keyframes=int(tracking.get("replenish_keyframes", 6)),
+            triangulate=bool(tracking.get("triangulate", False)),
+            min_views=int(tracking.get("min_views", 2)),
+            agreement=float(tracking.get("agreement", 0.05)),
+            relocalize_candidates=int(tracking.get("relocalize_candidates", 3)),
+            motion_model_frames=int(tracking.get("motion_model_frames", 10)),
+            bootstrap=bool(tracking.get("bootstrap", False)),
+            queue_frames=int(tracking.get("queue_frames", 8)),
+            provisional=bool(tracking.get("provisional", False)),
+            provisional_resolution=int(tracking.get("provisional_resolution", 392)),
+            refresh_keyframes=int(tracking.get("refresh_keyframes", 0)),
+            merge_observations=bool(tracking.get("merge_observations", True)),
+            merge_max_age=int(tracking.get("merge_max_age", 0)),
+            provisional_window=int(tracking.get("provisional_window", 8)),
+            blur_ratio=float(tracking.get("blur_ratio", 0.5)),
+            blur_window=int(tracking.get("blur_window", 30)),
+            relocalize_interval=int(tracking.get("relocalize_interval", 3)),
+            min_confidence=float(tracking.get("min_confidence", 0.1)),
+            history=int(tracking.get("history", 900)),
+        ),
         keyframe=KeyframeSelectorConfig(
             min_disparity_fraction=keyframe["min_disparity_fraction"],
             max_submap_size=cfg["submap_size"],
@@ -249,6 +497,8 @@ def load_slam_config(
             max_loop_closures=loop_closure["max_loop_closures"],
             min_confidence_ratio=loop_closure["min_confidence_ratio"],
             context_frames=int(loop_closure.get("context_frames", 1)),
+            roma_gate=bool(loop_closure.get("roma_gate", False)),
+            roma_min_overlap=float(loop_closure.get("roma_min_overlap", 0.30)),
             max_rotation_error_deg=_optional_float(
                 loop_closure, "max_rotation_error_deg"),
             max_translation_error=_optional_float(
