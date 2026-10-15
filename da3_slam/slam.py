@@ -52,9 +52,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from da3_slam.config import SLAMConfig, load_slam_config
+from da3_slam.frontend.tracker import FrameTracker, TrackingReference
 from da3_slam.frontend.keyframe_selector import (
     OnlineKeyframeSelector,
+    ReplayKeyframeSelector,
     SegmentKeyframeSelector,
+    load_keyframe_list,
+    save_keyframe_list,
 )
 from da3_slam.backend.inference.depth_estimator import DepthEstimator
 from da3_slam.backend.inference.submap import Submap, SubmapBuilder, transform_points
@@ -89,6 +93,14 @@ class SLAMResult:
 
     # Wall-clock timing breakdown
     timings: dict[str, float]
+
+    # Backbone (DA3 forward) instrumentation for the whole run, read from the
+    # DepthEstimator: cumulative forward wall-clock (s), number of forward
+    # calls, and the peak GPU memory of a single forward (bytes).  Backbone-
+    # only latency + peak memory are two of the sweep's headline axes.
+    backbone_seconds: float = 0.0
+    backbone_calls: int = 0
+    peak_gpu_mem_bytes: int = 0
 
     @property
     def n_keyframes(self) -> int:
@@ -161,8 +173,10 @@ class SLAMResult:
                 seen_seq_idx.add(frame.seq_idx)
                 if len(frame.points_cam) == 0:
                     continue
-                global_cam_to_world = self.optimization.pose(frame.seq_idx).astype(np.float64)
-                all_points.append(transform_points(frame.points_cam, global_cam_to_world))
+                # Batch unit -> submap 0's unit, matching the graph translations.
+                points_cam = frame.points_cam * np.float32(submap.global_scale)
+                points_to_world = self.optimization.point_transform(frame.seq_idx)
+                all_points.append(transform_points(points_cam, points_to_world))
                 all_colors.append(frame.colors)
 
         if not all_points:
@@ -262,6 +276,10 @@ class SLAMUpdate:
     frame_points_cam: list[tuple[int, np.ndarray, np.ndarray]] = field(
         default_factory=list)
 
+    # seq_idx → similarity scale (Sim(3); 1.0 under SL(4)).  keyframe_poses are
+    # rigid, so re-projecting points must scale them: world = s·R·p + t.
+    keyframe_scales: dict[int, float] = field(default_factory=dict)
+
 
 # ── run context ───────────────────────────────────────────────────────────────
 
@@ -275,11 +293,19 @@ class _RunContext:
     loop_closure_queue: queue.Queue
     # loop-closure worker → processing (seq_b, seq_a, relative, closure)
     loop_closure_result_queue: queue.Queue
+    # frontend → tracking.  Bounded and LOSSY: tracked poses never enter the
+    # pose graph, so a frame the tracker cannot keep up with is dropped rather
+    # than allowed to delay keyframe selection behind it.
+    track_queue: queue.Queue
     loop_closure_done: threading.Event
     submaps: list[Submap]
     loop_closures: list[LoopClosure]
     timings: dict[str, float]
     optimization_result: OptimizationResult | None = None
+    # (previous rung, anchor-to-world, accumulated scale) for the bootstrap
+    # ladder, which runs before any submap and never touches the graph.
+    bootstrap: tuple | None = None
+    frames_dropped: int = 0
 
     # Optional live-update callback (fired per submap from the processing
     # thread); None disables incremental emission.
@@ -296,6 +322,37 @@ class _RunContext:
     # Same error contract as on_update.
     on_loop_closure: (Callable[[dict[int, np.ndarray],
                                 list[tuple[int, int]], str], None] | None) = None
+
+    # Optional per-frame pose callback (frontend thread), fired for every
+    # input frame once tracking has geometry to solve against: (seq_idx, 4x4
+    # cam-to-world, TrackStats).  This is the low-latency pose stream — it
+    # arrives at camera rate, ~6 s before the submap covering that frame is
+    # optimised, and is superseded by it.  Same error contract as on_update.
+    on_pose: Callable[[int, np.ndarray, object], None] | None = None
+    # Fired once, when the bootstrap ladder's gauge is reconciled with the map.
+    on_pose_correction: Callable[[np.ndarray, int], None] | None = None
+
+    # Live tracker, when config.tracking.enable is set.  Written by the
+    # frontend, fed new geometry by the processing thread.
+    tracker: FrameTracker | None = None
+
+    # Deterministic replay.  With replay_lead > 0 the frontend may run at most
+    # that many BATCHES ahead of the optimised map, instead of being paced
+    # against the wall clock.  The unit is batches, not frames, because a batch
+    # is what the backend consumes: a frame-based lead has to exceed one batch
+    # span, which in segment mode varies with the stride (16 keyframes at
+    # stride 16 is 256 frames), and a lead below it deadlocks the frontend
+    # against a submap whose frames it has not emitted yet.  Wall-clock pacing is what makes this
+    # pipeline's tracking numbers non-reproducible — thread timing decides when
+    # references land — and the spread is large (live ATE 32.9 cm +/- 11.0 over
+    # three identical runs).  Lockstep fixes the frontend/backend relationship
+    # structurally, so a repeat is a repeat, and it runs at pipeline speed
+    # rather than footage speed.
+    replay_lead: int = 0
+    batches_emitted: int = 0
+    submaps_processed: int = 0
+    replay_stalled: bool = False
+    progress: threading.Condition = field(default_factory=threading.Condition)
 
     # First exception raised by any worker thread; checked by the others to
     # shut down early, and re-raised by run().
@@ -538,26 +595,214 @@ class _KeyframeBatcher:
     pose graph (module docstring, invariant 1).
     """
 
-    def __init__(self, submap_size: int, overlap: int):
+    def __init__(self, submap_size: int, overlap: int,
+                 warmup_size: int = 0, warmup_submaps: int = 0,
+                 flow_budget: float = 0.0, keyframe_config=None,
+                 bootstrap: bool = False, refresh_keyframes: int = 0,
+                 provisional_window: int = 8):
+        """Batch keyframes into submaps, optionally with a WARMUP RAMP.
+
+        With warmup_size == 0 the behaviour is what it has always been: every
+        submap holds `submap_size` keyframes.
+
+        With a warmup, the first `warmup_submaps` submaps hold `warmup_size`
+        keyframes and the rest hold `submap_size`.  This exists because a SHORT
+        sequence at a large submap_size can yield a single submap, which
+        silently disables the whole SLAM layer: no boundary to chain, a one-node
+        SL(4) graph with nothing to optimise, and loop closure structurally
+        impossible (min_submaps_apart >= 1 cannot be met).  Measured on
+        7-Scenes/stairs (500 frames -> 32 keyframes -> 1 submap at size 32):
+        ATE 0.1149 with scale 1.140, versus 0.0305 and scale 1.009 at size 16,
+        where the same sequence yields 3 submaps — a 3.8x difference produced
+        entirely by whether the pose graph exists.
+
+        The ramp is CAUSAL: it depends only on how many submaps have already
+        been emitted, never on the total sequence length, so it works online
+        where the length is unknown.  Submaps of differing sizes need no special
+        handling downstream — graph nodes are submaps and factors are relative
+        poses at shared anchors, so a [16, 16, 32, 32, ...] sequence is a
+        perfectly ordinary graph and no re-inference is required.
+
+        Trade-off to be aware of: DA3's cross-view attention has less context in
+        a smaller batch, so warmup submaps have somewhat weaker internal
+        geometry (at size 8 stairs scored 0.0997, worse than size 16's 0.0305),
+        and they sit at the START of the trajectory where errors propagate
+        furthest.  Keep warmup_size at the smallest value that still gives good
+        geometry rather than the smallest that gives many submaps.
+        """
         self._submap_size = submap_size
         self._overlap = overlap
+        self._bootstrap = bootstrap
+        self._rungs: list[int] | None = None
+        self._refresh_every = int(refresh_keyframes)
+        self._refresh_window = int(provisional_window)
+        self._last_refresh = 0
+        # FLOW BUDGET: close a submap once the view has moved far enough,
+        # instead of only after a fixed KEYFRAME COUNT.
+        #
+        # A submap is one DA3 batch, and DA3 estimates its geometry jointly by
+        # attending BETWEEN views -- which requires the views to still see
+        # overlapping scene.  Counting keyframes does not measure that.  In
+        # segment mode keyframes are picked at a fixed FRAME stride, so a fixed
+        # count spans whatever distance the camera happened to travel:
+        # measured, 2.8 m per submap on TUM fr1/teddy and 3.3 m on Replica
+        # room2, against 51 m on UAS fyllingsdalen and 65 m on UAS hornbill.
+        # At 65 m in a tunnel the first and last frames of a batch share no
+        # visible surface, so cross-view attention has nothing to attend to --
+        # and those two sequences are exactly the ones that regressed 2.2-2.4x
+        # when submap_size went 16 -> 32, while campus_fog (8 m/submap) barely
+        # moved.
+        #
+        # Accumulated optical flow is a scale-free proxy for view change: it
+        # needs no metric estimate and no intrinsics, so ONE budget serves
+        # indoor and aerial alike.  submap_size remains as a hard cap.
+        # 0 disables it and the behaviour is exactly as before.
+        self._flow_budget = float(flow_budget or 0.0)
+        self._kf_config = keyframe_config
+        self._flow_accum = 0.0
+        self._last_image = None
+        self._warmup_size = int(warmup_size)
+        self._provisional_done = False
+        self._warmup_submaps = int(warmup_submaps)
+        self._emitted = 0
         self._labels: list[str] = []
         self._images: list[np.ndarray] = []
         self._indices: list[int] = []
 
+    def _target_size(self) -> int:
+        """Keyframes for the submap currently being filled.
+
+        GEOMETRIC RAMP: start at `warmup_size` and DOUBLE every
+        `warmup_submaps` submaps, capped at `submap_size`.  With
+        warmup_size=16, warmup_submaps=2 and submap_size=32 that is
+        16, 16, 32, 32, 32, ... — the first submaps are small so a short
+        sequence still gets a pose graph, and the size climbs to the measured
+        optimum for everything after.
+
+        THE CAP IS NOT ARBITRARY.  A sweep of fixed sizes {8, 16, 32, 64} on
+        TUM fr1 (keyframes frozen per sequence) gave mean Sim(3) ATE
+        0.0324 / 0.0295 / 0.0267 / 0.0270: the curve is U-shaped with its
+        minimum at 32, and 64 already ties while degrading fr1/room and
+        fr1/teddy.  Ramping past the cap would also shrink the submap COUNT —
+        loop closures already fall 3.8 -> 1.7 per sequence going from 16 to 32,
+        since fewer submaps means fewer eligible retrieval pairs — and would
+        recreate at the long end exactly the failure this ramp fixes at the
+        short end, where one submap disables chaining, the graph and loop
+        closure together.  DA3's cross-view attention is also quadratic in
+        batch frames, so very large submaps are expensive and outside the
+        regime the backbone was trained on.
+        """
+        if self._warmup_size <= 0:
+            return self._submap_size
+        step = max(1, self._warmup_submaps)
+        size = self._warmup_size * (2 ** (self._emitted // step))
+        size = min(size, self._submap_size)
+        return max(size, self._overlap + 1)
+
     def add(self, label: str, image: np.ndarray, seq_idx: int) -> _KeyframeBatch | None:
         """Append a keyframe; return a full batch when one is ready."""
+        if self._flow_budget > 0.0 and self._last_image is not None:
+            try:
+                from da3_slam.frontend.keyframe_selector import keyframe_flow
+                self._flow_accum += keyframe_flow(
+                    self._last_image, image, self._kf_config)[2]
+            except Exception:
+                pass          # never fail a run over the motion signal
+        self._last_image = image
+
         self._labels.append(label)
         self._images.append(image)
         self._indices.append(seq_idx)
-        if len(self._labels) < self._submap_size:
+        over_budget = (self._flow_budget > 0.0
+                       and self._flow_accum >= self._flow_budget
+                       and len(self._labels) > self._overlap + 1)
+        if len(self._labels) < self._target_size() and not over_budget:
             return None
+        self._emitted += 1
+        self._flow_accum = 0.0
+        self._provisional_done = False
+        self._last_refresh = self._overlap
         batch = (list(self._labels), list(self._images), list(self._indices))
         # Anchor the next submap on the last `overlap` keyframes.
         del self._labels[:-self._overlap]
         del self._images[:-self._overlap]
         del self._indices[:-self._overlap]
         return batch
+
+    def bootstrap(self) -> _KeyframeBatch | None:
+        """A DOUBLING LADDER of early batches, before any submap exists.
+
+        Until the first submap is optimised the tracker has nothing: no depth,
+        and — just as disabling — no intrinsics, since `_intrinsic()` reads K
+        off the reference.  Measured at submap 16 that dead window is 14-22% of
+        a clip, and 60-85% of it is spent waiting for the batch to FILL rather
+        than for DA3 to run.  So each rung hands the tracker whatever exists as
+        soon as it exists: 2 keyframes, then 4, then 8, each a cheap re-inference
+        at `provisional_resolution`.
+
+        Unlike `submap_warmup_size`, which buys the same earliness by making the
+        first real submap smaller, none of this reaches the pose graph — so the
+        map keeps the geometry of a full-size first batch, and the metric scale
+        chain it anchors is untouched (measured: warmup 8 costs Replica's scale
+        0.9999 -> 0.9698).
+
+        Fires once per rung, in order, and only while nothing has been emitted.
+        """
+        if self._emitted or not self._bootstrap:
+            return None
+        if self._rungs is None:
+            size, self._rungs = 2, []
+            while size < self._target_size():
+                self._rungs.append(size)
+                size *= 2
+        if not self._rungs or len(self._labels) < self._rungs[0]:
+            return None
+        size = self._rungs.pop(0)
+        return (list(self._labels[:size]), list(self._images[:size]),
+                list(self._indices[:size]))
+
+    def provisional(self) -> _KeyframeBatch | None:
+        """A snapshot of the half-built batch, for the tracker only.
+
+        The tracker's geometry is always one DA3 inference old, and then ages
+        until the next submap lands — measured, most tracked poses were being
+        solved against a reference 4-8 s old, where the error is 2-3x what it
+        is at 2-4 s.  This hands it the first half of the batch as soon as that
+        half exists, roughly halving the worst-case age.  It never enters the
+        pose graph: half a batch has weaker cross-view geometry and would make
+        the MAP worse, while a PnP pose does not care.
+
+        With `refresh_keyframes > 0` it instead fires REPEATEDLY, every that
+        many keyframes, so the reference never ages past roughly that interval
+        — measured on fr1/teddy, live error against the map is 0.15 m when the
+        reference is 2-4 s old and 0.29 m at 6-9 s, and most frames sit in the
+        old bucket.  Each refresh is the shared ANCHOR plus the most recent
+        `provisional_window` keyframes: the anchor is what
+        `_publish_provisional_reference` bridges through, and capping the rest
+        keeps the cost flat instead of growing with the batch.
+
+        Returns a copy (the buffer keeps filling).
+        """
+        if len(self._labels) <= self._overlap + 1:
+            return None
+        every = self._refresh_every
+        if every > 0:
+            if len(self._labels) < self._last_refresh + every:
+                return None
+            self._last_refresh = len(self._labels)
+            window = max(2, self._refresh_window)
+            if len(self._labels) <= window:
+                keep = list(range(len(self._labels)))
+            else:                               # anchor + newest `window - 1`
+                keep = [0] + list(range(len(self._labels) - window + 1,
+                                        len(self._labels)))
+            return ([self._labels[i] for i in keep],
+                    [self._images[i] for i in keep],
+                    [self._indices[i] for i in keep])
+        if self._provisional_done or len(self._labels) < self._target_size() // 2:
+            return None
+        self._provisional_done = True
+        return (list(self._labels), list(self._images), list(self._indices))
 
     def tail(self) -> _KeyframeBatch | None:
         """The final partial batch, or None when only the anchor copies of
@@ -575,6 +820,44 @@ def _scaled_translation(transform: np.ndarray, scale: float) -> np.ndarray:
     scaled = transform.copy()
     scaled[:3, 3] *= scale
     return scaled
+
+
+def _rolloff_damping(boundary_idx: int, config) -> float:
+    """Effective damping g for the boundary entering submap `boundary_idx`.
+
+    With boundary_scale_rolloff_tau <= 0 this returns the fixed
+    boundary_scale_damping and nothing changes.
+
+    Otherwise the per-boundary WEIGHT w = (1 - g) follows a smooth rolloff
+
+        w_j = 1 / (1 + (j / tau)^p)
+
+    so g_j = 1 - w_j.  Motivation: boundary ratios are chained
+    multiplicatively, so with a constant weight the accumulated scale variance
+    is Var(log S_k) = sigma^2 * sum_j w_j^2 = sigma^2 * k -- it grows without
+    bound in the number of boundaries.  Any w_j with sum w_j^2 < infinity keeps
+    it bounded; this form converges for p > 1/2 (sum = 7.56 at tau=10, p=3).
+
+    WHY NOT A SINGLE EXPONENTIAL: e^(-j/tau) is also summable, but one
+    parameter controls both where the transition sits and how gradual it is, so
+    it cannot be flat early and steep later.  Measured against the damping
+    sweep, tau=30 leaves w=0.46 at j=23 (UAS median, which wants w~0) while
+    tau=10 already drops to w=0.67 at j=4 (TUM median, where damping costs ~5%).
+    The rolloff separates the two: tau sets the transition, p its sharpness, so
+    tau=10 p=3 gives w=0.94 at j=4 and w=0.08 at j=23.
+
+    This is causal -- it depends only on how many boundaries have been chained
+    so far, never on total sequence length -- so it works online.
+    """
+    tau = float(getattr(config, "boundary_scale_rolloff_tau", 0.0) or 0.0)
+    if tau <= 0.0:
+        return float(config.boundary_scale_damping)
+    p = float(getattr(config, "boundary_scale_rolloff_p", 3.0) or 3.0)
+    j = max(int(boundary_idx), 0)
+    w = 1.0 / (1.0 + (j / tau) ** p)
+    # Never trust a boundary MORE than the configured floor allows.
+    w = min(w, 1.0 - float(config.boundary_scale_damping))
+    return 1.0 - w
 
 
 def _adjust_boundary_scale(
@@ -649,7 +932,8 @@ def _boundary_delta_scale(
     damping/clamp behaviour is used unchanged.
     """
     deadband = config.boundary_scale_deadband
-    if deadband <= 0 and config.boundary_scale_damping >= 1.0:
+    if (deadband <= 0 and config.boundary_scale_damping >= 1.0
+            and float(getattr(config, "boundary_scale_rolloff_tau", 0.0) or 0.0) <= 0.0):
         # Nothing would use the ratio — skip the median depth-ratio estimate.
         return 1.0, 1.0
     raw = _estimate_boundary_scale(prev_submap, curr_submap, overlap)
@@ -664,7 +948,8 @@ def _boundary_delta_scale(
               f"applying full correction {applied:.3f}")
         return raw, applied
     return raw, _adjust_boundary_scale(
-        raw, config.boundary_scale_damping, config.boundary_scale_clamp)
+        raw, _rolloff_damping(curr_submap.idx, config),
+        config.boundary_scale_clamp)
 
 
 # ── runner ────────────────────────────────────────────────────────────────────
@@ -690,6 +975,8 @@ class DA3SLAM:
             model_id=config.depth_model,
             process_resolution=config.depth_model_resolution,
             use_ray_pose=config.use_ray_pose,
+            token_merging=config.token_merging,
+            backbone_dtype=config.backbone_dtype,
         )
         self.builder = SubmapBuilder(
             self.estimator,
@@ -714,6 +1001,8 @@ class DA3SLAM:
         on_loop_closure: (Callable[[dict[int, np.ndarray],
                                     list[tuple[int, int]], str], None]
                           | None) = None,
+        on_pose: Callable[[int, np.ndarray, object], None] | None = None,
+        on_pose_correction: Callable[[np.ndarray, int], None] | None = None,
     ) -> SLAMResult:
         """Offline entry point: run SLAM over a fixed list of image files.
 
@@ -725,7 +1014,9 @@ class DA3SLAM:
         """
         return self.run_stream(self._disk_frame_source(image_paths),
                                on_update=on_update,
-                               on_loop_closure=on_loop_closure)
+                               on_loop_closure=on_loop_closure,
+                               on_pose=on_pose,
+                               on_pose_correction=on_pose_correction)
 
     @staticmethod
     def _disk_frame_source(image_paths: list[str]) -> Iterator[FrameItem]:
@@ -743,6 +1034,9 @@ class DA3SLAM:
         on_loop_closure: (Callable[[dict[int, np.ndarray],
                                     list[tuple[int, int]], str], None]
                           | None) = None,
+        on_pose: Callable[[int, np.ndarray, object], None] | None = None,
+        on_pose_correction: Callable[[np.ndarray, int], None] | None = None,
+        replay_lead: int = 0,
     ) -> SLAMResult:
         """Streaming entry point: run SLAM over an iterable of input frames.
 
@@ -758,6 +1052,10 @@ class DA3SLAM:
         used to drive a live viewer.  See SLAMUpdate for the threading and
         error-handling contract.
         """
+        # Zero the backbone timing / peak-memory counters for this run (the
+        # model — and thus the estimator — is reused across runs).
+        self.estimator.reset_stats()
+
         loop_closure_done = threading.Event()
         if self.detector is None:
             loop_closure_done.set()  # no loop-closure thread — event is immediately done
@@ -765,6 +1063,8 @@ class DA3SLAM:
         ctx = _RunContext(
             config=self.config,
             batch_queue=queue.Queue(maxsize=2),
+            track_queue=queue.Queue(
+                maxsize=max(1, int(self.config.tracking.queue_frames))),
             submap_queue=queue.Queue(maxsize=2),
             loop_closure_queue=queue.Queue(),
             loop_closure_result_queue=queue.Queue(),
@@ -772,6 +1072,8 @@ class DA3SLAM:
             submaps=[],
             loop_closures=[],
             timings={
+                "tracking": 0.0,
+                "provisional": 0.0,
                 "keyframe_selection": 0.0,
                 "submap_building": 0.0,
                 "graph_building": 0.0,
@@ -780,6 +1082,11 @@ class DA3SLAM:
             },
             on_update=on_update,
             on_loop_closure=on_loop_closure,
+            on_pose=on_pose,
+            on_pose_correction=on_pose_correction,
+            tracker=(FrameTracker(self.config.tracking)
+                     if self.config.tracking.enable else None),
+            replay_lead=int(replay_lead),
         )
 
         # Start consumers before producers so they are ready immediately.
@@ -789,6 +1096,9 @@ class DA3SLAM:
             threading.Thread(target=self._inference, args=(ctx,),
                              name="da3-inference", daemon=True),
         ]
+        if ctx.tracker is not None:
+            threads.append(threading.Thread(target=self._tracking, args=(ctx,),
+                                            name="da3-tracking", daemon=True))
         if self.detector is not None:
             threads.append(threading.Thread(target=self._loop_closure_worker,
                                             args=(ctx,), name="da3-loop-closure", daemon=True))
@@ -813,7 +1123,12 @@ class DA3SLAM:
         if ctx.backend_error is not None:
             raise ctx.backend_error
 
-        self._print_timing_breakdown(ctx.timings, wall_elapsed)
+        self._print_timing_breakdown(
+            ctx.timings, wall_elapsed,
+            backbone_seconds=self.estimator.backbone_seconds,
+            backbone_calls=self.estimator.n_infer_calls,
+            peak_gpu_mem_bytes=self.estimator.peak_memory_bytes,
+        )
 
         return SLAMResult(
             keyframe_poses=_build_keyframe_poses(
@@ -822,10 +1137,19 @@ class DA3SLAM:
             optimization=ctx.optimization_result,
             loop_closures=ctx.loop_closures,
             timings=ctx.timings,
+            backbone_seconds=self.estimator.backbone_seconds,
+            backbone_calls=self.estimator.n_infer_calls,
+            peak_gpu_mem_bytes=self.estimator.peak_memory_bytes,
         )
 
     @staticmethod
-    def _print_timing_breakdown(timings: dict[str, float], wall_elapsed: float) -> None:
+    def _print_timing_breakdown(
+        timings: dict[str, float],
+        wall_elapsed: float,
+        backbone_seconds: float = 0.0,
+        backbone_calls: int = 0,
+        peak_gpu_mem_bytes: int = 0,
+    ) -> None:
         col = max(len(k) for k in timings)
         tag = f"[{threading.current_thread().name}]"
         print(f"{tag} Timing breakdown (per-module compute time, threads overlap):")
@@ -834,6 +1158,11 @@ class DA3SLAM:
         print(f"  {'':-<{col + 9}}")
         print(f"  {'compute total':<{col}}  {sum(timings.values()):6.1f}s")
         print(f"  {'wall-clock':<{col}}  {wall_elapsed:6.1f}s")
+        # Backbone-only figures: the isolated DA3 forward cost (a subset of
+        # submap_building / loop_closure) plus the peak GPU memory of one call.
+        print(f"  {'backbone fwd':<{col}}  {backbone_seconds:6.1f}s "
+              f"({backbone_calls} calls, "
+              f"peak {peak_gpu_mem_bytes / 1e6:.0f} MB)")
 
     # ── frontend thread ───────────────────────────────────────────────────────
 
@@ -845,51 +1174,185 @@ class DA3SLAM:
         batch shares its last keyframe with the next batch (the anchor frame)
         — see the module docstring.
         """
-        segment_mode = ctx.config.keyframe.selection_mode == "segment"
-        if segment_mode:
+        # Replay mode (frozen keyframes) bypasses optical-flow selection and
+        # emits exactly the recorded seq_idxs, so two configs are compared on
+        # byte-identical frames.  It shares segment mode's list-returning
+        # step()/flush() interface, so both take the `list_mode` path.
+        if ctx.config.keyframes_from:
+            selector = ReplayKeyframeSelector(
+                load_keyframe_list(ctx.config.keyframes_from))
+            list_mode = True
+        elif ctx.config.keyframe.selection_mode == "segment":
             selector = SegmentKeyframeSelector(ctx.config.keyframe)
+            list_mode = True
         else:
             selector = OnlineKeyframeSelector(ctx.config.keyframe)
-        batcher = _KeyframeBatcher(ctx.config.submap_size,
-                                   _effective_overlap(ctx.config))
+            list_mode = False
+        batcher = _KeyframeBatcher(
+            ctx.config.submap_size, _effective_overlap(ctx.config),
+            warmup_size=getattr(ctx.config, "submap_warmup_size", 0),
+            warmup_submaps=getattr(ctx.config, "submap_warmup_submaps", 2),
+            flow_budget=getattr(ctx.config, "submap_flow_budget", 0.0),
+            keyframe_config=ctx.config.keyframe,
+            bootstrap=(ctx.tracker is not None
+                       and ctx.config.tracking.bootstrap),
+            refresh_keyframes=ctx.config.tracking.refresh_keyframes,
+            provisional_window=ctx.config.tracking.provisional_window)
+
+        # (seq_idx, label) of every selected keyframe, accumulated only when
+        # --dump_keyframes is set (frozen-keyframe capture).
+        keyframe_log: list[tuple[int, str]] | None = (
+            [] if ctx.config.dump_keyframes else None)
+
+        def emit(new_keyframes: list[tuple[str, np.ndarray, int]]) -> None:
+            for label, image, seq_idx in new_keyframes:
+                if keyframe_log is not None:
+                    keyframe_log.append((seq_idx, label))
+                batch = batcher.add(label, image, seq_idx)
+                if batch is not None:
+                    if ctx.replay_lead:
+                        with ctx.progress:
+                            ctx.batches_emitted += 1
+                    _blocking_put(ctx, ctx.batch_queue, (*batch, ""))
+                elif ctx.tracker is not None:
+                    # A BOOTSTRAP rung outranks the half-batch provisional: it
+                    # only fires before the first submap exists, which is
+                    # exactly the window in which the tracker has nothing at
+                    # all — no depth and, just as disabling, no intrinsics.
+                    if ctx.config.tracking.bootstrap:
+                        rung = batcher.bootstrap()
+                        if rung is not None:
+                            _blocking_put(ctx, ctx.batch_queue, (*rung, "bootstrap"))
+                            continue
+                    if ctx.config.tracking.provisional:
+                        early = batcher.provisional()
+                        if early is not None:
+                            _blocking_put(ctx, ctx.batch_queue,
+                                          (*early, "provisional"))
 
         try:
             for image, seq_idx, label in frame_source:
                 if ctx.backend_error is not None:
                     break
 
+                if ctx.replay_lead:
+                    self._await_backend(ctx, seq_idx)
+
+                if ctx.tracker is not None:
+                    # Hand off, never block.  Tracking cost used to be paid on
+                    # this thread, ahead of keyframe selection, so every
+                    # millisecond of it delayed batching and inflated the map's
+                    # latency — measured at 49.0 s of a 70.3 s run, more than
+                    # DA3 itself.  The map does not depend on these poses.
+                    try:
+                        ctx.track_queue.put_nowait((image, seq_idx))
+                    except queue.Full:
+                        ctx.frames_dropped += 1
+
                 t0 = time.time()
-                if segment_mode:
+                if list_mode:
                     new_keyframes = selector.step(image, seq_idx, label)
                 else:
                     new_keyframes = (
                         [(label, image, seq_idx)] if selector.step(image) else []
                     )
                 ctx.timings["keyframe_selection"] += time.time() - t0
+                emit(new_keyframes)
 
-                for keyframe in new_keyframes:
-                    batch = batcher.add(*keyframe)
-                    if batch is not None:
-                        _blocking_put(ctx, ctx.batch_queue, batch)
-
-            # Drain the final partial segment (segment mode only).
-            if segment_mode and ctx.backend_error is None:
+            # Drain the final partial segment (list-mode selectors only).
+            if list_mode and ctx.backend_error is None:
                 t0 = time.time()
                 tail_keyframes = selector.flush()
                 ctx.timings["keyframe_selection"] += time.time() - t0
-                for keyframe in tail_keyframes:
-                    batch = batcher.add(*keyframe)
-                    if batch is not None:
-                        _blocking_put(ctx, ctx.batch_queue, batch)
+                emit(tail_keyframes)
 
             # Flush the final partial batch.
             tail_batch = batcher.tail()
             if tail_batch is not None and ctx.backend_error is None:
-                _blocking_put(ctx, ctx.batch_queue, tail_batch)
+                _blocking_put(ctx, ctx.batch_queue, (*tail_batch, ""))
+
+            # Persist the selected keyframe list once the stream is fully
+            # consumed (skip on error — the list would be truncated).
+            if keyframe_log is not None and ctx.backend_error is None:
+                save_keyframe_list(ctx.config.dump_keyframes, keyframe_log)
         except Exception as exc:
             ctx.backend_error = exc
         finally:
             ctx.batch_queue.put(None)  # sentinel — always sent, even on error
+            if ctx.tracker is not None:
+                # Same discipline, and it must not block: if the tracking
+                # thread has already died its queue is never drained again, and
+                # a bare put() on a full queue would hang the run instead of
+                # raising (the loop-closure sentinel bug, exactly).
+                while True:
+                    try:
+                        ctx.track_queue.put_nowait(None)
+                        break
+                    except queue.Full:
+                        try:
+                            ctx.track_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+            if ctx.frames_dropped:
+                print(f"[da3-frontend] tracker could not keep up with "
+                      f"{ctx.frames_dropped} frames; they were dropped rather "
+                      f"than allowed to delay the map")
+
+    @staticmethod
+    def _await_backend(ctx: _RunContext, seq_idx: int) -> None:
+        """Hold the frontend within `replay_lead` batches of the optimised map.
+
+        The wait is bounded and simply proceeds on timeout, logging once: a run
+        that trips it is no longer deterministic, which is worth knowing about
+        rather than hiding.
+        """
+        deadline = time.time() + 60.0
+        with ctx.progress:
+            while (ctx.batches_emitted - ctx.submaps_processed > ctx.replay_lead
+                   and ctx.backend_error is None):
+                if not ctx.progress.wait(timeout=max(0.0, deadline - time.time())):
+                    if not ctx.replay_stalled:
+                        ctx.replay_stalled = True
+                        print(f"[da3-frontend] lockstep stalled at frame "
+                              f"{seq_idx} (lead {ctx.replay_lead} batches); "
+                              f"proceeding — this run is no longer deterministic")
+                    return
+
+    def _tracking(self, ctx: _RunContext) -> None:
+        """Live pose stream: pops frames, solves, fires `on_pose`.
+
+        Its own thread because it is pure output — tracked poses never reach
+        the pose graph — so when it falls behind, the right answer is to drop
+        frames, not to hold the frontend.  Inline, it was the single largest
+        cost in a paced run (49.0 s of 70.3 s) and it sat *ahead* of keyframe
+        selection, so the map paid for every millisecond of it.
+        """
+        try:
+            while True:
+                item = ctx.track_queue.get()
+                if item is None or ctx.backend_error is not None:
+                    break
+                image, seq_idx = item
+                t0 = time.time()
+                try:
+                    pose = ctx.tracker.step(image, seq_idx)
+                except Exception as exc:
+                    ctx.backend_error = exc
+                    break
+                ctx.timings["tracking"] += time.time() - t0
+                if pose is not None and ctx.on_pose is not None:
+                    try:
+                        ctx.on_pose(seq_idx, pose, ctx.tracker.stats)
+                    except Exception as exc:       # never kill the run
+                        print(f"[{threading.current_thread().name}] "
+                              f"on_pose callback error (ignored): {exc!r}")
+        finally:
+            # Drain so a blocked frontend can always finish.
+            while True:
+                try:
+                    ctx.track_queue.get_nowait()
+                except queue.Empty:
+                    break
 
     # ── inference thread ──────────────────────────────────────────────────────
 
@@ -901,7 +1364,22 @@ class DA3SLAM:
                 item = ctx.batch_queue.get()
                 if item is None or ctx.backend_error is not None:
                     break
-                paths, images, indices = item
+                paths, images, indices, kind = item
+
+                if kind:
+                    # Cheaper resolution: this geometry is thrown away as soon
+                    # as the real submap lands, so it buys latency with
+                    # accuracy it does not need to keep.
+                    t0 = time.time()
+                    early = self.builder.build(
+                        paths, images, indices, -1,
+                        resolution=ctx.config.tracking.provisional_resolution)
+                    ctx.timings["provisional"] += time.time() - t0
+                    if kind == "bootstrap":
+                        self._publish_bootstrap_reference(ctx, early)
+                    else:
+                        self._publish_provisional_reference(ctx, early)
+                    continue
 
                 t0 = time.time()
                 submap = self.builder.build(paths, images, indices, submap_idx)
@@ -930,7 +1408,8 @@ class DA3SLAM:
         Loop closure detection is dispatched to _loop_closure_worker; its
         results are drained back into the graph between optimisations.
         """
-        pose_graph = PoseGraph(ctx.config.noise)
+        pose_graph = PoseGraph(ctx.config.noise,
+                               ctx.config.pose_parameterisation)
         overlap = _effective_overlap(ctx.config)
 
         # Running product of inter-submap scale ratios: converts translations
@@ -971,8 +1450,11 @@ class DA3SLAM:
                     self._add_submap_to_graph(pose_graph, submap, accumulated_scale)
                     print(f"{tag} Submap {submap.idx}: scale={accumulated_scale:.4f} "
                           f"(Δ raw={raw_delta_scale:.4f} applied={delta_scale:.4f})")
-                self._add_consecutive_frame_factors(pose_graph, submap, accumulated_scale)
+                self._add_consecutive_frame_factors(
+                    pose_graph, submap, accumulated_scale,
+                    tuple(ctx.config.submap_skip_strides))
 
+                submap.global_scale = accumulated_scale
                 ctx.submaps.append(submap)
                 submap_scales[submap.idx] = accumulated_scale
                 submaps_by_idx[submap.idx] = submap
@@ -996,6 +1478,11 @@ class DA3SLAM:
                 t0 = time.time()
                 optimization = pose_graph.optimize()
                 ctx.timings["optimization"] += time.time() - t0
+                # Publish the LATEST result, not just the final one: the
+                # inference thread needs the current anchor poses to place a
+                # provisional tracking reference.  Every existing reader runs
+                # after the final optimisation, which still assigns last.
+                ctx.optimization_result = optimization
                 print(f"{tag} Submap {submap.idx}: "
                       f"{pose_graph.n_nodes} nodes  "
                       f"{pose_graph.n_factors} factors  "
@@ -1004,6 +1491,12 @@ class DA3SLAM:
                 if inserted_loops and ctx.on_loop_closure is not None:
                     self._emit_loop_closure_snapshot(
                         ctx, optimization.pose, inserted_loops, phase="post")
+
+                self._publish_tracking_reference(ctx, submap, optimization)
+                if ctx.replay_lead:
+                    with ctx.progress:
+                        ctx.submaps_processed += 1
+                        ctx.progress.notify_all()
 
                 if ctx.on_update is not None:
                     self._emit_update(ctx, submap, optimization)
@@ -1048,6 +1541,16 @@ class DA3SLAM:
 
         except Exception as exc:
             ctx.backend_error = exc
+        finally:
+            # The loop-closure worker blocks on its queue and only stops on a
+            # sentinel, which the happy path above sends.  Every OTHER exit —
+            # an exception here, or the early return when another thread has
+            # already failed — used to skip it, so the worker waited forever,
+            # run_stream's join() never returned, and the run HUNG instead of
+            # raising: the real error was invisible.  A second sentinel on the
+            # normal path is harmless; a missing one is not.
+            if self.detector is not None:
+                ctx.loop_closure_queue.put(None)
 
     @staticmethod
     def _add_first_submap_to_graph(pose_graph: PoseGraph, submap: Submap) -> None:
@@ -1084,6 +1587,7 @@ class DA3SLAM:
         pose_graph: PoseGraph,
         submap: Submap,
         accumulated_scale: float,
+        skip_strides: tuple[int, ...] = (),
     ) -> None:
         """Add a between-factor for each consecutive frame pair in the submap.
 
@@ -1092,17 +1596,35 @@ class DA3SLAM:
         *independent* DA3 measurement of the same pair and is added on
         purpose: the redundancy stops one broken batch from silently
         displacing everything after the boundary.
+        `skip_strides` additionally links frames that are k apart *within the
+        same batch* (k = 2, 4, 8, ...).  This is not extra computation: DA3
+        estimates every frame of a batch JOINTLY, so the relative pose between
+        frame i and frame i+k is a single direct measurement — not the
+        composition of k consecutive ones.  Adding it is free information that
+        the consecutive-only chain throws away.
+
+        Why it matters: measured per-keyframe error has a floor that does not
+        shrink with baseline (RPE/step triples from 0.089 to 0.312 as keyframe
+        spacing shrinks 9x), so a chain of k short steps accumulates ~sqrt(k)
+        floors where one stride-k measurement carries just one.  It also makes
+        the graph OVER-determined — a consecutive-only chain has exactly
+        n_nodes factors for n_nodes nodes, so it is exactly determined and the
+        noise model cannot influence the solution at all.  Redundancy is what
+        lets the optimiser average the floor down.
         """
-        for previous, current in zip(submap.frames, submap.frames[1:]):
-            relative = (
-                previous.extrinsic.astype(np.float64)
-                @ current.cam_to_world.astype(np.float64)
-            )
-            pose_graph.add_between(
-                previous.seq_idx,
-                current.seq_idx,
-                _scaled_translation(relative, accumulated_scale),
-            )
+        strides = (1, *sorted({int(k) for k in (skip_strides or ()) if int(k) > 1}))
+        frames = submap.frames
+        for stride in strides:
+            for previous, current in zip(frames, frames[stride:]):
+                relative = (
+                    previous.extrinsic.astype(np.float64)
+                    @ current.cam_to_world.astype(np.float64)
+                )
+                pose_graph.add_between(
+                    previous.seq_idx,
+                    current.seq_idx,
+                    _scaled_translation(relative, accumulated_scale),
+                )
 
     @staticmethod
     def _emit_loop_closure_snapshot(
@@ -1122,6 +1644,264 @@ class DA3SLAM:
                   f"on_loop_closure callback error (ignored): {exc!r}")
 
     @staticmethod
+    def _reconcile_bootstrap(ctx: _RunContext, optimization: OptimizationResult) -> None:
+        """Align the bootstrap gauge to the optimised one, retroactively.
+
+        `_register` already moves the tracker's OBSERVATIONS into the map's
+        frame when the real references arrive, so tracking itself recovers on
+        its own.  What it cannot fix is the poses already handed to the
+        consumer: those were computed in the ladder's gauge, whose scale is
+        whatever DA3 returned for a 2-frame batch.  Leaving them there is not a
+        small error — a single Sim(3) alignment cannot fit two gauges at once,
+        so on chess it moved the live ATE of the WHOLE stream from 11.9 to
+        42.1 cm, every age bucket included.
+
+        Both gauges place the same keyframes, so the correction is the
+        similarity taking one set of keyframe positions to the other.  It is
+        emitted once, with the frame bound it applies below, and the consumer
+        rewrites its history.
+        """
+        state, ctx.bootstrap = ctx.bootstrap, None
+        rung, anchor_to_world, scale = state
+        inverse = np.linalg.inv(rung.frames[0].cam_to_world.astype(np.float64))
+        source, target = [], []
+        for frame in rung.frames:
+            try:
+                real = np.asarray(optimization.point_transform(int(frame.seq_idx)),
+                                  dtype=np.float64)
+            except Exception:
+                continue                       # not in the graph
+            relative = inverse @ frame.cam_to_world.astype(np.float64)
+            relative[:3, 3] *= scale
+            source.append((anchor_to_world @ relative)[:3, 3])
+            target.append(real[:3, 3])
+        if len(source) < 3:
+            return                             # under-determined; leave it alone
+        transform = _similarity(np.asarray(source), np.asarray(target))
+        if transform is None:
+            return
+        # The gauge applies to every pose emitted before this moment, not just
+        # to frames up to the last rung's keyframe: the tracker keeps solving in
+        # the bootstrap gauge right up until the real reference is adopted.
+        bound = int(max(int(f.seq_idx) for f in rung.frames))
+        try:
+            ctx.tracker.set_correction(transform, discard_upto=bound)
+        except Exception as exc:
+            print(f"[da3-tracking] bootstrap correction failed on the tracker: {exc!r}")
+        if ctx.on_pose_correction is not None:
+            try:
+                ctx.on_pose_correction(transform, bound)
+            except Exception as exc:
+                print(f"[da3-tracking] on_pose_correction callback error "
+                      f"(ignored): {exc!r}")
+
+    def _publish_bootstrap_reference(self, ctx: _RunContext, rung: Submap) -> None:
+        """Publish a bootstrap rung to the tracker, with no graph and no map.
+
+        There is no previous submap to bridge through and no optimisation to
+        ask, so the FIRST rung defines the frame: DA3's own batch poses are
+        taken as world, at scale 1.  That is deliberately the same gauge the
+        real first submap will land in — the graph priors frame 0 on its DA3
+        pose — so the two differ mostly by each batch's arbitrary metric scale
+        rather than by a full rigid transform.
+
+        Later rungs are chained onto the first through the keyframe they all
+        share (every rung starts at keyframe 0), exactly as consecutive submaps
+        are bridged: compose the anchor's stored world transform with DA3's
+        local anchor-to-frame pose, with the translation carried into the
+        established unit by the depth ratio at the anchor.
+
+        The handover to the real map needs no new machinery.  Rungs publish the
+        same `seq_idx`s the first submap will, so when `_publish_tracking_reference`
+        fires, its `updates` dict covers exactly these keyframes and the tracker
+        re-registers its observations into the optimised frame itself.  Poses
+        already emitted stay in the bootstrap gauge — the consumer sees them
+        corrected when the map reaches those frames.
+        """
+        if ctx.tracker is None or not rung.frames:
+            return
+        anchor, target = rung.frames[0], rung.frames[-1]
+        if anchor.seq_idx == target.seq_idx or target.depth is None:
+            return
+        state = ctx.bootstrap
+        if state is None:
+            anchor_to_world = np.asarray(anchor.cam_to_world, dtype=np.float64)
+            scale = 1.0
+        else:
+            previous, anchor_to_world, previous_scale = state
+            # NOT _estimate_boundary_scale: that reads the previous submap's
+            # LAST frame, which is the shared anchor only for consecutive
+            # submaps.  Rungs are nested and all start at keyframe 0, so the
+            # frame observed by both inferences is frames[0] of each.
+            try:
+                delta = _estimate_depth_scale(previous.frames[0].depth,
+                                              rung.frames[0].depth)
+            except Exception:
+                delta = 1.0
+            if not np.isfinite(delta) or delta <= 0:
+                delta = 1.0
+            scale = float(previous_scale) * float(delta)
+        ctx.bootstrap = (rung, anchor_to_world, scale)
+
+        inverse = np.linalg.inv(anchor.cam_to_world.astype(np.float64))
+
+        def place(frame) -> TrackingReference:
+            relative = inverse @ frame.cam_to_world.astype(np.float64)
+            relative[:3, 3] *= scale
+            to_world = anchor_to_world @ relative
+            rotation = _nearest_rotation(to_world[:3, :3])
+            gray = (cv2.cvtColor(frame.image, cv2.COLOR_RGB2GRAY)
+                    if frame.image is not None and frame.image.size else None)
+            return TrackingReference(
+                seq_idx=int(frame.seq_idx), gray=gray, depth=frame.depth,
+                confidence=frame.confidence, intrinsic=frame.intrinsic,
+                to_world=to_world, rotation_world=rotation, scale=scale)
+
+        companions = []
+        if ctx.config.tracking.publish_all_keyframes:
+            for other in rung.frames[:-1]:
+                if other.depth is not None and other.depth.size:
+                    companions.append(place(other))
+        reference = place(target)
+        reference.companions = companions
+        print(f"[da3-tracking] bootstrap rung: {len(rung.frames)} keyframes, "
+              f"target seq {int(target.seq_idx)}, scale {scale:.3f}, "
+              f"{len(companions)} companions", flush=True)
+        ctx.tracker.set_reference(reference)
+
+    def _publish_provisional_reference(self, ctx: _RunContext, early: Submap) -> None:
+        """Publish half-batch geometry to the tracker, bypassing the graph.
+
+        The provisional batch starts with the same anchor frames the previous
+        submap ended on, and those anchors already have optimised global poses
+        — the same bridge the pipeline uses to place a real submap (see
+        _add_submap_to_graph).  So the newest provisional frame can be placed
+        in the world frame by composing the anchor's global transform with
+        DA3's local anchor-to-frame pose, with the translation converted to the
+        global metric unit by the boundary depth ratio.
+
+        Nothing here reaches the pose graph, the submap list, or the map.  If
+        anything is missing (no optimisation yet, anchor not in the graph) the
+        reference is simply skipped: the tracker keeps the geometry it has.
+        """
+        if ctx.tracker is None or ctx.optimization_result is None or not early.frames:
+            return
+        previous = next((sm for sm in reversed(ctx.submaps)
+                         if not sm.is_loop_closure_submap), None)
+        if previous is None:
+            return
+        overlap = _effective_overlap(ctx.config)
+        anchor, target = early.frames[0], early.frames[-1]
+        if anchor.seq_idx == target.seq_idx or target.depth is None:
+            return
+        try:
+            anchor_to_world = np.asarray(
+                ctx.optimization_result.point_transform(anchor.seq_idx), dtype=np.float64)
+            delta = _estimate_boundary_scale(previous, early, overlap)
+        except Exception:
+            return                     # anchor not in the graph yet
+        scale = float(previous.global_scale) * float(delta)
+
+        # local anchor-to-target, translation carried into the global unit
+        relative = (np.linalg.inv(anchor.cam_to_world.astype(np.float64))
+                    @ target.cam_to_world.astype(np.float64))
+        relative[:3, 3] *= scale
+        to_world = anchor_to_world @ relative
+        rotation = _nearest_rotation(to_world[:3, :3])
+
+        gray = (cv2.cvtColor(target.image, cv2.COLOR_RGB2GRAY)
+                if target.image is not None and target.image.size else None)
+        ctx.tracker.set_reference(TrackingReference(
+            seq_idx=int(target.seq_idx),
+            gray=gray,
+            depth=target.depth,
+            confidence=target.confidence,
+            intrinsic=target.intrinsic,
+            to_world=to_world,
+            rotation_world=rotation,
+            scale=scale,
+        ))
+
+    @staticmethod
+    def _publish_tracking_reference(ctx: _RunContext, submap: Submap,
+                                    optimization: OptimizationResult) -> None:
+        """Hand the live tracker the newest keyframe's geometry.
+
+        The submap's *last* frame is the most recent view DA3 has processed, so
+        it is both the closest reference to the live frame and the one whose
+        feature tracks are most likely still alive (see frontend/tracker.py).
+        The transform is the same `point_transform` the viewer projects points
+        with, so a tracked pose lands in exactly the frame the map is drawn in;
+        its rotation is taken as the nearest orthonormal matrix, since under
+        SL(4) the block is only approximately a rotation.
+        """
+        if ctx.tracker is None:
+            return
+        if ctx.bootstrap is not None:
+            DA3SLAM._reconcile_bootstrap(ctx, optimization)
+        frame = submap.frames[-1]
+        if frame.depth is None or not frame.depth.size:
+            return
+        to_world = optimization.point_transform(frame.seq_idx)
+        rotation = _nearest_rotation(to_world[:3, :3])
+        # Refresh every keyframe the tracker may still hold: the graph moves
+        # them on each optimisation, and its local map is built from their
+        # poses, so stale transforms would put old observations in the wrong
+        # place and quietly poison PnP.
+        held = [sm for sm in ctx.submaps if not sm.is_loop_closure_submap]
+        updates: dict = {}
+        wanted = ctx.config.tracking.local_map_size + 2
+        for past in reversed(held):
+            if len(updates) >= wanted:
+                break
+            frames = (past.frames if ctx.config.tracking.publish_all_keyframes
+                      else past.frames[-1:])
+            for other in frames:
+                seq = int(other.seq_idx)
+                if seq in updates:
+                    continue
+                try:
+                    updates[seq] = (
+                        np.asarray(optimization.point_transform(seq), dtype=np.float64),
+                        float(past.global_scale))
+                except Exception:
+                    continue
+
+        def build(target, extras=(), carry_updates=False):
+            """A TrackingReference for one frame of this submap."""
+            to_world_t = np.asarray(
+                optimization.point_transform(target.seq_idx), dtype=np.float64)
+            rotation_t = _nearest_rotation(to_world_t[:3, :3])
+            gray_t = (cv2.cvtColor(target.image, cv2.COLOR_RGB2GRAY)
+                      if target.image is not None and target.image.size else None)
+            return TrackingReference(
+                seq_idx=int(target.seq_idx),
+                gray=gray_t,
+                depth=target.depth,
+                confidence=target.confidence,
+                intrinsic=target.intrinsic,
+                to_world=to_world_t,
+                rotation_world=rotation_t,
+                scale=float(submap.global_scale),
+                updates=updates if carry_updates else {},
+                companions=list(extras),
+            )
+
+        # Every keyframe of this submap can join the local map, not just its
+        # last frame: the others carry depth the tracker could already be
+        # solving against, from viewpoints spread through the submap rather
+        # than bunched at its end.
+        companions = []
+        if ctx.config.tracking.publish_all_keyframes:
+            for other in submap.frames[:-1]:
+                if other.depth is not None and other.depth.size:
+                    try:
+                        companions.append(build(other))
+                    except Exception:
+                        continue        # not in the graph yet; skip it
+        ctx.tracker.set_reference(build(frame, companions, carry_updates=True))
+
+    @staticmethod
     def _emit_update(ctx: _RunContext, submap: Submap, optimization: OptimizationResult) -> None:
         """Build a SLAMUpdate for the just-optimised submap and fire on_update.
 
@@ -1139,9 +1919,12 @@ class DA3SLAM:
         for frame in frames:
             if len(frame.points_cam) == 0:
                 continue
-            frame_points_cam.append((frame.seq_idx, frame.points_cam, frame.colors))
-            global_cam_to_world = optimization.pose(frame.seq_idx).astype(np.float64)
-            points_list.append(transform_points(frame.points_cam, global_cam_to_world))
+            # Batch unit -> submap 0's unit, matching the graph translations
+            # (the viewer caches these, so its re-projections stay consistent).
+            points_cam = frame.points_cam * np.float32(submap.global_scale)
+            frame_points_cam.append((frame.seq_idx, points_cam, frame.colors))
+            points_to_world = optimization.point_transform(frame.seq_idx)
+            points_list.append(transform_points(points_cam, points_to_world))
             colors_list.append(frame.colors)
         new_points = (np.concatenate(points_list) if points_list
                       else np.empty((0, 3), dtype=np.float32))
@@ -1156,6 +1939,7 @@ class DA3SLAM:
             n_submaps=len([s for s in ctx.submaps if not s.is_loop_closure_submap]),
             n_loop_closures=len(ctx.loop_closures),
             frame_points_cam=frame_points_cam,
+            keyframe_scales={k: optimization.scale(k) for k in poses},
         )
         try:
             ctx.on_update(update)
@@ -1334,12 +2118,56 @@ def _check_boundary_consistency(
         norm_ratio = float("inf") if norm_curr > 1e-9 else 1.0
     broken = ((np.isfinite(rotation_diff) and rotation_diff > 15.0)
               or norm_ratio < 0.5 or norm_ratio > 2.0)
+    # Always emit the measurement, not only the failures.  "How often is a
+    # boundary broken" and "how large is the typical disagreement" are
+    # different questions, and only the second one distinguishes a genuinely
+    # mis-aligned boundary from an intact one that simply costs a little.
+    # Only reachable with submap_overlap >= 2, so normal runs print nothing.
+    print(f"{tag} [boundary] {prev_submap.idx}->{curr_submap.idx} "
+          f"rot_deg={rotation_diff:.4f} norm_ratio={norm_ratio:.4f} "
+          f"broken={int(broken)}")
     if broken:
         print(f"{tag} WARNING: boundary {prev_submap.idx}→{curr_submap.idx} "
               f"inconsistent — the two batches disagree on the shared frame "
               f"pair (rotation {rotation_diff:.1f}°, translation-norm ratio "
               f"{norm_ratio:.2f}); possible odometry break here")
     return broken
+
+
+def _nearest_rotation(linear: np.ndarray) -> np.ndarray:
+    """Closest proper rotation to a 3x3 block, by SVD.
+
+    `point_transform` folds the Sim(3) scale into the rotation block, and under
+    SL(4) the block is only approximately a rotation, so anything that needs an
+    orientation (a tracking reference, a camera frustum) has to orthonormalise
+    first.  The determinant check keeps it proper: without it a reflected
+    solution flips the reference's handedness.
+    """
+    u, _, vt = np.linalg.svd(np.asarray(linear, dtype=np.float64))
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0:
+        rotation = u @ np.diag([1.0, 1.0, -1.0]) @ vt
+    return rotation
+
+
+def _similarity(source: np.ndarray, target: np.ndarray) -> np.ndarray | None:
+    """Umeyama similarity [sR | t] taking `source` points onto `target`."""
+    if len(source) < 3 or not (np.isfinite(source).all() and np.isfinite(target).all()):
+        return None
+    mu_s, mu_t = source.mean(0), target.mean(0)
+    a, b = source - mu_s, target - mu_t
+    u, sigma, vt = np.linalg.svd((b.T @ a) / len(source))
+    d = np.eye(3)
+    d[2, 2] = np.sign(np.linalg.det(u @ vt))
+    rotation = u @ d @ vt
+    variance = float((a ** 2).sum() / len(source))
+    if variance <= 1e-12:
+        return None
+    scale = float((sigma * np.diag(d)).sum() / variance)
+    out = np.eye(4)
+    out[:3, :3] = scale * rotation
+    out[:3, 3] = mu_t - scale * rotation @ mu_s
+    return out
 
 
 def _estimate_depth_scale(depth_ref: np.ndarray, depth_new: np.ndarray) -> float:

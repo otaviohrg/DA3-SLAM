@@ -11,3 +11,19 @@ pytorch_metric_learning
 trimesh
 hatchling
 editables
+
+# ── declared explicitly, previously only transitive ────────────────────────────
+# These are imported directly by da3_slam/ and scripts/ but used to arrive only
+# as dependencies of Depth-Anything-3[all] / salad.  That worked, but it meant an
+# upstream change could silently remove one and break the benchmarks — and
+# setup.sh clones both of those from git, so their dependency sets are not under
+# this file's control.  Versions are the ones the validated image was built with.
+opencv-python        # cv2: keyframe selection (Lucas-Kanade flow), UAS fisheye
+                     # undistortion, depth/GT image IO across the benchmarks
+matplotlib           # benchmark_common.plot_results — every benchmark_*.py
+                     # writes trajectory/ATE figures through it
+pillow               # PIL.Image: DINO-SALAD descriptor preprocessing
+tqdm                 # progress bars in the sweep/benchmark drivers
+open3d               # point-cloud IO and the Replica mapping evaluation
+rosbags              # pure-Python ROS 1 bag reader — REQUIRED for the UAS
+                     # dataset, whose sequences ship as sensors_only.bag

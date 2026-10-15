@@ -118,16 +118,38 @@ def resolve_camera(
 def load_calibration(yaml_path: str | Path) -> dict:
     """Parse a UAS camera YAML → {K (3x3), D (n,1), size (w,h), model}.
 
-    The ROS `camera_matrix` is row-major fx,0,cx, 0,fy,cy, 0,0,1; the distortion
-    model is "equidistant" (fisheye / Kannala-Brandt) with 4 coefficients.
+    Handles the two formats the dataset ships:
+      * ROS camera_info (AR1 sequences): row-major `camera_matrix.data`
+        (fx,0,cx, 0,fy,cy, 0,0,1), `distortion_coefficients.data`,
+        `image_width`/`image_height`.
+      * Kalibr (UniPilot sequences, e.g. campus_fog): a single-camera block
+        (`cam0`) with `intrinsics` [fx,fy,cx,cy], `distortion_coeffs`,
+        `resolution` [w,h].
+    Both use the equidistant / Kannala-Brandt (fisheye) distortion model.
     """
     with open(yaml_path) as f:
         cfg = yaml.safe_load(f)
-    K = np.array(cfg["camera_matrix"]["data"], dtype=np.float64).reshape(3, 3)
-    D = np.array(cfg["distortion_coefficients"]["data"],
-                 dtype=np.float64).reshape(-1, 1)
-    size = (int(cfg["image_width"]), int(cfg["image_height"]))
-    model = str(cfg.get("distortion_model", "equidistant")).lower()
+
+    if "camera_matrix" in cfg:  # ROS camera_info
+        K = np.array(cfg["camera_matrix"]["data"], dtype=np.float64).reshape(3, 3)
+        D = np.array(cfg["distortion_coefficients"]["data"],
+                     dtype=np.float64).reshape(-1, 1)
+        size = (int(cfg["image_width"]), int(cfg["image_height"]))
+        model = str(cfg.get("distortion_model", "equidistant")).lower()
+        return {"K": K, "D": D, "size": size, "model": model}
+
+    # Kalibr: the camera block is nested (usually under `cam0`).
+    cam = cfg.get("cam0") or next(
+        (v for v in cfg.values() if isinstance(v, dict) and "intrinsics" in v),
+        None)
+    if cam is None:
+        raise ValueError(f"Unrecognised calibration format: {yaml_path}")
+    fx, fy, cx, cy = (float(v) for v in cam["intrinsics"])
+    K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    D = np.array(cam["distortion_coeffs"], dtype=np.float64).reshape(-1, 1)
+    w, h = cam["resolution"]
+    size = (int(w), int(h))
+    model = str(cam.get("distortion_model", "equidistant")).lower()
     return {"K": K, "D": D, "size": size, "model": model}
 
 

@@ -127,6 +127,13 @@ class Submap:
     # Global confidence threshold used at build time (absolute value in [0, 1])
     confidence_threshold: float | None = None
 
+    # Running product of boundary scale ratios up to this submap (set by
+    # _processing): converts this batch's DA3 unit to submap 0's.  Graph
+    # translations are multiplied by it, so camera-space points must be too,
+    # or the submap renders at the wrong size relative to its own cameras
+    # (seams / duplicated geometry between neighbouring submaps).
+    global_scale: float = 1.0
+
     @property
     def n_frames(self) -> int:
         return len(self.frames)
@@ -199,6 +206,7 @@ class SubmapBuilder:
         images: list[np.ndarray],
         seq_indices: list[int],
         submap_idx: int = 0,
+        resolution: int | None = None,
     ) -> Submap:
         """
         Run DA3 on a batch of keyframes and build a Submap.
@@ -208,9 +216,12 @@ class SubmapBuilder:
             images:       pre-loaded HxWx3 uint8 RGB arrays, one per keyframe
             seq_indices:  corresponding indices in the original full sequence
             submap_idx:   position of this submap in the global sequence
+            resolution:   override DA3's processing resolution for this batch
+                          (used by the provisional tracking pass, which trades
+                          accuracy it does not need for latency it does)
         """
         assert len(image_paths) == len(seq_indices) == len(images)
-        prediction = self.estimator.infer(images)
+        prediction = self.estimator.infer(images, resolution=resolution)
         submap = self.build_from_prediction(prediction, submap_idx, seq_indices)
         submap.image_paths = list(image_paths)
         return submap
