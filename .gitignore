@@ -216,83 +216,28 @@ plots/
 salad/
 evals/
 Depth-Anything-3/
-third_party/
-checkpoints/
-_seqcache/
+recording.rrd
 
-# Benchmark/report products (results.json, *_summary.json, sweep rows, figures)
-*.json
-*.jsonl
-*.csv
-
-# Images and rendered figures
-*.png
-*.jpg
-*.jpeg
-
-# Point clouds, meshes and reconstruction output
-*.ply
-*.obj
-*.pcd
-
-# Model weights and caches
-*.pth
-*.pt
-*.ckpt
-*.safetensors
-*.npy
-*.npz
-*.pkl
-
-# Recordings and dataset archives
-*.rrd
-*.bag
-*.mcap
-*.zip
-*.tgz
-*.tar.gz
-
-# ── rendered media ────────────────────────────────────────────────────────────
-# videos/ is 277 MB of rendered demo clips, regenerable from the recordings in
-# outputs/ with `make_video.py --render_only`.  The extensions also cover the
-# media inside presentation_build/, whose generators (build_slides.py,
-# build_video.sh) and .html slide sources ARE tracked.
+# --- Generated artifacts and local datasets ----------------------------
+# Nothing below is reproducible from source, and committing it once already
+# cost this repo dearly: a 13.7M-vertex map.ply (532 MB) plus a batch of plot
+# PNGs were committed and then reset away, and because the objects survive in
+# the pack, .git is 2.9 GB for 61 tracked source files.
+results/
 videos/
-*.mp4
-*.mov
-*.mkv
-*.webm
-*.avi
-*.gif
-*.mp3
-*.wav
-*.m4a
+frozen_lake_images/
+*.ply
+*.rrd
 
-# Compressed pickles (SLAM recordings are *.rec.pkl.gz; *.pkl does not match)
-*.pkl.gz
+# Stray media at the repo root (slide audio, screen recordings, plan images).
+# Scoped to the root so plots written under outputs/ stay covered by that rule
+# and nothing inside the package tree is hidden by accident.
+/*.mp3
+/*.mp4
+/*.png
 
-# ── LaTeX build artefacts ─────────────────────────────────────────────────────
-# paper/ holds .tex sources and stays tracked; only the build products go.
-*.aux
-*.bbl
-*.blg
-*.fdb_latexmk
-*.fls
-*.out
-*.toc
-*.lof
-*.lot
-*.nav
-*.snm
-*.vrb
-*.synctex.gz
-
-# ── editor and OS cruft ───────────────────────────────────────────────────────
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-*~
-
-# Evaluation harnesses and their result tables — kept on disk, out of git.
-evals/
+# Claude Code: settings.json is shared tooling and SHOULD be committed;
+# local overrides and session state should not.
+.claude/settings.local.json
+.claude/.session_start
+.claude/skill-workspaces/
