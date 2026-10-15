@@ -213,3 +213,27 @@ plots/
 salad/
 Depth-Anything-3/
 recording.rrd
+
+# --- Generated artifacts and local datasets ----------------------------
+# Nothing below is reproducible from source, and committing it once already
+# cost this repo dearly: a 13.7M-vertex map.ply (532 MB) plus a batch of plot
+# PNGs were committed and then reset away, and because the objects survive in
+# the pack, .git is 2.9 GB for 61 tracked source files.
+results/
+videos/
+frozen_lake_images/
+*.ply
+*.rrd
+
+# Stray media at the repo root (slide audio, screen recordings, plan images).
+# Scoped to the root so plots written under outputs/ stay covered by that rule
+# and nothing inside the package tree is hidden by accident.
+/*.mp3
+/*.mp4
+/*.png
+
+# Claude Code: settings.json is shared tooling and SHOULD be committed;
+# local overrides and session state should not.
+.claude/settings.local.json
+.claude/.session_start
+.claude/skill-workspaces/
